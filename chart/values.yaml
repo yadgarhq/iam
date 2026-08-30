@@ -1,0 +1,47 @@
+# In git the image points at a moving TAG; the PUBLISHED chart pins a DIGEST,
+# rewritten by ci-release at package time (D65).
+image:
+  repository: ghcr.io/yadgarhq/iam
+  tag: latest
+
+# At least two, always (D55) — and here it is load-bearing rather than
+# ceremonial: D23's client-side balancing cannot be exercised by one replica of
+# this service talking to one replica of iam-db.
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+# The HEADLESS Service of the -db twin (D23). Resolving this name yields every
+# ready pod address rather than one virtual IP, which is what makes client-side
+# balancing possible at all.
+iamDb:
+  host: iam-db
+  port: 50051
+
+# Mounted at /var/run/secrets/iam-keys (D72): the AES-GCM and HMAC keys iam uses
+# to encrypt personal data at rest and to compute blind indexes, held in a
+# Secret and never in the database — so a stolen backup decrypts nothing.
+keysSecret: iam-keys
+
+# D68: scale on CONCURRENCY, not CPU. A -db waits on MariaDB and a logic service
+# waits on its -db, so both saturate at low CPU — a CPU-driven HPA stays quiet
+# exactly when the system is in trouble.
+#
+# The signal is call RATE per replica, read from D67's metrics. Rate rather than
+# a gauge because nothing tracks in-flight requests yet: rate is what the
+# instrumentation actually exposes today, and pretending otherwise would give a
+# scaler that reads nothing. Stated here rather than silently substituted.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  # At least two, always (D55) — the floor is a correctness property, not a
+  # tuning knob: one replica makes a class of defect unreachable.
+  maxReplicas: 6
+  # Calls per second per replica before adding one.
+  threshold: "10"
+  prometheusAddress: http://prometheus-server.observability.svc.cluster.local

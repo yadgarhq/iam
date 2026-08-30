@@ -1,0 +1,63 @@
+[package]
+name = "yadgar-iam"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "The identity module's logic service: business rules, no store."
+
+[dependencies]
+# NO sqlx, NO yadgar-store, and that absence is the design (D4). A logic service
+# reaches its data only over the -db API — here, IamDbService — and a store SDK
+# in this dependency tree would mean it could open its own connection, which is
+# what the twin exists to prevent. proto-contract-design keeps a per-repo check
+# for exactly this.
+tonic = { version = "0.14", default-features = false, features = [
+  "codegen",
+  "router",
+  "server",
+  "transport",
+  "channel",
+] }
+tonic-prost = "0.14"
+# The shared instrumentation seam (D67). Pinned by revision, like every other
+# in-org crate — a branch is a moving target.
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1273e45e641c6af5187af1203dfb153d4369b5bc", features = ["grpc"] }
+prost = "0.14"
+prost-types = "0.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+http = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# The identity module's own primitives (D72): encrypting personal data at rest,
+# hashing passwords, computing blind indexes and token hashes. None of this
+# touches storage — iam-db holds ciphertext and hashes only, and every one of
+# these operations happens here before a value crosses that boundary.
+# The 0.10 / 0.5 / 0.12 / 0.10 line, NOT the newest majors, and deliberately.
+# aes-gcm 0.11 replaces `Aead` with a buffer-based `AeadInOut`, and argon2 0.6
+# moves salt generation inside `hash_password` — both are real API rewrites. This
+# is the line the ecosystem actually runs and the one whose usage is
+# well-established; writing cryptographic code against an API being guessed at is
+# the worst place in the system to be approximately right. Revisit deliberately,
+# not by autoupdate.
+aes-gcm = "0.10"
+argon2 = "0.5"
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1.9", features = ["derive"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v7"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

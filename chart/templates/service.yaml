@@ -1,0 +1,16 @@
+# A NORMAL Service, unlike iam-db's. Nothing balances across iam replicas
+# client-side yet — the same gap gateway/src/upstream.rs documents for `task`:
+# until a caller of iam needs it enough to justify a headless Service plus the
+# shared balancing helper, a ClusterIP is honest about what actually happens
+# rather than declaring a balancing story nothing implements.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Chart.Name }}
+spec:
+  selector:
+    app: {{ .Chart.Name }}
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: grpc
