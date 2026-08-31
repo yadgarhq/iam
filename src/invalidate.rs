@@ -58,6 +58,16 @@ pub mod subject {
 #[derive(Clone)]
 pub struct Invalidator {
     client: Option<async_nats::Client>,
+    /// Every publish this instance made, recorded so a test can assert that a
+    /// code path publishes AT ALL.
+    ///
+    /// Compiled only under `cfg(test)`, so the deployed type is unchanged. It
+    /// exists because the alternative — running a broker in the test suite — is
+    /// how "does `AddTeamMember` publish?" stays untested, which is precisely the
+    /// question that went unanswered until a newly granted team took five minutes
+    /// to arrive.
+    #[cfg(test)]
+    published: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>,
 }
 
 impl Invalidator {
@@ -72,14 +82,12 @@ impl Invalidator {
                 "no broker configured: cache invalidation will NOT be published, so a \
                  revoked credential may be honoured until its TTL expires (D72)"
             );
-            return Self { client: None };
+            return Self::with(None);
         };
         match async_nats::connect(url).await {
             Ok(client) => {
                 tracing::info!(%url, "publishing cache invalidation");
-                Self {
-                    client: Some(client),
-                }
+                Self::with(Some(client))
             }
             Err(e) => {
                 tracing::error!(
@@ -87,13 +95,36 @@ impl Invalidator {
                     "cannot reach the broker: cache invalidation will NOT be published \
                      until it recovers, and revocations will be honoured late"
                 );
-                Self { client: None }
+                Self::with(None)
             }
         }
     }
 
+    fn with(client: Option<async_nats::Client>) -> Self {
+        Self {
+            client,
+            #[cfg(test)]
+            published: std::sync::Arc::default(),
+        }
+    }
+
+    /// What this instance published, in order. Clones share the log, so a handler
+    /// holding a clone is observable from the test that built it.
+    #[cfg(test)]
+    pub fn published(&self) -> Vec<(&'static str, String)> {
+        self.published.lock().expect("the publish log").clone()
+    }
+
     /// Publish, and never fail the caller.
     async fn publish(&self, subject: &'static str, payload: String) {
+        // Recorded BEFORE the branch, so what a test sees does not depend on
+        // whether a broker happened to be configured.
+        #[cfg(test)]
+        self.published
+            .lock()
+            .expect("the publish log")
+            .push((subject, payload.clone()));
+
         let Some(client) = &self.client else {
             tracing::warn!(subject, %payload, "no broker: invalidation not published");
             return;
