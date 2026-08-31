@@ -100,9 +100,24 @@ impl IamService for Iam {
             .client()
             .resolve_credential(upstream)
             .await
-            .inspect_err(call_failed)?
+            .map_err(upstream_failed)?
             .into_inner();
 
+        // AN EMPTY user_id IS A NEGATIVE ANSWER, and it must not be cacheable.
+        //
+        // `iam-db` returns an empty response for "no live credential" — unknown,
+        // revoked, expired, or belonging to a soft-deleted person. Copying that
+        // through with the ordinary TTL tells the gateway to remember, for five
+        // minutes, that a token resolves to user_id "". Nothing consumes this
+        // field yet, which is exactly why the shape is pinned now: the consumer
+        // that caches on it has not been written, and by the time it is, a
+        // `valid_for_seconds: 300` beside an empty user id looks deliberate.
+        //
+        // Zero, not a shorter TTL: there is no interval over which "this token
+        // belongs to nobody" is worth remembering, and a revoked credential's
+        // negative answer is the one thing that must never be served from a
+        // cache.
+        let resolved = !got.user_id.is_empty();
         let resp = ResolveCredentialResponse {
             user_id: got.user_id,
             team_ids: got.team_ids,
@@ -110,7 +125,7 @@ impl IamService for Iam {
             // mechanism — revocation and team changes arrive as broker events
             // (D72). Five minutes bounds how long a missed event can leave a
             // revoked credential working.
-            valid_for_seconds: 300,
+            valid_for_seconds: if resolved { 300 } else { 0 },
         };
         call.finish(Outcome {
             status: "OK",
@@ -137,7 +152,7 @@ impl IamService for Iam {
             .client()
             .get_password_hash(lookup)
             .await
-            .inspect_err(call_failed)?
+            .map_err(upstream_failed)?
             .into_inner();
 
         // THE ORDER HERE IS THE SECURITY PROPERTY.
@@ -167,7 +182,7 @@ impl IamService for Iam {
             .client()
             .create_credential(create)
             .await
-            .inspect_err(call_failed)?
+            .map_err(upstream_failed)?
             .into_inner();
 
         call.finish(Outcome {
@@ -206,7 +221,7 @@ impl IamService for Iam {
             .client()
             .create_credential(create)
             .await
-            .inspect_err(call_failed)?
+            .map_err(upstream_failed)?
             .into_inner();
 
         call.finish(Outcome {
@@ -245,7 +260,7 @@ impl IamService for Iam {
             .client()
             .revoke_credential(upstream)
             .await
-            .inspect_err(call_failed)?
+            .map_err(upstream_failed)?
             .into_inner();
 
         // The USER, not the credential — the gateway's cache is keyed on a token
@@ -286,7 +301,7 @@ impl IamService for Iam {
             .client()
             .create_user(upstream)
             .await
-            .inspect_err(call_failed)?
+            .map_err(upstream_failed)?
             .into_inner();
 
         call.finish(Outcome {
@@ -318,7 +333,15 @@ impl IamService for Iam {
         self.client()
             .add_team_member(upstream)
             .await
-            .inspect_err(call_failed)?;
+            .map_err(upstream_failed)?;
+
+        // ADDING invalidates too, and the subject is named `teams-changed`
+        // rather than `teams-removed` precisely so this is not forgotten — see
+        // `invalidate::subject::TEAMS_CHANGED`. Granting a team changes what a
+        // cached identity says just as removing one does; without this, a newly
+        // granted permission arrives up to 300s late and reads as a bug in
+        // whatever the person was trying to reach.
+        self.invalidator.teams_changed(&req.get_ref().user_id).await;
 
         call.finish(Outcome {
             status: "OK",
@@ -351,7 +374,7 @@ impl IamService for Iam {
         self.client()
             .remove_team_member(upstream)
             .await
-            .inspect_err(call_failed)?;
+            .map_err(upstream_failed)?;
 
         self.invalidator.teams_changed(&req.get_ref().user_id).await;
 
@@ -363,10 +386,37 @@ impl IamService for Iam {
     }
 }
 
-/// Log an upstream failure WITHOUT its message reaching the caller unchanged.
+/// Log an upstream failure and return one whose message is this service's own.
 ///
 /// A `Status` from `iam-db` can carry storage detail, and on this service that
 /// detail names the identity schema. The code propagates; the words stay here.
-fn call_failed(e: &Status) {
+///
+/// **This used to be an `inspect_err`, which logged and then returned the
+/// upstream `Status` unchanged** — so the doc above described a redaction that
+/// did not happen and two upstream sentences reached the caller verbatim: "a user
+/// with that name already exists" and "no such credential". Replacing the message
+/// rather than correcting the doc, because the doc was right about what should
+/// happen.
+fn upstream_failed(e: Status) -> Status {
     tracing::error!(code = ?e.code(), message = %e.message(), "upstream iam-db call failed");
+    Status::new(e.code(), refusal_for(e.code()))
 }
+
+/// One fixed sentence per code, chosen HERE rather than upstream.
+///
+/// The code is what a caller branches on and it survives untouched; the words are
+/// only for a human, and a fixed set of them cannot leak a table name, a column
+/// or a fragment of a query. Deliberately not the empty string: a `Status` with
+/// no message at all reads as a bug in the caller's client library.
+fn refusal_for(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::AlreadyExists => "already exists",
+        tonic::Code::NotFound => "no such record",
+        tonic::Code::InvalidArgument => "the store refused the request",
+        tonic::Code::Unavailable => "storage unavailable",
+        _ => "the iam-db call failed",
+    }
+}
+
+#[cfg(test)]
+mod tests;

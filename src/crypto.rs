@@ -98,6 +98,37 @@ fn read_key(dir: &str, name: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     Ok(key)
 }
 
+// Count one Argon2id verification.
+//
+// THE TIMING EQUALISATION IS INVISIBLE TO AN ORDINARY ASSERTION. A test that only
+// checks the ANSWER of `verify_password(None, …)` passes with the dummy hash, its
+// generation and `KeyError::Dummy` all deleted — the answer is `false` either
+// way. Counting the verifications measures the property itself, and does it
+// deterministically rather than by reading a clock.
+//
+// A THREAD-LOCAL, because the test binary runs tests in parallel in one process
+// and a global counter would make each test's reading depend on which others
+// happened to be running.
+#[cfg(test)]
+thread_local! {
+    static ARGON2_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn argon2_verifications() -> usize {
+    ARGON2_VERIFICATIONS.with(std::cell::Cell::get)
+}
+
+/// Verify once, and record that it happened. Compiles to the bare verification
+/// outside tests — the counter costs nothing in a deployed binary.
+fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> bool {
+    #[cfg(test)]
+    ARGON2_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+    Argon2::default()
+        .verify_password(password.as_bytes(), parsed)
+        .is_ok()
+}
+
 impl Keys {
     /// Load, or refuse to start.
     ///
@@ -214,13 +245,10 @@ impl Keys {
         let hash_str = stored.unwrap_or(&self.dummy_hash);
         let Ok(parsed) = PasswordHash::new(hash_str) else {
             // A corrupt stored hash must not be a fast path either.
-            let _ = PasswordHash::new(&self.dummy_hash)
-                .map(|d| Argon2::default().verify_password(password.as_bytes(), &d));
+            let _ = PasswordHash::new(&self.dummy_hash).map(|d| verify_counted(password, &d));
             return false;
         };
-        let ok = Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok();
+        let ok = verify_counted(password, &parsed);
         // `stored.is_some()` is checked AFTER the work, not before it.
         ok && stored.is_some()
     }
@@ -236,123 +264,4 @@ fn normalise(username: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn keys() -> Keys {
-        Keys {
-            encryption: Zeroizing::new([7u8; 32]),
-            blind_index: Zeroizing::new([9u8; 32]),
-            dummy_hash: Argon2::default()
-                .hash_password(b"x", &SaltString::encode_b64(&[3u8; 16]).unwrap())
-                .unwrap()
-                .to_string(),
-        }
-    }
-
-    #[test]
-    fn a_name_round_trips() {
-        let k = keys();
-        let ct = k.encrypt("Ada Lovelace").unwrap();
-        assert_eq!(k.decrypt(&ct).unwrap(), "Ada Lovelace");
-    }
-
-    #[test]
-    fn the_same_name_encrypts_differently_every_time() {
-        // This is the property that makes a blind index necessary. If this test
-        // ever fails, encryption has become deterministic and equal names are
-        // linkable in the database.
-        let k = keys();
-        assert_ne!(k.encrypt("ada").unwrap(), k.encrypt("ada").unwrap());
-    }
-
-    #[test]
-    fn ciphertext_does_not_contain_the_plaintext() {
-        let k = keys();
-        let ct = k.encrypt("supersecretname").unwrap();
-        assert!(!String::from_utf8_lossy(&ct).contains("supersecretname"));
-    }
-
-    #[test]
-    fn altered_ciphertext_is_refused_rather_than_returning_rubbish() {
-        // GCM authenticates. Without that, a flipped bit would decrypt to a
-        // different name and be believed.
-        let k = keys();
-        let mut ct = k.encrypt("ada").unwrap();
-        let last = ct.len() - 1;
-        ct[last] ^= 0x01;
-        assert!(matches!(k.decrypt(&ct), Err(CryptoError::Decrypt)));
-    }
-
-    #[test]
-    fn a_different_key_cannot_decrypt() {
-        let a = keys();
-        let mut b = keys();
-        b.encryption = Zeroizing::new([8u8; 32]);
-        let ct = a.encrypt("ada").unwrap();
-        assert!(b.decrypt(&ct).is_err());
-    }
-
-    #[test]
-    fn the_blind_index_is_stable_and_case_insensitive() {
-        let k = keys();
-        assert_eq!(k.blind_index("Max"), k.blind_index("max"));
-        assert_eq!(k.blind_index(" max "), k.blind_index("max"));
-        assert_ne!(k.blind_index("max"), k.blind_index("maxa"));
-    }
-
-    #[test]
-    fn the_blind_index_depends_on_its_key() {
-        // If it did not, the index would be a plain hash of a small public input
-        // space and reversible by anyone holding the database.
-        let a = keys();
-        let mut b = keys();
-        b.blind_index = Zeroizing::new([1u8; 32]);
-        assert_ne!(a.blind_index("max"), b.blind_index("max"));
-    }
-
-    #[test]
-    fn a_minted_token_is_unpredictable_and_url_safe() {
-        let a = Keys::mint_token().unwrap();
-        let b = Keys::mint_token().unwrap();
-        assert_ne!(*a, *b);
-        assert!(a
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-    }
-
-    #[test]
-    fn token_hashing_is_stable_and_distinguishing() {
-        assert_eq!(Keys::token_hash("abc"), Keys::token_hash("abc"));
-        assert_ne!(Keys::token_hash("abc"), Keys::token_hash("abd"));
-        assert_eq!(Keys::token_hash("abc").len(), 32);
-    }
-
-    #[test]
-    fn a_password_verifies_against_its_own_hash_and_not_another() {
-        let k = keys();
-        let h = k.hash_password("correct horse").unwrap();
-        assert!(k.verify_password(Some(&h), "correct horse"));
-        assert!(!k.verify_password(Some(&h), "wrong horse"));
-    }
-
-    #[test]
-    fn the_same_password_hashes_differently_for_two_users() {
-        // Argon2id salts per password. Without it, two people choosing the same
-        // password would be visibly identical in the table.
-        let k = keys();
-        assert_ne!(
-            k.hash_password("same").unwrap(),
-            k.hash_password("same").unwrap()
-        );
-    }
-
-    #[test]
-    fn an_absent_user_still_fails_verification_rather_than_erroring() {
-        // And it does the work first — the timing equalisation the login path
-        // depends on. This asserts the contract; the timing itself is not
-        // something a unit test can assert reliably.
-        let k = keys();
-        assert!(!k.verify_password(None, "anything"));
-    }
-}
+pub(crate) mod tests;
