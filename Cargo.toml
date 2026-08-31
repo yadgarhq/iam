@@ -20,6 +20,8 @@ tonic = { version = "0.14", default-features = false, features = [
   "channel",
 ] }
 tonic-prost = "0.14"
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "2c1aab6e2754317e9dcea53c1d8c2d37e5d10042" }
+
 # The shared instrumentation seam (D67). Pinned by revision, like every other
 # in-org crate — a branch is a moving target.
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1273e45e641c6af5187af1203dfb153d4369b5bc", features = ["grpc"] }
@@ -48,6 +50,7 @@ hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1.9", features = ["derive"] }
 base64 = "0.22"
+async-nats = "0.50"
 uuid = { version = "1", features = ["v7"] }
 
 [build-dependencies]

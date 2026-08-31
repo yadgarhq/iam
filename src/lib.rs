@@ -8,8 +8,8 @@
 
 #![forbid(unsafe_code)]
 
-pub mod balance;
 pub mod crypto;
+pub mod invalidate;
 pub mod service;
 pub mod upstream;
 

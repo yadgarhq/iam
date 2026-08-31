@@ -1,6 +1,6 @@
 //! Connecting to `iam-db`, this module's twin.
 //!
-//! Kept separate from [`crate::balance`] deliberately: `balance` is the generic
+//! Kept separate from [`yadgar_dial`] deliberately: the crate is the generic
 //! channel-balancing mechanism (D23) — it knows about `SocketAddr`s and DNS, and
 //! nothing about which module it is balancing for. This is the thin,
 //! module-specific wiring on top: `iam-db`'s env-configured host and port,
@@ -12,13 +12,13 @@
 
 use tonic::transport::Channel;
 
-use crate::balance::{self, BalanceError};
+use yadgar_dial::BalanceError;
 
 /// Connect to `iam-db` and return a load-balanced [`Channel`].
 ///
 /// `iam-db`'s Service is headless, same as `task-db` (D23), so this goes through
-/// `balance::connect` — one long-lived HTTP/2 connection per pod, re-resolved
+/// `yadgar_dial::connect` — one long-lived HTTP/2 connection per pod, re-resolved
 /// every 5s — rather than a plain single-endpoint `Endpoint::connect`.
 pub async fn connect(host: &str, port: u16) -> Result<Channel, BalanceError> {
-    balance::connect(host, port).await
+    yadgar_dial::connect(host, port).await
 }
