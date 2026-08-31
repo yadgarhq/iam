@@ -9,6 +9,7 @@ use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::crypto::Keys;
+use crate::invalidate::Invalidator;
 use crate::pb::yadgar::iam::v1::iam_service_server::IamService;
 use crate::pb::yadgar::iam::v1::*;
 use crate::pb::yadgar::iamdb::v1 as db;
@@ -19,11 +20,16 @@ const SERVICE: &str = "iam";
 pub struct Iam {
     keys: Keys,
     channel: tonic::transport::Channel,
+    invalidator: Invalidator,
 }
 
 impl Iam {
-    pub fn new(keys: Keys, channel: tonic::transport::Channel) -> Self {
-        Self { keys, channel }
+    pub fn new(keys: Keys, channel: tonic::transport::Channel, invalidator: Invalidator) -> Self {
+        Self {
+            keys,
+            channel,
+            invalidator,
+        }
     }
 
     fn client(&self) -> IamDbServiceClient<tonic::transport::Channel> {
@@ -213,12 +219,15 @@ impl IamService for Iam {
         }))
     }
 
-    /// Revoke, and hand back who it belonged to.
+    /// Revoke, and publish the invalidation.
     ///
-    /// **The caller must publish the cache-invalidation event** (D72). This
-    /// service does not, because the broker client is not wired yet — and until
-    /// it is, a revoked credential keeps working for up to `valid_for_seconds`.
-    /// Stated here rather than left to be discovered.
+    /// **Publishing is what makes the gateway's cache safe** (D72). Without it a
+    /// revoked credential keeps working until its TTL expires, which turns the
+    /// backstop into the mechanism and makes every revocation late by design.
+    ///
+    /// The publish happens AFTER the store confirms, and its failure does not
+    /// fail this call: the revocation has already happened, and returning an
+    /// error would tell the caller to retry something that is done.
     async fn revoke_credential(
         &self,
         req: Request<RevokeCredentialRequest>,
@@ -239,11 +248,10 @@ impl IamService for Iam {
             .inspect_err(call_failed)?
             .into_inner();
 
-        tracing::warn!(
-            user_id = %done.user_id,
-            "credential revoked; cache invalidation is NOT yet published (D72) — \
-             the gateway may honour it until its TTL expires"
-        );
+        // The USER, not the credential — the gateway's cache is keyed on a token
+        // hash this service never sees, so the person is the addressable unit.
+        // This is why RevokeCredential returns user_id at all.
+        self.invalidator.credential_revoked(&done.user_id).await;
 
         call.finish(Outcome {
             status: "OK",
@@ -319,8 +327,8 @@ impl IamService for Iam {
         Ok(Response::new(AddTeamMemberResponse {}))
     }
 
-    /// Removing a member narrows what that user can see, so it has the same
-    /// unpublished-invalidation caveat as revocation above.
+    /// Removing a member narrows what that user can see, so the cached identity
+    /// has to be invalidated or they keep reading the team's records.
     async fn remove_team_member(
         &self,
         req: Request<RemoveTeamMemberRequest>,
@@ -345,10 +353,7 @@ impl IamService for Iam {
             .await
             .inspect_err(call_failed)?;
 
-        tracing::warn!(
-            user_id = %req.get_ref().user_id,
-            "team membership removed; cache invalidation is NOT yet published (D72)"
-        );
+        self.invalidator.teams_changed(&req.get_ref().user_id).await;
 
         call.finish(Outcome {
             status: "OK",

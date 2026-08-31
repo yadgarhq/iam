@@ -45,3 +45,10 @@ autoscaling:
   # Calls per second per replica before adding one.
   threshold: "10"
   prometheusAddress: http://prometheus-server.observability.svc.cluster.local
+
+# The broker (D22), for publishing D72's cache invalidation. NOT a startup
+# dependency: a broker outage must not become an authentication outage, so iam
+# starts without it, warns loudly, and revocations are honoured late until it
+# returns.
+nats:
+  url: nats://nats:4222

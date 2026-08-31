@@ -61,6 +61,12 @@ spec:
             # reads them; the Secret itself is mounted below.
             - name: YADGAR_KEYS_DIR
               value: /var/run/secrets/iam-keys
+            # The broker (D22), for publishing D72's cache invalidation. Absent
+            # or unreachable is survivable and loudly logged: a broker outage
+            # must not become an authentication outage, and the cache TTL is the
+            # backstop for exactly that window.
+            - name: NATS_URL
+              value: {{ .Values.nats.url | quote }}
           # This service does NOT wait for iam-db before listening, so the port
           # opening means "process up", not "dependency healthy" — deliberately.
           # Blocking startup on a -db that is still migrating would turn one

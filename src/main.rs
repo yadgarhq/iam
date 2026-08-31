@@ -3,7 +3,7 @@
 //!
 //! The twin's own boot is gated — probe, migrate, then listen (D69) — so a
 //! `-db` that is not ready has no DNS endpoint behind the headless Service, and
-//! `balance::connect` fails loudly. Blocking this service's startup on that would
+//! `yadgar_dial::connect` fails loudly. Blocking this service's startup on that would
 //! turn one module's slow migration into a cascading outage across everything
 //! that depends on it, and under D68 a pod stuck in startup is one the autoscaler
 //! cannot help. Failing a request with UNAVAILABLE is recoverable; refusing to
@@ -18,7 +18,6 @@
 
 use std::net::SocketAddr;
 
-use yadgar_iam::balance;
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 use yadgar_iam::service::Iam;
@@ -59,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = upstream::connect(&db_host, db_port).await?;
     tracing::info!(
-        reresolve_secs = balance::reresolve_interval().as_secs(),
+        reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
         "connected to iam-db"
     );
 
@@ -72,10 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
 
+    // The broker, for D72's cache invalidation. Does NOT gate startup: a broker
+    // outage must not become an authentication outage, and the TTL is the
+    // backstop for exactly this. The warning at connect time is what makes the
+    // degraded state visible rather than assumed.
+    let invalidator =
+        yadgar_iam::invalidate::Invalidator::connect(std::env::var("NATS_URL").ok().as_deref())
+            .await;
+
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
     tracing::info!(%addr, "iam listening");
     tonic::transport::Server::builder()
-        .add_service(IamServiceServer::new(Iam::new(keys, db)))
+        .add_service(IamServiceServer::new(Iam::new(keys, db, invalidator)))
         .serve_with_shutdown(addr, async {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutting down");
