@@ -192,6 +192,117 @@ fn a_corrupt_stored_hash_is_not_a_fast_path_either() {
     );
 }
 
+#[test]
+fn a_stored_hash_the_verifier_refuses_before_hashing_is_not_a_fast_path() {
+    // THE TEST ABOVE COVERS ONE CORRUPTION SHAPE AND MISSES THESE. "not a PHC
+    // string at all" is the shape that is handled CORRECTLY — it fails
+    // `PasswordHash::new`, takes the `else` arm, and pays the dummy. The shapes
+    // below PARSE, so they sail past that guard and reach a verifier that then
+    // computes nothing:
+    //
+    // - no digest: `password_hash`'s blanket `PasswordVerifier` impl is gated on
+    //   `if let (Some(salt), Some(expected_output)) = (&hash.salt, &hash.hash)`
+    //   and otherwise falls straight through to `Err(Error::Password)` — the same
+    //   error a wrong password gets, without hashing anything;
+    // - an illegal parameter set: `Params::try_from` rejects `m=8,p=2` (Argon2
+    //   requires `m >= 8 * p`) and the `?` returns before the first block of
+    //   memory is touched.
+    //
+    // AND A THIRD FAMILY, ONE CALL DEEPER, which the two above do not reach:
+    // argon2's own `hash_password_customized` rejects a foreign algorithm ident, a
+    // version that is neither 0x10 nor 0x13, and a salt DECODING to fewer than
+    // `MIN_SALT_LEN` = 8 bytes. `password_hash`'s `Salt::MIN_LENGTH` is 4
+    // CHARACTERS and `Params::try_from` never looks at the ident, so all three
+    // parse and then die past every guard the two cases above describe. They are
+    // in the table below because the production code closes them through the
+    // catch-all `Err(_) => None` rather than through the enumeration — see
+    // `verify_counted`. Narrowing that arm to the named variants would reopen
+    // exactly these rows, and this test is what makes that loud.
+    //
+    // MEASURED before the fix, release build: every one of these shapes answered
+    // in microseconds against the milliseconds a real verification costs — three
+    // to four orders of magnitude, which is the oracle. After the fix they are all
+    // one full verification, indistinguishable from the absent-user path. The
+    // absolute figures are host-dependent and quoted in the pull request against
+    // the host they were taken on; the ratio is the part that is not.
+    //
+    // BOTH counter tests above stayed green throughout, which is the point: the
+    // counter incremented on entry to `verify_counted` rather than where the work
+    // happens, so it reported control flow while claiming to report cost.
+    //
+    // MUTATIONS THIS CATCHES: dropping the `salt`/`hash` presence check, or
+    // turning the `Err(_) => None` arm into `Some(false)`. Each returns a verdict
+    // for a call that hashed nothing, so the dummy that pays for it is skipped.
+    //
+    // AND the instrumentation regression itself, in both of its forms. Moving the
+    // increment out of `CountingArgon2` and back to the top of `verify_counted`
+    // makes the counter derived from the decision it is measuring, so a mutation
+    // to the decision moves the counter with it and every assertion below reads 1
+    // again. Counting on ENTRY to `hash_password_customized` instead of on its
+    // `Ok` is the same error at smaller scale: the third family reaches that entry
+    // point and fills no memory, so those rows report `spent == 2` — one spurious,
+    // one real — and fail here.
+    //
+    // Reachable the same way the test above is: `iam-db`'s `SetPassword` writes a
+    // caller-supplied string verbatim into VARCHAR(255).
+    //
+    // "x" DELIBERATELY, as elsewhere in this file: the fixture's dummy_hash is the
+    // hash of "x", so the fallback verification SUCCEEDS and `stored.is_some()` is
+    // the only thing still returning false. A password that failed on its own
+    // would let a mutation that authenticates here pass unnoticed.
+    let k = keys();
+
+    for (shape, stored) in [
+        (
+            "no digest",
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0c2FsdA",
+        ),
+        ("no salt and no digest", "$argon2id$v=19$m=19456,t=2,p=1"),
+        (
+            "an illegal parameter set",
+            "$argon2id$v=19$m=8,t=1,p=2$c29tZXNhbHRzYWx0c2FsdA\
+             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
+        ),
+        // The third family. Each of these has a legal Argon2 parameter string
+        // and a digest, so it is past both guards the two cases above name.
+        (
+            "an algorithm that is not Argon2",
+            "$scrypt$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0c2FsdA\
+             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
+        ),
+        (
+            "a version Argon2 does not have",
+            "$argon2id$v=99$m=19456,t=2,p=1$c29tZXNhbHRzYWx0c2FsdA\
+             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
+        ),
+        (
+            // Decodes to 7 bytes: legal for `password_hash`, one byte under
+            // Argon2's own minimum.
+            "a salt shorter than Argon2 accepts",
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbA\
+             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
+        ),
+    ] {
+        // Guards the test itself: if any of these ever stopped parsing it would
+        // take the `else` arm and silently become a copy of the test above.
+        assert!(
+            PasswordHash::new(stored).is_ok(),
+            "{shape}: must PARSE, or this asserts nothing the previous test does not"
+        );
+
+        let before = argon2_verifications();
+        let ok = k.verify_password(Some(stored), "x");
+        let spent = argon2_verifications() - before;
+
+        assert!(!ok, "{shape}: must never verify");
+        assert_eq!(
+            spent, 1,
+            "{shape}: parses but hashes nothing, so it must still cost one real \
+             Argon2 verification against the dummy"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KNOWN-ANSWER tests.
 //
@@ -355,6 +466,17 @@ fn the_dummy_hash_costs_exactly_what_a_stored_hash_costs() {
     // wide enough to survive a loaded CI runner, and a tolerance that wide stops
     // catching the smaller divergences.
     //
+    // WHAT THIS TEST CANNOT SEE, AND THE GENERAL FORM OF THAT BLINDNESS: an
+    // equality between two values minted by ONE function cannot detect that
+    // function moving both. `hash_secret` mints the stored hash and the dummy, so
+    // tuning it to `m=8,t=1,p=1` keeps every assertion below green while password
+    // hashing is destroyed. Relative and absolute are different properties and
+    // need separate assertions. The floor this test is silent about is pinned by
+    // `a_stored_hash_is_expensive_in_absolute_terms`, below. The same shape is
+    // what `iam#6` and the change above are each about, one level up: a
+    // measurement taken from the thing it is measuring reports agreement, not
+    // correctness.
+    //
     // `Params` covers the digest length too, without a separate assertion:
     // `Params::try_from` recovers `output_len` from the hash itself, because the
     // PHC parameter string does not carry it.
@@ -377,4 +499,58 @@ fn the_dummy_hash_costs_exactly_what_a_stored_hash_costs() {
         argon2::Params::try_from(&dummy).expect("dummy parameters"),
         "an absent user must cost the same memory, passes and lanes as a present one"
     );
+}
+
+#[test]
+fn a_stored_hash_is_expensive_in_absolute_terms() {
+    // THE EQUALITY TEST ABOVE IS SILENT ABOUT THIS, and that is not a detail of
+    // this file — it is the general form. `stored_params == dummy_params` is a
+    // RELATIVE assertion, both sides are minted by the one `hash_secret`, and one
+    // edit to `hash_secret` moves them together. Tuned to `m=8,t=1,p=1` the whole
+    // suite passed with password hashing reduced to about nine microseconds per
+    // hash. Nothing anywhere asserted that either hash was STRONG.
+    //
+    // MUTATION THIS CATCHES: any global collapse of `hash_secret`'s cost —
+    // `Argon2::new(.., Params::new(8, 1, 1, None))` in place of
+    // `Argon2::default()`. The equality test stays green under it, because the
+    // dummy collapses in step; only a floor sees it.
+    //
+    // THE FLOOR IS OWASP'S ARGON2ID MINIMUM — m = 19 MiB, t = 2, p = 1 (Password
+    // Storage Cheat Sheet), which is also what `argon2`'s `Params::DEFAULT`
+    // encodes, so today's `Argon2::default()` sits exactly on it. `>=` and not
+    // `==` deliberately: raising the cost is a change this test must permit, and
+    // lowering it is the one it exists to refuse.
+    //
+    // BOTH hashes are floored, and independently. Flooring only the stored one
+    // would leave the dummy covered by the equality test alone — two tests each
+    // load-bearing on the other is the coupling this whole file is about.
+    const MIN_M_COST: u32 = 19 * 1024;
+    const MIN_T_COST: u32 = 2;
+    const MIN_P_COST: u32 = 1;
+
+    let k = loaded_keys("absolute-cost");
+
+    let stored = k.hash_password("correct horse").expect("hash a password");
+    for (which, phc) in [
+        ("a stored hash", stored.as_str()),
+        ("the dummy hash", &k.dummy_hash),
+    ] {
+        let parsed = PasswordHash::new(phc).expect("the hash parses");
+        let params = argon2::Params::try_from(&parsed).expect("its parameters");
+        assert!(
+            params.m_cost() >= MIN_M_COST,
+            "{which}: m={} is below OWASP's {MIN_M_COST} KiB minimum for Argon2id",
+            params.m_cost()
+        );
+        assert!(
+            params.t_cost() >= MIN_T_COST,
+            "{which}: t={} is below OWASP's {MIN_T_COST}-pass minimum for Argon2id",
+            params.t_cost()
+        );
+        assert!(
+            params.p_cost() >= MIN_P_COST,
+            "{which}: p={} is below OWASP's {MIN_P_COST}-lane minimum for Argon2id",
+            params.p_cost()
+        );
+    }
 }
