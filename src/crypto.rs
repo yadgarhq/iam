@@ -262,9 +262,15 @@ fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> Option<bool> {
 /// TUNING THE COST HERE IS NOT A SELF-CONTAINED CHANGE. One function moves both
 /// hashes together only from that moment ON; every row written before the tune
 /// keeps its old cost, and no rehash can move it without the plaintext. That
-/// residual, and the response-time floor that is the only thing which closes it,
-/// are worked through at [`Keys::verify_password`]. Read that note BEFORE
-/// changing the parameters below — the floor belongs in the same change.
+/// residual is covered by the response-time floor on `Login`, not by anything in
+/// this file — see [`Keys::verify_password`], and read it BEFORE changing the
+/// parameters below.
+///
+/// THEN CHECK THE FLOOR STILL CLEARS THE NEW COST. Raising these is precisely
+/// the change that pushes a legitimate verification past
+/// [`crate::service::DEFAULT_LOGIN_RESPONSE_FLOOR`], and a floor a verification
+/// exceeds is a floor hiding nothing. `Login` warns when that happens rather
+/// than failing, so the signal is in the logs and not in this test suite.
 fn hash_secret(secret: &[u8]) -> Result<String, argon2::password_hash::Error> {
     // A fresh salt per hash, so two people choosing the same password are not
     // visibly identical in the table.
@@ -396,47 +402,58 @@ impl Keys {
     /// arm below is for: a PHC string can parse cleanly and still be refused by
     /// the verifier before it hashes anything. See [`verify_counted`].
     ///
-    /// # The residual this does NOT close, and why there is no time floor
+    /// # The residual this does NOT close, and what does
     ///
     /// Everything here equalises by making both paths verify a hash with the SAME
     /// PARAMETERS. That holds only while every stored hash shares the dummy's
-    /// parameters, and one event breaks it permanently: A GENUINE COST TUNE. The
-    /// dummy is minted fresh at boot, so it moves the moment `hash_secret`
-    /// changes; rows written before the tune keep the old cost forever. Their
-    /// logins then run measurably faster than an unknown username's, and the
-    /// oracle is open again for exactly the accounts that are oldest.
+    /// parameters, and TWO events break it — the second without anyone deciding
+    /// anything.
+    ///
+    /// A GENUINE COST TUNE is the first. The dummy is minted fresh at boot, so it
+    /// moves the moment `hash_secret` changes; rows written before the tune keep
+    /// the old cost forever. Their logins then run measurably faster than an
+    /// unknown username's, and the oracle is open again for exactly the accounts
+    /// that are oldest.
+    ///
+    /// `iamdb.v1.SetPassword` IS THE SECOND, AND IT NEEDS NO TUNE AT ALL. It takes
+    /// an already-formed `argon2id_hash` and stores it VERBATIM, and
+    /// `verify_counted` reads its cost out of the PHC STRING rather than from
+    /// this service's configuration. So any provisioning path that does not go
+    /// through `hash_secret` picks its own cost and diverges immediately — one
+    /// gRPC call, no deployment, no review of this file.
+    ///
+    /// MEASURED THROUGH THE LIVE EDGE, not predicted. 25 samples per class, wrong
+    /// password throughout: a stored hash at `m=16384,t=2,p=1` answered in 27ms
+    /// median and the unknown-user dummy at `Argon2::default()`
+    /// (`m=19456,t=2,p=1`) in 29ms — indistinguishable. A stored hash at
+    /// `m=65536,t=3,p=1` answered in 98ms median and 136ms worst: a 70ms gap with
+    /// NON-OVERLAPPING p90s, which a handful of samples separates.
     ///
     /// IT CANNOT BE CLOSED BY REHASHING. A password hash cannot be re-derived to
     /// new parameters without the plaintext, so the usual "rehash them at next
-    /// login" answer only ever applies to people who log in — and, today, to
-    /// nobody: [`Self::hash_password`] has no production caller, `iam` exposes no
-    /// `SetPassword`, and `CreateUser` takes no password. The same divergence
-    /// reaches a row directly, without any tune at all, because `iam-db`'s
-    /// `SetPassword` writes a caller-supplied string verbatim: a stored hash at
-    /// `m=8,t=1,p=1` does real Argon2 work and still returns in ~9µs, against the
-    /// ~11ms a default-cost hash takes in the same release build — roughly three
-    /// orders of magnitude, on the machine that was measured.
+    /// login" answer only ever applies to people who log in — and [`Self::hash_password`]
+    /// has no production caller, `iam` exposes no `SetPassword`, and `CreateUser`
+    /// takes no password, so today it applies to nobody.
     ///
-    /// The only defence that generalises is A FIXED RESPONSE-TIME FLOOR on the
-    /// `Login` RPC — sleep until a constant deadline on every path, so the
-    /// response time stops being a function of the work done. It is deliberately
-    /// NOT built here:
+    /// THE DEFENCE THAT GENERALISES IS A RESPONSE-TIME FLOOR ON `Login`, AND IT IS
+    /// BUILT — [`crate::service::DEFAULT_LOGIN_RESPONSE_FLOOR`], configurable
+    /// through `LOGIN_RESPONSE_FLOOR_MS`. The response time stops being a function
+    /// of the work done, so a row's parameters stop being readable from it. Three
+    /// things about where it had to sit:
     ///
-    /// - the floor has to exceed the SLOWEST legitimate verification, and one set
-    ///   below the true worst case does not close the oracle, it clips it. That
-    ///   number is a measurement on the deployment target, which does not exist
-    ///   yet, and a guess would buy latency on every login for a property it does
-    ///   not actually deliver;
-    /// - the round trip `Login` spends at `iam-db` before reaching here does NOT
-    ///   hide the delta, and nothing about its variance does. `get_password_hash`
-    ///   is issued on both paths, so its cost is COMMON MODE and cancels out of
-    ///   the difference between them; an attacker averaging N samples divides the
-    ///   standard error by √N against a per-class mean that stays put. What the
-    ///   round trips do establish is where the floor has to sit: it must cover
-    ///   THE WHOLE HANDLER, error paths and the success-path second round trip
-    ///   included, or the floor becomes an oracle of its own;
-    /// - the divergence it defends against does not exist yet. Both hashes are
-    ///   minted by one `hash_secret` today, and there has been no tune.
+    /// - it covers THE WHOLE HANDLER, error paths and the success-path second
+    ///   round trip included. A floor over part of a call is an oracle over the
+    ///   rest of it;
+    /// - the round trip `Login` spends at `iam-db` does NOT hide the delta on its
+    ///   own, and nothing about its variance does. `get_password_hash` is issued
+    ///   on both paths, so its cost is COMMON MODE and cancels out of the
+    ///   difference between them; an attacker averaging N samples divides the
+    ///   standard error by √N against a per-class mean that stays put;
+    /// - it has to EXCEED the slowest legitimate verification, because one set
+    ///   below the true worst case does not close the oracle, it clips it. Which
+    ///   is why exceeding it WARNS rather than passing unnoticed: a floor is
+    ///   one-sided, and a verification slower than it answers late and still
+    ///   leaks. See `crate::service::Iam::hold_until_floor`.
     ///
     /// A FLOOR ON THE STORED PARAMETERS IS POSSIBLE AND IS STILL NOT THE ANSWER.
     /// `argon2::Params::try_from(&parsed)` hands back `m_cost`, `t_cost` and
@@ -446,13 +463,11 @@ impl Keys {
     /// plaintext, the plaintext arrives only at a login, and it can only be
     /// trusted once it has verified against that row's OLD parameters. A floor
     /// that refuses the row before verifying it turns every pre-tune account into
-    /// a permanent lockout instead of a rehash. The minting side is where the
-    /// floor belongs, and `crypto::tests` pins it there.
-    ///
-    /// So: build the response-time floor AT THE MOMENT A PARAMETER TUNE IS
-    /// PROPOSED, and treat it as part of that change rather than as a separate
-    /// improvement. This note is here so the next reader finds the analysis
-    /// instead of re-deriving it.
+    /// a permanent lockout instead of a rehash. The minting side is where a
+    /// PARAMETER floor belongs, and `crypto::tests` pins it there; the response
+    /// time is where the defence against a row that got past it belongs. This
+    /// note is here so the next reader finds the analysis instead of re-deriving
+    /// it.
     pub fn verify_password(&self, stored: Option<&str>, password: &str) -> bool {
         let hash_str = stored.unwrap_or(&self.dummy_hash);
         let verdict = PasswordHash::new(hash_str)

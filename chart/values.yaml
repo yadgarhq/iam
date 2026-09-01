@@ -52,3 +52,20 @@ autoscaling:
 # returns.
 nats:
   url: nats://nats:4222
+
+login:
+  # The shortest time Login may answer in, in milliseconds. It floors the WHOLE
+  # call, success and failure alike, so the response time stops being a function
+  # of how much Argon2 work the stored hash cost — which is what otherwise tells
+  # an attacker which usernames exist.
+  #
+  # 250 IS A FLOOR, NOT A TARGET, AND IT CAME FROM A MEASUREMENT ON DEV HARDWARE.
+  # 25 samples per class through the live edge: a matched-cost login at 27-29ms
+  # median, and a row stored at m=65536,t=3,p=1 at 98ms median and 136ms worst.
+  # Re-measure here and raise this if the slowest legitimate login on THIS
+  # cluster approaches it — a floor set under the true worst case does not close
+  # the leak, it clips it. iam logs a WARN naming both durations whenever a login
+  # exceeds the floor, which is the signal that this number is too low.
+  #
+  # Lowering it is a security change, not a latency optimisation.
+  responseFloorMs: 250

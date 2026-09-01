@@ -17,10 +17,11 @@
 //! legible, instead of a pod that passes its readiness probe and is wrong.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
-use yadgar_iam::service::Iam;
+use yadgar_iam::service::{Iam, DEFAULT_LOGIN_RESPONSE_FLOOR};
 use yadgar_iam::upstream;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -79,10 +80,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         yadgar_iam::invalidate::Invalidator::connect(std::env::var("NATS_URL").ok().as_deref())
             .await;
 
+    // The shortest time `Login` may answer in, whatever it found. Argon2id takes
+    // its cost from the PHC string it is verifying, so a stored hash provisioned
+    // at parameters other than this build's makes the response time report which
+    // usernames exist — see `crypto::Keys::verify_password`.
+    //
+    // PARSED, NOT SALVAGED: a mistyped value fails boot rather than falling back
+    // to the default. Silently substituting one would leave an operator who
+    // believes they raised the floor running the old one, and a security control
+    // nobody can tell is misconfigured is the failure this floor's own warning
+    // exists to prevent.
+    let default_floor_ms = DEFAULT_LOGIN_RESPONSE_FLOOR.as_millis().to_string();
+    let login_response_floor =
+        Duration::from_millis(env_or("LOGIN_RESPONSE_FLOOR_MS", &default_floor_ms).parse()?);
+    tracing::info!(
+        floor_ms = login_response_floor.as_millis() as u64,
+        "Login answers no sooner than its response-time floor"
+    );
+
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
     tracing::info!(%addr, "iam listening");
     tonic::transport::Server::builder()
-        .add_service(IamServiceServer::new(Iam::new(keys, db, invalidator)))
+        .add_service(IamServiceServer::new(Iam::new(
+            keys,
+            db,
+            invalidator,
+            login_response_floor,
+        )))
         .serve_with_shutdown(addr, async {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutting down");

@@ -57,7 +57,12 @@ uuid = { version = "1", features = ["v7"] }
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` for `#[tokio::test(start_paused = true)]`. The response-time floor
+# has one property no wall-clock assertion can pin — that the deadline is
+# ANCHORED to the start of the call rather than ADDED to the work it did — and a
+# paused clock is what turns that into an equality instead of a bound. Dev-only,
+# so the deployed binary never links the time-manipulation machinery.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"
