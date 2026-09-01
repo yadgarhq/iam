@@ -323,3 +323,58 @@ fn a_32_byte_key_loads_and_a_missing_one_is_named_in_the_error() {
         .expect_err("an absent key must be an error, not an empty one");
     assert!(matches!(err, KeyError::Unreadable(path, _) if path.ends_with(super::BLIND_INDEX_KEY)));
 }
+
+/// A `Keys` built the way `main` builds it — dummy hash and all.
+///
+/// The `keys()` fixture above mints its own `dummy_hash`, so a test that used it
+/// would be asserting on this file rather than on the construction the binary
+/// runs. This goes through the real path, which is what `from_dir` exists for.
+fn loaded_keys(name: &str) -> Keys {
+    let dir = key_dir(name);
+    std::fs::write(dir.join(super::ENCRYPTION_KEY), [4u8; 32]).expect("write the encryption key");
+    std::fs::write(dir.join(super::BLIND_INDEX_KEY), [5u8; 32]).expect("write the blind-index key");
+    Keys::from_dir(dir.to_str().unwrap()).expect("a fully provisioned key directory loads")
+}
+
+#[test]
+fn the_dummy_hash_costs_exactly_what_a_stored_hash_costs() {
+    // THE COUNTER TESTS ABOVE CANNOT SEE THIS. Argon2 takes its cost parameters
+    // from the PHC STRING being verified, not from the `Argon2` doing the
+    // verifying — `password-hash` builds them with `Params::try_from(hash)`. So
+    // "one verification each" is a statement about control flow, and the oracle
+    // is about COST: one verification of a 64 MiB, 4-pass hash and one of a
+    // 19 MiB, 2-pass hash are both one verification and are not the same wait.
+    //
+    // MUTATION THIS CATCHES: tuning `hash_password`'s parameters while the dummy
+    // stays at whatever it was. Measured on this code at m=65536,t=4 against a
+    // default dummy: present 13.726s, absent 0.250s — a 55x enumeration oracle,
+    // with both counter tests green. Nothing pinned the two together.
+    //
+    // Deterministic rather than a stopwatch: this compares the two parameter sets
+    // instead of two durations. A wall-clock assertion would need a tolerance
+    // wide enough to survive a loaded CI runner, and a tolerance that wide stops
+    // catching the smaller divergences.
+    //
+    // `Params` covers the digest length too, without a separate assertion:
+    // `Params::try_from` recovers `output_len` from the hash itself, because the
+    // PHC parameter string does not carry it.
+    let k = loaded_keys("dummy-cost");
+
+    let stored = k.hash_password("correct horse").expect("hash a password");
+    let stored = PasswordHash::new(&stored).expect("a freshly written hash parses");
+    let dummy = PasswordHash::new(&k.dummy_hash).expect("the dummy hash parses");
+
+    assert_eq!(
+        stored.algorithm, dummy.algorithm,
+        "the dummy hash must use the same Argon2 variant as a stored one"
+    );
+    assert_eq!(
+        stored.version, dummy.version,
+        "the dummy hash must use the same Argon2 version as a stored one"
+    );
+    assert_eq!(
+        argon2::Params::try_from(&stored).expect("stored parameters"),
+        argon2::Params::try_from(&dummy).expect("dummy parameters"),
+        "an absent user must cost the same memory, passes and lanes as a present one"
+    );
+}
