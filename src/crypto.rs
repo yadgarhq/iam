@@ -124,9 +124,32 @@ pub(crate) fn argon2_verifications() -> usize {
 fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> bool {
     #[cfg(test)]
     ARGON2_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+    // `Argon2::default()` here sets NOTHING about what this costs: the cost comes
+    // from `parsed`, whose parameters `password_hash` reads back out of the PHC
+    // string. Which is why both hashes have to be minted by `hash_secret`.
     Argon2::default()
         .verify_password(password.as_bytes(), parsed)
         .is_ok()
+}
+
+/// The ONE place a password becomes a PHC string, and so the one place Argon2id
+/// is configured.
+///
+/// Both the stored hash and the dummy hash go through here, and that is the
+/// whole point. `verify_password` takes its cost parameters from the PHC STRING
+/// it is verifying — `password_hash` rebuilds them with `Params::try_from(hash)`
+/// — and NOT from the `Argon2` doing the verifying. Two independently chosen
+/// parameter sets would therefore make the absent path cheaper or dearer than
+/// the present one, reopening the enumeration oracle this module exists to
+/// close, in silence, under a change as ordinary as tuning the cost. One
+/// function means tuning it moves both hashes together.
+fn hash_secret(secret: &[u8]) -> Result<String, argon2::password_hash::Error> {
+    // A fresh salt per hash, so two people choosing the same password are not
+    // visibly identical in the table.
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(secret, &salt)
+        .map(|h| h.to_string())
 }
 
 impl Keys {
@@ -140,18 +163,23 @@ impl Keys {
             .ok()
             .filter(|d| !d.is_empty())
             .ok_or(KeyError::Unconfigured)?;
+        Self::from_dir(&dir)
+    }
 
+    /// Everything [`Self::from_env`] does except read the environment.
+    ///
+    /// The split exists so the dummy hash can be asserted on. `from_env` reads a
+    /// process-wide variable, which no test can set without racing every other
+    /// test in the binary, so the construction that mints `dummy_hash` had no
+    /// test at all — and that hash is one half of the timing equalisation.
+    fn from_dir(dir: &str) -> Result<Self, KeyError> {
         let mut filler = [0u8; 32];
         OsRng.fill_bytes(&mut filler);
-        let salt = SaltString::generate(&mut OsRng);
-        let dummy_hash = Argon2::default()
-            .hash_password(&filler, &salt)
-            .map_err(|e| KeyError::Dummy(e.to_string()))?
-            .to_string();
+        let dummy_hash = hash_secret(&filler).map_err(|e| KeyError::Dummy(e.to_string()))?;
 
         Ok(Self {
-            encryption: read_key(&dir, ENCRYPTION_KEY)?,
-            blind_index: read_key(&dir, BLIND_INDEX_KEY)?,
+            encryption: read_key(dir, ENCRYPTION_KEY)?,
+            blind_index: read_key(dir, BLIND_INDEX_KEY)?,
             dummy_hash,
         })
     }
@@ -228,12 +256,12 @@ impl Keys {
         )))
     }
 
+    /// Hash a password for storage.
+    ///
+    /// Through [`hash_secret`], and the dummy hash is too — see the note there
+    /// for why the two must not be configured separately.
     pub fn hash_password(&self, password: &str) -> Result<String, CryptoError> {
-        let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
-            .map(|h| h.to_string())
-            .map_err(|e| CryptoError::BadHash(e.to_string()))
+        hash_secret(password.as_bytes()).map_err(|e| CryptoError::BadHash(e.to_string()))
     }
 
     /// Verify a password, taking the same time whether or not the user exists.
