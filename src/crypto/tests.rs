@@ -192,6 +192,85 @@ fn a_corrupt_stored_hash_is_not_a_fast_path_either() {
     );
 }
 
+#[test]
+fn a_stored_hash_the_verifier_refuses_before_hashing_is_not_a_fast_path() {
+    // THE TEST ABOVE COVERS ONE CORRUPTION SHAPE AND MISSES THESE. "not a PHC
+    // string at all" is the shape that is handled CORRECTLY — it fails
+    // `PasswordHash::new`, takes the `else` arm, and pays the dummy. The shapes
+    // below PARSE, so they sail past that guard and reach a verifier that then
+    // computes nothing:
+    //
+    // - no digest: `password_hash`'s blanket `PasswordVerifier` impl is gated on
+    //   `if let (Some(salt), Some(expected_output)) = (&hash.salt, &hash.hash)`
+    //   and otherwise falls straight through to `Err(Error::Password)` — the same
+    //   error a wrong password gets, without hashing anything;
+    // - an illegal parameter set: `Params::try_from` rejects `m=8,p=2` (Argon2
+    //   requires `m >= 8 * p`) and the `?` returns before the first block of
+    //   memory is touched.
+    //
+    // MEASURED on this code before the fix, release build, against the ~12ms a
+    // real verification costs there: 2.4µs for the digest-less hash, 511ns with
+    // the salt gone too, and 1.3µs for the illegal parameters — a 4,900x to
+    // 23,000x fast path. After the fix all three cost 11.8-12.1ms, against 12.6ms
+    // for the absent-user path they now have to be indistinguishable from.
+    //
+    // BOTH counter tests above stayed green throughout, which is the point: the
+    // counter incremented on entry to `verify_counted` rather than where the work
+    // happens, so it reported control flow while claiming to report cost.
+    //
+    // MUTATIONS THIS CATCHES: dropping the `salt`/`hash` presence check, or
+    // turning the `Err(_) => None` arm into `Some(false)`. Each returns a verdict
+    // for a call that hashed nothing, so the dummy that pays for it is skipped.
+    //
+    // AND the instrumentation regression itself: moving the increment out of
+    // `CountingArgon2` and back to the top of `verify_counted`. That is what makes
+    // this test possible at all. The counter used to be derived from the same
+    // decision it was measuring, so a mutation to the decision moved the counter
+    // with it and every assertion below still read 1. Counting inside
+    // `hash_password_customized` — which `password_hash` reaches only after it has
+    // committed to hashing — is what made the two independent.
+    //
+    // Reachable the same way the test above is: `iam-db`'s `SetPassword` writes a
+    // caller-supplied string verbatim into VARCHAR(255).
+    //
+    // "x" DELIBERATELY, as elsewhere in this file: the fixture's dummy_hash is the
+    // hash of "x", so the fallback verification SUCCEEDS and `stored.is_some()` is
+    // the only thing still returning false. A password that failed on its own
+    // would let a mutation that authenticates here pass unnoticed.
+    let k = keys();
+
+    for (shape, stored) in [
+        (
+            "no digest",
+            "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0c2FsdA",
+        ),
+        ("no salt and no digest", "$argon2id$v=19$m=19456,t=2,p=1"),
+        (
+            "an illegal parameter set",
+            "$argon2id$v=19$m=8,t=1,p=2$c29tZXNhbHRzYWx0c2FsdA\
+             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
+        ),
+    ] {
+        // Guards the test itself: if any of these ever stopped parsing it would
+        // take the `else` arm and silently become a copy of the test above.
+        assert!(
+            PasswordHash::new(stored).is_ok(),
+            "{shape}: must PARSE, or this asserts nothing the previous test does not"
+        );
+
+        let before = argon2_verifications();
+        let ok = k.verify_password(Some(stored), "x");
+        let spent = argon2_verifications() - before;
+
+        assert!(!ok, "{shape}: must never verify");
+        assert_eq!(
+            spent, 1,
+            "{shape}: parses but hashes nothing, so it must still cost one real \
+             Argon2 verification against the dummy"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KNOWN-ANSWER tests.
 //

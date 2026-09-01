@@ -98,13 +98,20 @@ fn read_key(dir: &str, name: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     Ok(key)
 }
 
-// Count one Argon2id verification.
+// Count one Argon2id verification THAT ACTUALLY COMPUTED SOMETHING.
 //
 // THE TIMING EQUALISATION IS INVISIBLE TO AN ORDINARY ASSERTION. A test that only
 // checks the ANSWER of `verify_password(None, …)` passes with the dummy hash, its
 // generation and `KeyError::Dummy` all deleted — the answer is `false` either
 // way. Counting the verifications measures the property itself, and does it
 // deterministically rather than by reading a clock.
+//
+// COUNTED INSIDE THE LIBRARY'S HASHING CALL, and not on entry to `verify_counted`
+// — see [`CountingArgon2`]. Counting on entry made this read "one verification"
+// for calls that touched not one block of memory: the instrument every test below
+// leans on, reporting control flow while claiming to report cost. That is
+// precisely the mistake this module exists to catch, committed inside the thing
+// that catches it.
 //
 // A THREAD-LOCAL, because the test binary runs tests in parallel in one process
 // and a global counter would make each test's reading depend on which others
@@ -119,17 +126,92 @@ pub(crate) fn argon2_verifications() -> usize {
     ARGON2_VERIFICATIONS.with(std::cell::Cell::get)
 }
 
-/// Verify once, and record that it happened. Compiles to the bare verification
-/// outside tests — the counter costs nothing in a deployed binary.
-fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> bool {
-    #[cfg(test)]
-    ARGON2_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+/// An `Argon2` that counts at the moment the hashing actually starts.
+///
+/// THE COUNTER HAS TO BE INDEPENDENT OF THE CODE IT MEASURES, and putting it
+/// anywhere in `verify_counted` is not. `verify_counted` decides which hashes are
+/// usable; if the counter were derived from that same decision, then a mutation to
+/// the decision would move the counter with it and the tests would go on reading
+/// "one verification" while nothing was computed — the exact failure this file is
+/// fixing, reintroduced one level up.
+///
+/// `password_hash`'s blanket `PasswordVerifier` impl reaches
+/// `hash_password_customized` ONLY once it has committed to hashing: past its
+/// `(Some(salt), Some(expected_output))` gate and past `Params::try_from`. So an
+/// increment here means the memory really is about to be filled, whatever
+/// `verify_counted` believes.
+#[cfg(test)]
+struct CountingArgon2(Argon2<'static>);
+
+#[cfg(test)]
+impl PasswordHasher for CountingArgon2 {
+    type Params = argon2::Params;
+
+    fn hash_password_customized<'a>(
+        &self,
+        password: &[u8],
+        algorithm: Option<argon2::password_hash::Ident<'a>>,
+        version: Option<argon2::password_hash::Decimal>,
+        params: Self::Params,
+        salt: impl Into<argon2::password_hash::Salt<'a>>,
+    ) -> argon2::password_hash::Result<PasswordHash<'a>> {
+        ARGON2_VERIFICATIONS.with(|c| c.set(c.get() + 1));
+        self.0
+            .hash_password_customized(password, algorithm, version, params, salt)
+    }
+}
+
+/// Verify once against `parsed`, and record it if the Argon2 work happened.
+///
+/// `Some(verdict)` means a full Argon2id computation ran and this is its answer.
+/// `None` means THE VERIFIER REFUSED THE HASH WITHOUT COMPUTING ANYTHING, and the
+/// caller therefore still owes the equalisation a real verification.
+///
+/// `None` is not hypothetical. `password_hash`'s blanket `PasswordVerifier` impl
+/// computes nothing in two cases that a CLEANLY PARSED PHC string reaches, so
+/// neither is caught by `PasswordHash::new` failing:
+///
+/// - no digest, or no salt — the impl is gated on
+///   `if let (Some(salt), Some(expected_output)) = (&hash.salt, &hash.hash)` and
+///   otherwise falls straight through to `Err(Error::Password)`, the very error a
+///   wrong password gets;
+/// - a parameter string `Params::try_from` rejects — `m=8,t=1,p=2` is legal PHC
+///   and not a legal Argon2 configuration (`m >= 8 * p`), so the `?` returns
+///   before the first block of memory is touched.
+///
+/// Both answer in MICROSECONDS — measured at 511ns to 2.4µs, release build —
+/// against the ~12ms a real verification costs there, and
+/// that gap is the whole oracle. Telling them apart is why this returns the
+/// verdict rather than a bare bool: `Error::Password` is ambiguous ON ITS OWN —
+/// a wrong password and the ungated fall-through both return it — and stops being
+/// ambiguous only once the digest is known present, which is checked first.
+///
+/// Compiles to the bare verification outside tests — the counting wrapper exists
+/// only under `cfg(test)` and costs nothing in a deployed binary.
+fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> Option<bool> {
+    // The library's gate, restated. With no digest there is nothing to compare a
+    // computation against, so it does not perform one.
+    if parsed.salt.is_none() || parsed.hash.is_none() {
+        return None;
+    }
+
     // `Argon2::default()` here sets NOTHING about what this costs: the cost comes
     // from `parsed`, whose parameters `password_hash` reads back out of the PHC
     // string. Which is why both hashes have to be minted by `hash_secret`.
-    Argon2::default()
-        .verify_password(password.as_bytes(), parsed)
-        .is_ok()
+    #[cfg(test)]
+    let hasher = CountingArgon2(Argon2::default());
+    #[cfg(not(test))]
+    let hasher = Argon2::default();
+
+    match hasher.verify_password(password.as_bytes(), parsed) {
+        // The digest is present, so both of these are the answer to a real
+        // computation rather than a refusal wearing the same error.
+        Ok(()) => Some(true),
+        Err(argon2::password_hash::Error::Password) => Some(false),
+        // An unusable parameter set, a mismatched algorithm: refused BEFORE any
+        // hashing, and so not a verification at all.
+        Err(_) => None,
+    }
 }
 
 /// The ONE place a password becomes a PHC string, and so the one place Argon2id
@@ -143,6 +225,13 @@ fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> bool {
 /// the present one, reopening the enumeration oracle this module exists to
 /// close, in silence, under a change as ordinary as tuning the cost. One
 /// function means tuning it moves both hashes together.
+///
+/// TUNING THE COST HERE IS NOT A SELF-CONTAINED CHANGE. One function moves both
+/// hashes together only from that moment ON; every row written before the tune
+/// keeps its old cost, and no rehash can move it without the plaintext. That
+/// residual, and the response-time floor that is the only thing which closes it,
+/// are worked through at [`Keys::verify_password`]. Read that note BEFORE
+/// changing the parameters below — the floor belongs in the same change.
 fn hash_secret(secret: &[u8]) -> Result<String, argon2::password_hash::Error> {
     // A fresh salt per hash, so two people choosing the same password are not
     // visibly identical in the table.
@@ -269,14 +358,66 @@ impl Keys {
     /// Pass `None` when no user matched. It still runs a full Argon2id
     /// verification, against the dummy hash, and then returns false — because
     /// returning early is exactly what would make the two cases distinguishable.
+    ///
+    /// PARSING IS NOT ENOUGH TO KNOW THE WORK HAPPENED, which is what the `None`
+    /// arm below is for: a PHC string can parse cleanly and still be refused by
+    /// the verifier before it hashes anything. See [`verify_counted`].
+    ///
+    /// # The residual this does NOT close, and why there is no time floor
+    ///
+    /// Everything here equalises by making both paths verify a hash with the SAME
+    /// PARAMETERS. That holds only while every stored hash shares the dummy's
+    /// parameters, and one event breaks it permanently: A GENUINE COST TUNE. The
+    /// dummy is minted fresh at boot, so it moves the moment `hash_secret`
+    /// changes; rows written before the tune keep the old cost forever. Their
+    /// logins then run measurably faster than an unknown username's, and the
+    /// oracle is open again for exactly the accounts that are oldest.
+    ///
+    /// IT CANNOT BE CLOSED BY REHASHING. A password hash cannot be re-derived to
+    /// new parameters without the plaintext, so the usual "rehash them at next
+    /// login" answer only ever applies to people who log in — and, today, to
+    /// nobody: [`Self::hash_password`] has no production caller, `iam` exposes no
+    /// `SetPassword`, and `CreateUser` takes no password. The same divergence
+    /// reaches a row directly, without any tune at all, because `iam-db`'s
+    /// `SetPassword` writes a caller-supplied string verbatim: a stored hash at
+    /// `m=8,t=1,p=1` does real Argon2 work and still returns in ~16µs, against
+    /// the ~12ms a default-cost hash takes in the same release build.
+    ///
+    /// The only defence that generalises is A FIXED RESPONSE-TIME FLOOR on the
+    /// `Login` RPC — sleep until a constant deadline on every path, so the
+    /// response time stops being a function of the work done. It is deliberately
+    /// NOT built here:
+    ///
+    /// - the floor has to exceed the SLOWEST legitimate verification, and one set
+    ///   below the true worst case does not close the oracle, it clips it. That
+    ///   number is a measurement on the deployment target, which does not exist
+    ///   yet, and a guess would buy latency on every login for a property it does
+    ///   not actually deliver;
+    /// - `Login` already spends a network round trip at `iam-db` before reaching
+    ///   here, and a second one when it succeeds. That variance is larger than
+    ///   the Argon2 delta a floor would be hiding, so the floor has to cover the
+    ///   whole handler, error paths included, or it becomes an oracle of its own;
+    /// - the divergence it defends against does not exist yet. Both hashes are
+    ///   minted by one `hash_secret` today, and there has been no tune.
+    ///
+    /// So: build the floor AT THE MOMENT A PARAMETER TUNE IS PROPOSED, and treat
+    /// it as part of that change rather than as a separate improvement. This note
+    /// is here so the next reader finds the analysis instead of re-deriving it.
     pub fn verify_password(&self, stored: Option<&str>, password: &str) -> bool {
         let hash_str = stored.unwrap_or(&self.dummy_hash);
-        let Ok(parsed) = PasswordHash::new(hash_str) else {
-            // A corrupt stored hash must not be a fast path either.
+        let verdict = PasswordHash::new(hash_str)
+            .ok()
+            .and_then(|parsed| verify_counted(password, &parsed));
+
+        let Some(ok) = verdict else {
+            // NOTHING WAS COMPUTED ABOVE — the stored value did not parse, or it
+            // parsed into something the verifier refuses before hashing. Either
+            // way this branch has so far cost microseconds, and returning here
+            // would hand back the fast answer for a username that EXISTS. Buy the
+            // time honestly instead, against a hash that is known good.
             let _ = PasswordHash::new(&self.dummy_hash).map(|d| verify_counted(password, &d));
             return false;
         };
-        let ok = verify_counted(password, &parsed);
         // `stored.is_some()` is checked AFTER the work, not before it.
         ok && stored.is_some()
     }
