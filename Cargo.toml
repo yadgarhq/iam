@@ -12,14 +12,30 @@ description = "The identity module's logic service: business rules, no store."
 # in this dependency tree would mean it could open its own connection, which is
 # what the twin exists to prevent. proto-contract-design keeps a per-repo check
 # for exactly this.
+#
+# `tls-ring` is DECLARED HERE rather than inherited. `yadgar-dial` enables it and
+# feature unification would hand it to this crate anyway, but a feature this
+# crate's own `serve::builder` calls into is one this crate must ask for: the day
+# the dial dependency changes, an implicit feature disappears with it and the
+# error lands on a line nobody edited. `tls-ring` rather than `tls-aws-lc` for
+# the reason dial gives — aws-lc-rs needs cmake and a C toolchain, and this
+# builds for x86_64-unknown-linux-musl (D63).
 tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "router",
   "server",
   "transport",
   "channel",
+  "tls-ring",
 ] }
 tonic-prost = "0.14"
+# The SAME PEM parser tonic itself uses on the certificate and the key, so "this
+# file holds no certificate" is decided in `serve.rs` rather than failing
+# opaquely inside the acceptor. Present in the tree already by way of
+# tokio-rustls; naming it directly costs nothing and is what lets the error say
+# WHICH of the two files an operator has to fix. It is the same reasoning, and
+# the same crate, that `yadgar_dial::TlsOptions::prepare` uses on a CA bundle.
+rustls-pki-types = { version = "1", features = ["std"] }
 yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e9ec92a6efd74363e68c694fe6c0fa" }
 
 # The shared instrumentation seam (D67). Pinned by revision, like every other
@@ -62,7 +78,24 @@ tonic-prost-build = "0.14"
 # ANCHORED to the start of the call rather than ADDED to the work it did — and a
 # paused clock is what turns that into an equality instead of a bound. Dev-only,
 # so the deployed binary never links the time-manipulation machinery.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+#
+# `net` and `time` for the TLS rig in tests/serve_tls.rs: it binds its own
+# listeners and waits for the port rather than sleeping a guessed interval.
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+  "net",
+  "time",
+] }
+# Certificates are MINTED PER TEST RUN rather than checked in: a fixture key in
+# the repository is a secret in the repository, and it expires on a date nobody
+# is watching.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# Wraps a `TcpListener` the rig owns into the stream `serve_with_incoming` takes,
+# which is how the same builder the binary uses gets served on a port the test
+# chose. Dev-only, so the shipped tree is unchanged.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints.rust]
 unsafe_code = "forbid"

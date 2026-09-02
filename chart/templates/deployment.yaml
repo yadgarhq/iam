@@ -53,6 +53,24 @@ spec:
             - name: grpc
               containerPort: 50052
           env:
+            {{- if .Values.tls.enabled }}
+            # THE CERTIFICATE THIS SERVICE PRESENTS, not one it verifies —
+            # `IAM_DB_TLS_*` below is the other direction, and the two share a
+            # word. RENDERED ONLY WHEN ASKED FOR, so a deployment that has not
+            # cut over sends the binary nothing at all and binds the plaintext
+            # listener it always bound. Absence is the default, and the flag is
+            # the whole of the lever.
+            - name: LISTEN_TLS_ENABLED
+              value: "1"
+            # PATHS, never an issuer-specific resource (D80). cert-manager writes
+            # these files in the reference deployment and a hand-assembled Secret
+            # writes them anywhere else; neither the chart nor the binary can
+            # tell the difference, which is the point.
+            - name: LISTEN_TLS_CERT_FILE
+              value: /var/run/secrets/iam-tls/tls.pem
+            - name: LISTEN_TLS_KEY_FILE
+              value: /var/run/secrets/iam-tls/tls-key.pem
+            {{- end }}
             - name: IAM_DB_HOST
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT
@@ -162,6 +180,16 @@ spec:
             - name: keys
               mountPath: /var/run/secrets/iam-keys
               readOnly: true
+            {{- if .Values.tls.enabled }}
+            # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
+            # the enrolment CA below: a subPath mount is a one-time copy that
+            # kubelet never refreshes, so a renewed certificate would never reach
+            # this process and the listener would keep serving an expired one
+            # until somebody restarted it.
+            - name: serving-cert
+              mountPath: /var/run/secrets/iam-tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.iamDb.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
             # the enrolment CA below: a subPath mount is a one-time copy that
@@ -185,6 +213,31 @@ spec:
         - name: keys
           secret:
             secretName: {{ .Values.keysSecret }}
+        {{- if .Values.tls.enabled }}
+        - name: serving-cert
+          secret:
+            secretName: {{ required "tls.certSecret holds the certificate and private key iam serves and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecret }}
+            # OPTIONAL, and it means what it means on the iam-db CA above rather
+            # than what it means on the enrolment CA below: the process MUST NOT
+            # START without a usable certificate, and optional is simply which
+            # error says so. A required mount that cannot be satisfied leaves the
+            # pod in ContainerCreating with a FailedMount event about a volume;
+            # an optional one mounts an empty directory, the binary finds no file
+            # at LISTEN_TLS_CERT_FILE, and it exits naming THAT PATH and saying
+            # that TLS was asked for so cleartext is not the answer. Neither
+            # starts; only one of them explains itself.
+            optional: true
+            # BOTH KEYS, because a listener cannot present a certificate it has
+            # no key for — the one mount in this file that is meant to carry a
+            # private key, and it is this pod's own. Selecting them by name is
+            # also what renames whatever the issuer called them to the paths the
+            # environment names above.
+            items:
+              - key: {{ required "tls.certSecretKey names the key inside tls.certSecret that holds the certificate and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.certSecretKey | quote }}
+                path: tls.pem
+              - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
+                path: tls-key.pem
+        {{- end }}
         {{- if .Values.iamDb.tls.enabled }}
         - name: iam-db-ca
           secret:

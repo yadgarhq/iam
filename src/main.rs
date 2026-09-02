@@ -23,12 +23,24 @@
 //! stops the process, because the only other thing to do with it is connect in
 //! cleartext — and this connection carries every password verification and every
 //! encrypted personal-data field in the system.
+//!
+//! **The transport this service LISTENS on follows the same rule, in the other
+//! direction**, and is decided FIRST — before the keys, before the dial. A
+//! certificate that is missing, unreadable, undecodable, or paired with a key
+//! belonging to something else stops the process rather than binding a plaintext
+//! listener. That downgrade is the one failure an operator who asked for
+//! encryption cannot see: the pod is Running, the readiness probe passes, and
+//! every caller is in the clear.
+//!
+//! Both transports are OPT-IN and OFF by default, so an unconfigured deployment
+//! dials and listens exactly as it always has.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
+use yadgar_iam::serve;
 use yadgar_iam::service::{
     EnrolmentConfig, Iam, ResponseFloors, DEFAULT_LOGIN_RESPONSE_FLOOR,
     DEFAULT_REDEEM_RESPONSE_FLOOR,
@@ -57,6 +69,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // THE TRANSPORT THIS SERVICE LISTENS ON, decided before anything else. A
+    // missing certificate, an unreadable one, a file holding no certificate at
+    // all and a key belonging to a different certificate are all refused HERE —
+    // never downgraded to the plaintext listener, because a listener that
+    // quietly stayed in the clear is the one failure an operator who asked for
+    // TLS cannot see.
+    //
+    // `.to_string()` on the way out for the reason spelled out on the dial
+    // below: `Box<dyn Error>` prints with DEBUG, and these messages are
+    // sentences naming a file.
+    let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
+    let mut server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
+
     // Fails boot loudly if the keys are absent or unreadable — deliberately
     // before the listener binds. See the module doc above for why this one
     // dependency is NOT allowed to degrade gracefully the way iam-db is.
@@ -69,9 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_port: u16 = env_or("IAM_DB_PORT", "50051").parse()?;
 
     // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
-    // the cleartext dial this service has always done — no server in the estate
-    // serves TLS yet, so the cut-over is a later change that can be reverted on
-    // its own.
+    // the cleartext dial this service has always done. `iam-db` can now serve
+    // TLS, also opt-in and also off, so the cut-over is a later change that
+    // turns both ends on together and can be reverted on its own.
     //
     // `.to_string()` on the way out, and not decoration: `main` returns
     // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
@@ -168,8 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
-    tracing::info!(%addr, "iam listening");
-    tonic::transport::Server::builder()
+    // `tls` is recorded because "is this listener encrypted?" must be answerable
+    // from the boot log rather than inferred from which variables somebody
+    // believes they set.
+    tracing::info!(%addr, tls = listen_tls.is_some(), "iam listening");
+    server
         .add_service(IamServiceServer::new(Iam::new(
             keys,
             db,
