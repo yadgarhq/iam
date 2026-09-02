@@ -111,7 +111,7 @@ enrolment:
   # that stranger's machine as an undiagnosable connection error.
   gateway: "https://gateway.yadgar.internal:18443"
 
-  # A ConfigMap holding the root CA the token carries, under the key `ca.pem`.
+  # The Secret holding the root CA the token carries.
   #
   # EMPTY MEANS SYSTEM TRUST, which is a legitimate deployment rather than a
   # missing value: the mechanism exists for development and private deployments,
@@ -119,7 +119,34 @@ enrolment:
   # empty are different instructions to a client, and iam refuses a CA file that
   # is present and empty for exactly that reason.
   #
-  # A ConfigMap and not a Secret: a root CA certificate is public by
-  # construction. Putting it in a Secret would claim a confidentiality it does
-  # not have and does not need.
-  caConfigMap: ""
+  # THE VALUE IS THE GATEWAY'S OWN CERTIFICATE SECRET, and that is the design
+  # rather than a convenience. cert-manager writes `tls.crt` and `ca.crt` into
+  # this one Secret in a single issuance, so the anchor named here is BY
+  # CONSTRUCTION the anchor for the certificate the gateway IS SERVING. There is
+  # no copy to refresh and no second object to keep in step, so the two cannot
+  # drift apart.
+  #
+  # NOT THE ISSUER'S OWN SECRET. `yadgar-dev-ca` holds the root itself, but it
+  # can run AHEAD of the leaf — a new root published before the gateway's
+  # certificate has been reissued — and a token minted from it in that window
+  # carries a root that does not sign what the gateway serves. It also lives in
+  # cert-manager's namespace, which this pod cannot mount from at all.
+  #
+  # NOT A PEM PASTED INTO THIS FILE. The root rotates. A copy in git is correct
+  # only until the rotation nobody remembered to follow, and the failure then
+  # lands on a stranger's first connection rather than on the person who moved
+  # the CA.
+  #
+  # A SECRET, THOUGH A ROOT CA IS PUBLIC. Reading it here claims no
+  # confidentiality the certificate does not have; it references the artifact
+  # where cert-manager ACTUALLY WRITES the CA, and cert-manager writes Secrets.
+  # The mount selects one key alone, so the gateway's private key — which shares
+  # this Secret — never enters the pod.
+  caSecret: gateway-tls
+
+  # The key inside that Secret which holds the CA, mounted as `ca.pem`.
+  #
+  # `ca.crt` is cert-manager's name for the certificate that signed the leaf.
+  # Named here rather than assumed, because a Secret assembled by hand for a
+  # deployment cert-manager does not run in is free to call it something else.
+  caSecretKey: ca.crt

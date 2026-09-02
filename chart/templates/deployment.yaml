@@ -108,7 +108,7 @@ spec:
             # refusal, without an availability cost.
             - name: ENROLMENT_GATEWAY
               value: {{ .Values.enrolment.gateway | quote }}
-            {{- if .Values.enrolment.caConfigMap }}
+            {{- if .Values.enrolment.caSecret }}
             # Set ONLY when a CA is configured. Absence is the whole of "use
             # system trust", so an empty value here would be a token assembled
             # wrong rather than a deployment without a CA — and iam refuses that.
@@ -139,7 +139,12 @@ spec:
             - name: keys
               mountPath: /var/run/secrets/iam-keys
               readOnly: true
-            {{- if .Values.enrolment.caConfigMap }}
+            {{- if .Values.enrolment.caSecret }}
+            # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
+            # copy that kubelet never refreshes, so the CA would freeze at
+            # whatever it was when the pod started — and the propagation that
+            # follows the certificate through a rotation is the entire reason
+            # this reads the gateway's own Secret rather than a pasted copy.
             - name: enrolment-ca
               mountPath: /var/run/config/iam-ca
               readOnly: true
@@ -148,8 +153,33 @@ spec:
         - name: keys
           secret:
             secretName: {{ .Values.keysSecret }}
-        {{- if .Values.enrolment.caConfigMap }}
+        {{- if .Values.enrolment.caSecret }}
         - name: enrolment-ca
-          configMap:
-            name: {{ .Values.enrolment.caConfigMap }}
+          secret:
+            secretName: {{ .Values.enrolment.caSecret }}
+            # OPTIONAL, for the reason the readiness comment above gives. A
+            # Secret that is missing must not wedge this pod in
+            # ContainerCreating: iam is the authentication plane and the CA
+            # belongs to ONE administrative RPC, so coupling the whole process's
+            # startup to the TLS edge would trade an estate-wide outage for an
+            # enrolment one. Optional mounts an empty directory instead, the
+            # file iam is told to read is then absent, and
+            # `EnrolmentConfig::from_env` fails with `UnreadableCa` — a WARN at
+            # boot and FAILED_PRECONDITION from IssueEnrolment, with Login and
+            # ResolveCredential untouched. Identical to the trade
+            # ENROLMENT_GATEWAY already makes above.
+            optional: true
+            # ONE KEY, not the whole Secret. `gateway-tls` also holds the
+            # gateway's PRIVATE KEY, and iam has no business being able to read
+            # it. Selecting a single key is what keeps it out of the pod, and it
+            # is also what renames cert-manager's `ca.crt` to the `ca.pem` that
+            # ENROLMENT_CA_PEM_FILE names.
+            #
+            # `required` rather than a bare lookup: a values override that nulls
+            # the key would render an empty `key:` here, which the API server
+            # rejects at sync time with a message about the volume rather than
+            # about the value. This names the value instead.
+            items:
+              - key: {{ required "enrolment.caSecretKey names the key inside enrolment.caSecret that holds the CA and must be set whenever enrolment.caSecret is; see the chart's values.yaml" .Values.enrolment.caSecretKey | quote }}
+                path: ca.pem
         {{- end }}
