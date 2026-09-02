@@ -67,6 +67,24 @@ spec:
             # backstop for exactly that window.
             - name: NATS_URL
               value: {{ .Values.nats.url | quote }}
+            # The shortest time Login may answer in. A security control rather
+            # than a tuning knob: it is what stops the response time from
+            # reporting how much Argon2 work a row cost, and so which usernames
+            # exist. Templated rather than left to the binary's default because
+            # the right value is a MEASUREMENT of the slowest legitimate login on
+            # THIS cluster, and the default was measured on dev hardware. iam
+            # warns when a login exceeds it, which is the signal to raise it.
+            #
+            # `required` rather than a bare lookup or a `| default 250`. A values
+            # override that nulls `login` renders an EMPTY string here, `env_or`
+            # returns it for a set-but-empty variable, and the parse then fails
+            # at boot — a CrashLoop whose cause is three layers from its message.
+            # `required` turns that into a template-time error naming the value.
+            # NOT `| default`, which would hand back a floor nobody chose, and a
+            # security control configured by accident is the failure this whole
+            # change is about.
+            - name: LOGIN_RESPONSE_FLOOR_MS
+              value: {{ required "login.responseFloorMs is the Login response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.login.responseFloorMs | quote }}
           # This service does NOT wait for iam-db before listening, so the port
           # opening means "process up", not "dependency healthy" — deliberately.
           # Blocking startup on a -db that is still migrating would turn one

@@ -4,6 +4,8 @@
 //! encrypted or hashed *here* before it crosses the storage boundary. The
 //! division is what makes a stolen database backup worthless on its own.
 
+use std::time::{Duration, Instant};
+
 use tonic::{Request, Response, Status};
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
@@ -17,23 +19,181 @@ use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
 
 const SERVICE: &str = "iam";
 
+/// The default response-time floor for [`IamService::login`].
+///
+/// A FLOOR, NOT A TARGET. It is the shortest time `Login` is allowed to answer
+/// in, not the time it is expected to take: a call that already costs more than
+/// this is not slowed further, and is warned about instead.
+///
+/// 250ms COMES FROM A MEASUREMENT, and the measurement is on DEV HARDWARE — treat
+/// it as a starting point for a deployment rather than a constant. Through the
+/// live edge, 25 samples per class, wrong password throughout: a stored hash at
+/// `m=16384,t=2,p=1` answered in 27ms median / 41ms max, the unknown-user dummy
+/// at `Argon2::default()` (`m=19456,t=2,p=1`) in 29ms / 47ms, and a stored hash
+/// at `m=65536,t=3,p=1` in 98ms median / 136ms max. 250ms clears that worst case
+/// with room, which is the property that matters: A FLOOR SET BELOW THE SLOWEST
+/// LEGITIMATE VERIFICATION DOES NOT CLOSE THE ORACLE, IT CLIPS IT.
+///
+/// Re-measure on the deployment target and raise `LOGIN_RESPONSE_FLOOR_MS` if
+/// the slowest legitimate login there approaches this. `Login` says so itself
+/// when it happens — see `Iam::hold_until_floor`.
+pub const DEFAULT_LOGIN_RESPONSE_FLOOR: Duration = Duration::from_millis(250);
+
 pub struct Iam {
     keys: Keys,
     channel: tonic::transport::Channel,
     invalidator: Invalidator,
+    /// See [`DEFAULT_LOGIN_RESPONSE_FLOOR`] and `Iam::hold_until_floor`.
+    login_response_floor: Duration,
 }
 
 impl Iam {
-    pub fn new(keys: Keys, channel: tonic::transport::Channel, invalidator: Invalidator) -> Self {
+    /// `login_response_floor` is REQUIRED rather than defaulted, so that the one
+    /// place it is chosen is the one place it can be read — `main`, from
+    /// `LOGIN_RESPONSE_FLOOR_MS`. A constructor that silently supplied
+    /// [`DEFAULT_LOGIN_RESPONSE_FLOOR`] would let a caller build an `Iam` whose
+    /// floor nobody selected, which is how a security control ends up configured
+    /// by accident.
+    pub fn new(
+        keys: Keys,
+        channel: tonic::transport::Channel,
+        invalidator: Invalidator,
+        login_response_floor: Duration,
+    ) -> Self {
         Self {
             keys,
             channel,
             invalidator,
+            login_response_floor,
         }
     }
 
     fn client(&self) -> IamDbServiceClient<tonic::transport::Channel> {
         IamDbServiceClient::new(self.channel.clone())
+    }
+
+    /// Everything `Login` actually does. Wrapped by the trait method, which is
+    /// what holds it to the response-time floor.
+    ///
+    /// SPLIT SO THE FLOOR CANNOT BE PARTIAL. With the work in its own function
+    /// there is one place the elapsed time is read and one place it is paid, and
+    /// no `return` inside this body can skip either — the early refusal below is
+    /// exactly the path that would otherwise answer fastest.
+    ///
+    /// D67's `Call` IS OPENED BY THE HANDLER AND FINISHED HERE, so it spans the
+    /// work and NOT the wait. An operator sets the floor from the real duration
+    /// distribution, and a metric padded to a constant would report the constant
+    /// instead — deleting the one signal that says the floor needs raising. The
+    /// gap between what this records and what a client observes is deliberate,
+    /// and [`Self::hold_until_floor`] is what makes it visible when it closes.
+    ///
+    /// TAKING `call` AS A PARAMETER IS ALSO WHAT KEEPS `observe-coverage` HONEST.
+    /// That hook follows same-file calls to find a `Call::start`, but its
+    /// `BARE_CALL` pattern excludes an identifier preceded by `.`, so a
+    /// `self.login_inner(…)` hop is invisible to it: opening the `Call` in here
+    /// would leave the handler reading as uninstrumented. Opening it in the
+    /// handler and passing it down satisfies the check by being true rather than
+    /// by an exemption.
+    async fn login_inner(
+        &self,
+        req: Request<LoginRequest>,
+        call: Call,
+    ) -> Result<Response<LoginResponse>, Status> {
+        // The username never leaves this process. What goes to the store is its
+        // blind index, so the plaintext reaches no query log and no backup.
+        let mut lookup = Request::new(db::GetPasswordHashRequest {
+            username_blind_index: self.keys.blind_index(&req.get_ref().username),
+            ..Default::default()
+        });
+        forward_request_id(&req, &mut lookup);
+
+        let found = self
+            .client()
+            .get_password_hash(lookup)
+            .await
+            .map_err(upstream_failed)?
+            .into_inner();
+
+        // THE ORDER HERE IS THE SECURITY PROPERTY.
+        //
+        // `verify_password` is called whether or not a user was found, and it
+        // does a full Argon2id verification either way — against the real hash if
+        // there is one, against a dummy otherwise. Returning early on an unknown
+        // username would make it answer in microseconds while a known one takes
+        // the ~50ms Argon2id costs, and that difference is measurable over a
+        // network. The endpoint would enumerate accounts.
+        let stored = (!found.user_id.is_empty()).then_some(found.argon2id_hash.as_str());
+        if !self.keys.verify_password(stored, &req.get_ref().password) {
+            call.fail("UNAUTHENTICATED");
+            return Err(refused());
+        }
+
+        let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
+        let mut create = Request::new(db::CreateCredentialRequest {
+            user_id: found.user_id.clone(),
+            token_hash: Keys::token_hash(&token),
+            label: req.get_ref().label.clone(),
+            ..Default::default()
+        });
+        forward_request_id(&req, &mut create);
+
+        let created = self
+            .client()
+            .create_credential(create)
+            .await
+            .map_err(upstream_failed)?
+            .into_inner();
+
+        call.finish(Outcome {
+            status: "OK",
+            ..Default::default()
+        });
+        Ok(Response::new(LoginResponse {
+            // The only time this value is ever returned. The store holds a hash.
+            token: token.to_string(),
+            credential_id: created.credential_id,
+        }))
+    }
+
+    /// Wait out whatever is left of the floor, or say that there was nothing left.
+    ///
+    /// **A FLOOR CLOSES ONLY THE FAST SIDE.** Padding a short call up to a
+    /// constant makes every call that is FASTER than the constant look alike; a
+    /// call that is SLOWER answers late and still reports how much work it did.
+    /// So when `elapsed` exceeds the floor the control is not merely inactive for
+    /// that call, it is covering nothing — and the only thing that can be done
+    /// about it is to raise the configured value, which needs an operator who
+    /// knows. Hence the warning, naming both numbers: the observed duration and
+    /// the floor it passed.
+    ///
+    /// Without it this degrades in silence. The floor keeps being applied, the
+    /// tests keep passing, and the property it is supposed to deliver is simply
+    /// gone for whichever rows are slow — a check that cannot fail, which is
+    /// worse than none.
+    ///
+    /// **NOT AN ERROR, deliberately.** A verification slower than the floor is
+    /// still a CORRECT verification. Refusing it would lock out exactly the
+    /// accounts whose unusual cost this exists to hide, turning a leak into an
+    /// outage; the same trade is worked through at
+    /// [`crate::crypto::Keys::verify_password`], where refusing a cheap stored
+    /// hash before verifying it would make every pre-tune account a permanent
+    /// lockout.
+    ///
+    /// `checked_sub` returns `None` ONLY when `elapsed` is STRICTLY greater than
+    /// the floor, so answering exactly on it sleeps zero and warns nothing —
+    /// "exceeds" means exceeds.
+    async fn hold_until_floor(&self, elapsed: Duration) {
+        let Some(remaining) = self.login_response_floor.checked_sub(elapsed) else {
+            tracing::warn!(
+                observed_ms = elapsed.as_millis() as u64,
+                floor_ms = self.login_response_floor.as_millis() as u64,
+                "Login took longer than its response-time floor; the floor is \
+                 hiding nothing for this call. Raise LOGIN_RESPONSE_FLOOR_MS above \
+                 the slowest legitimate login on this deployment."
+            );
+            return;
+        };
+        tokio::time::sleep(remaining).await;
     }
 }
 
@@ -136,64 +296,22 @@ impl IamService for Iam {
 
     /// Username and password to a long-lived token. The one sign-in a person
     /// performs (D72).
+    ///
+    /// **The whole call is held to a response-time floor**, both the success and
+    /// the failure path — see `Iam::hold_until_floor` for why it is one rule with
+    /// no branch, and `crypto::Keys::verify_password` for the leak it closes.
     async fn login(&self, req: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
+        // THE CLOCK STARTS BEFORE ANYTHING ELSE, and the answer is computed to
+        // completion before a single byte of it is returned. Flooring the whole
+        // handler is what makes the round trips to `iam-db` — one on every path,
+        // a second on the success path — part of what the floor covers rather
+        // than a residual outside it.
+        let started = Instant::now();
         let rid = request_id_of(&req);
         let call = Call::start(SERVICE, "Login", Kind::Write, tel(rid.clone(), ""));
-
-        // The username never leaves this process. What goes to the store is its
-        // blind index, so the plaintext reaches no query log and no backup.
-        let mut lookup = Request::new(db::GetPasswordHashRequest {
-            username_blind_index: self.keys.blind_index(&req.get_ref().username),
-            ..Default::default()
-        });
-        forward_request_id(&req, &mut lookup);
-
-        let found = self
-            .client()
-            .get_password_hash(lookup)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
-
-        // THE ORDER HERE IS THE SECURITY PROPERTY.
-        //
-        // `verify_password` is called whether or not a user was found, and it
-        // does a full Argon2id verification either way — against the real hash if
-        // there is one, against a dummy otherwise. Returning early on an unknown
-        // username would make it answer in microseconds while a known one takes
-        // the ~50ms Argon2id costs, and that difference is measurable over a
-        // network. The endpoint would enumerate accounts.
-        let stored = (!found.user_id.is_empty()).then_some(found.argon2id_hash.as_str());
-        if !self.keys.verify_password(stored, &req.get_ref().password) {
-            call.fail("UNAUTHENTICATED");
-            return Err(refused());
-        }
-
-        let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
-        let mut create = Request::new(db::CreateCredentialRequest {
-            user_id: found.user_id.clone(),
-            token_hash: Keys::token_hash(&token),
-            label: req.get_ref().label.clone(),
-            ..Default::default()
-        });
-        forward_request_id(&req, &mut create);
-
-        let created = self
-            .client()
-            .create_credential(create)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
-
-        call.finish(Outcome {
-            status: "OK",
-            ..Default::default()
-        });
-        Ok(Response::new(LoginResponse {
-            // The only time this value is ever returned. The store holds a hash.
-            token: token.to_string(),
-            credential_id: created.credential_id,
-        }))
+        let answered = self.login_inner(req, call).await;
+        self.hold_until_floor(started.elapsed()).await;
+        answered
     }
 
     async fn issue_credential(
