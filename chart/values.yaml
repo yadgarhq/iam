@@ -109,7 +109,7 @@ enrolment:
   # empty gateway: the field has no presence, so such a token would be
   # structurally valid and point at nothing, and its failure would surface on
   # that stranger's machine as an undiagnosable connection error.
-  gateway: ""
+  gateway: "https://gateway.yadgar.internal:18443"
 
   # A ConfigMap holding the root CA the token carries, under the key `ca.pem`.
   #
