@@ -51,6 +51,57 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// What this service presents to the broker, or `None` if it presents nothing.
+///
+/// A PATH rather than a value (D80), the same shape `YADGAR_KEYS_DIR` and
+/// `ENROLMENT_CA_PEM_FILE` already use, and for the same reason twice over: a
+/// deployment that is not the reference one assembles the Secret by hand, and a
+/// password in an environment variable is a password in `kubectl describe pod`.
+///
+/// **Every way of being half-configured is a boot failure**, and there are three:
+/// a path that cannot be read, a file that is empty, and a password with no user
+/// to go with it. All three describe a deployment that asked for authentication
+/// and cannot perform it, and the only alternative to refusing is connecting
+/// anonymously — which succeeds, looks healthy, and leaves D72's invalidation
+/// events publishable by anything on the pod network.
+fn nats_credentials() -> Result<Option<yadgar_iam::invalidate::Credentials>, String> {
+    let path = match std::env::var("NATS_PASSWORD_FILE") {
+        Err(_) => return Ok(None),
+        Ok(p) if p.is_empty() => return Ok(None),
+        Ok(p) => p,
+    };
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "NATS_PASSWORD_FILE names {path}, which cannot be read: {e}. It is the password iam \
+             presents to the broker (D22) for D72's cache invalidation. Refusing to start rather \
+             than connecting to the broker without one."
+        )
+    })?;
+    // TRAILING NEWLINE ONLY. `kubectl create secret --from-file` of a file a
+    // person edited keeps the newline their editor added, and a password with a
+    // `\n` on the end is a different password — rejected by a broker configured
+    // from the same 1Password item, as an authorization violation nobody can see.
+    // Inner whitespace is a legitimate part of a password and is left alone.
+    let password = raw.trim_end_matches(['\n', '\r']).to_string();
+    if password.is_empty() {
+        return Err(format!(
+            "NATS_PASSWORD_FILE names {path}, which is empty. A blank password is not one. \
+             Either put the broker's password in that file or unset the variable, which is how \
+             a deployment says the broker asks for none."
+        ));
+    }
+    let user = env_or("NATS_USER", "");
+    if user.is_empty() {
+        return Err(
+            "NATS_PASSWORD_FILE is set and NATS_USER is not. The broker's authorization block \
+             names an account and a password together, so a password with no user cannot \
+             authenticate against it. Set both, or neither."
+                .to_string(),
+        );
+    }
+    Ok(Some(yadgar_iam::invalidate::Credentials { user, password }))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -129,9 +180,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // outage must not become an authentication outage, and the TTL is the
     // backstop for exactly this. The warning at connect time is what makes the
     // degraded state visible rather than assumed.
-    let invalidator =
-        yadgar_iam::invalidate::Invalidator::connect(std::env::var("NATS_URL").ok().as_deref())
-            .await;
+    //
+    // THE CREDENTIAL IS READ BEFORE THE CONNECTION IS ATTEMPTED, and its absence
+    // is the one thing here that DOES gate startup. The distinction is the same
+    // one D69 draws everywhere else: an unreachable broker is an outage of one
+    // component, and a deployment that named a credential it cannot produce is a
+    // mistake somebody made. Connecting anonymously at that point would be the
+    // silent fall back to an unauthenticated broker this exists to stop, and it
+    // would look exactly like success.
+    //
+    // NOT `required` IN THE CHART EITHER: unset means the broker asks for no
+    // password, which is what every deployment of this was until ledger 518 and
+    // is what lets this image roll before the broker's authorization block does.
+    let nats_credentials = nats_credentials()?;
+    let invalidator = yadgar_iam::invalidate::Invalidator::connect(
+        std::env::var("NATS_URL").ok().as_deref(),
+        nats_credentials,
+    )
+    .await;
 
     // The shortest time `Login` may answer in, whatever it found. Argon2id takes
     // its cost from the PHC string it is verifying, so a stored hash provisioned
