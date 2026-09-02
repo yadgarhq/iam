@@ -20,7 +20,7 @@ tonic = { version = "0.14", default-features = false, features = [
   "channel",
 ] }
 tonic-prost = "0.14"
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "abd9c3105f2a2746faa795c6d4936b0fb195f4a8" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e9ec92a6efd74363e68c694fe6c0fa" }
 
 # The shared instrumentation seam (D67). Pinned by revision, like every other
 # in-org crate — a branch is a moving target.
