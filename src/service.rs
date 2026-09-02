@@ -420,7 +420,12 @@ impl Iam {
     ///    `UNAUTHENTICATED` with one message. The store tells them apart and
     ///    records which; the caller cannot. The refusal path ALSO pays the
     ///    verification the success path is about to pay, so the two cost the
-    ///    same two Argon2id operations rather than two against one.
+    ///    same two Argon2id operations rather than two against one. **The
+    ///    store's own ERROR is a fourth outcome and is collapsed with them**:
+    ///    an idempotency key already recorded against a different secret is
+    ///    refused there with `INVALID_ARGUMENT`, before the presented secret is
+    ///    looked up, and forwarding that code told a caller holding no secret
+    ///    whether the key had been redeemed. See the call site.
     /// 4. **THE REPLAY CHECK, WHICH REMEMBERS NOTHING.** `iam` holds no store
     ///    (D4), so it cannot know whether this key has been seen. It does not
     ///    need to: it verifies the presented password against the hash the store
@@ -465,12 +470,55 @@ impl Iam {
         });
         forward_request_id(&req, &mut spend);
 
-        let spent = self
-            .client()
-            .redeem_enrolment(spend)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        // THE STORE'S OWN REFUSALS ARE PART OF "ONE REFUSAL FOR THREE OUTCOMES",
+        // and forwarding their status code untouched was an oracle on an
+        // unauthenticated endpoint. `upstream_failed` replaces the MESSAGE and
+        // keeps the CODE — correct everywhere else, and exactly the leak here.
+        //
+        // WHAT IT LEAKED, with no secret needed: the store compares a presented
+        // `secret_hash` against the one its ledger holds for this key BEFORE it
+        // looks the secret up, and refuses a mismatch with INVALID_ARGUMENT. So a
+        // caller sending any key with a garbage secret learned whether that key
+        // had been redeemed — INVALID_ARGUMENT if it had, UNAUTHENTICATED if it
+        // had not. The response-time floor equalises TIME and never STATUS.
+        //
+        // NOTHING IS LOST BY COLLAPSING IT. The only other INVALID_ARGUMENT that
+        // call can produce is the store refusing an `argon2id_hash` too long for
+        // its column, and `iam` mints that PHC string itself — its length is
+        // fixed and unreachable from the request.
+        //
+        // THE OTHER CODES STAY. UNAVAILABLE and INTERNAL describe the deployment
+        // rather than the secret: every caller sees them at once, so they tell an
+        // attacker nothing about the key they presented, and collapsing an outage
+        // into "this enrolment cannot be redeemed" would send a person to reissue
+        // an enrolment that is fine.
+        //
+        // THE GENERAL RULE, because one call site is not the lesson: a design
+        // promising ONE refusal for N outcomes must audit the status code of
+        // EVERY upstream error it forwards, not only its own refusal paths. The
+        // two remaining `upstream_failed` sites in this function — the password
+        // lookup and the credential mint — are safe for the reason step 4 gives:
+        // both run only after the secret is confirmed and spent, so their codes
+        // report nothing the caller does not already know.
+        let spent = match self.client().redeem_enrolment(spend).await {
+            Ok(answered) => answered.into_inner(),
+            Err(refused) if refused.code() == tonic::Code::InvalidArgument => {
+                // THE VERIFICATION THE SUCCESS PATH PAYS, paid here too — the same
+                // reason step 3 below pays it, and this path would otherwise be
+                // the one refusal costing a single Argon2id operation.
+                let _ = self.keys.verify_password(None, &req.get_ref().password);
+                // At INFO beside step 3's refusal and for the same reason: the
+                // operator diagnosing a failed enrolment needs the store's own
+                // words, and the caller must not have them.
+                tracing::info!(
+                    upstream = %refused.message(),
+                    "enrolment redemption refused by the store"
+                );
+                call.fail("UNAUTHENTICATED");
+                return Err(enrolment_refused());
+            }
+            Err(other) => return Err(upstream_failed(other)),
+        };
 
         // 3. ONE FAILURE, NOT THREE.
         if spent.outcome() != db::RedeemOutcome::Redeemed {

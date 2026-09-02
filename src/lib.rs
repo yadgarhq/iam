@@ -8,6 +8,9 @@
 
 #![forbid(unsafe_code)]
 
+/// What `main` decides before it connects to anything, here rather than there so
+/// a test can reach it — `main` is a binary entry point and nothing in it is.
+pub mod boot;
 pub mod crypto;
 pub mod invalidate;
 /// The certificate this service PRESENTS; [`upstream`] is how it VERIFIES the
