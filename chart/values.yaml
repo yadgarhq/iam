@@ -64,6 +64,58 @@ tls:
   # `tls-key.pem`. Named for the same reason.
   keySecretKey: tls.key
 
+# HOW A RENEWED CERTIFICATE ACTUALLY REACHES THE PROCESS.
+#
+# The certificate above is read ONCE, when the listener is built, and tonic
+# cannot swap a running server's TLS configuration. cert-manager renews 30 days
+# before expiry and kubelet refreshes the mounted files — each Secret is mounted
+# as a DIRECTORY rather than with subPath precisely so it does — but the process
+# would go on serving its day-0 leaf until something restarted it.
+#
+# So iam hashes the TLS files it read at boot — the serving certificate, its key,
+# the CA bundle iam-db is verified against, and the CA every enrolment token
+# carries (D73) — and when one of them changes it logs which, and the old and new
+# fingerprint, waits out this pod's splay, drains, and exits 0. Kubelet restarts
+# the container and the new process reads the fresh files.
+#
+# THE ENROLMENT CA IS IN THAT SET even though it is token payload rather than a
+# transport input, and `enrolment.caSecret` below is mounted as a directory for
+# exactly that reason. Left unwatched, a gateway CA rotation leaves this process
+# minting tokens carrying a CA that no longer signs anything — silently, which is
+# the outcome exit-on-change exists to refuse.
+#
+# A HASH RATHER THAN A MODIFICATION TIME, and that is not a detail. Kubelet
+# rotates a mounted Secret by renaming a new `..data` symlink over the old one,
+# so every path resolves to a new inode with a new mtime on EVERY resync,
+# changed or not. An mtime check restarts both replicas for nothing.
+#
+# THE FAILURE MODE IS THE POINT: if the watcher dies you get the old behaviour,
+# never worse. `yadgar_tls_certificate_not_after_seconds` is the other half —
+# it reports the expiry of the certificate this process actually loaded, so a
+# watcher that stopped working is still visible as a leaf ageing out.
+#
+# THE WATCHER RUNS ON A DEFAULT INSTALL EVEN WITH `tls.enabled: false`, and that
+# is worth reading twice. The watch set holds the enrolment CA as well as the
+# serving certificate, and `enrolment.caSecret` below ships with a default — so
+# a cleartext pod watches that CA and restarts when the gateway rotates it. The
+# set is empty only when `tls.enabled` is false AND `enrolment.caSecret` is
+# unset. The schedule is parsed at boot in every case, so a value the binary
+# cannot read fails a pod that uses no TLS at all.
+tlsRotation:
+  # How often the files are re-hashed. Reading four small files a minute costs
+  # nothing, and the deadline this protects is 30 days wide.
+  pollSeconds: 60
+  # THE LONGEST A POD WAITS BEFORE EXITING, drawn per pod inside that range.
+  #
+  # Both replicas see the refreshed file inside the same kubelet sync window, so
+  # an unsplayed exit can drop both at once — and the PodDisruptionBudget does
+  # NOT govern a self-exit, it constrains eviction. This is the only control
+  # there is. Five minutes against 30 days of slack is free.
+  #
+  # `0` exits immediately, which is what a single-replica or a development
+  # deployment wants.
+  splayMaxSeconds: 300
+
 # The HEADLESS Service of the -db twin (D23). Resolving this name yields every
 # ready pod address rather than one virtual IP, which is what makes client-side
 # balancing possible at all.

@@ -34,12 +34,22 @@
 //!
 //! Both transports are OPT-IN and OFF by default, so an unconfigured deployment
 //! dials and listens exactly as it always has.
+//!
+//! **AND BOTH ARE READ EXACTLY ONCE, HERE.** tonic cannot swap a running
+//! listener's certificate, so a pod serves its day-0 leaf until it restarts —
+//! which is why [`yadgar_iam::rotate`] watches the files this function opened
+//! and ends the serve when they change. That is the only mechanism by which
+//! this process ever picks up a renewed certificate — and it works only because
+//! [`yadgar_iam::serve::shutdown`] hears the signal Kubernetes actually sends.
+//! This binary listened for SIGINT alone, which kubelet never sends, so the
+//! drain was reached on no rollout at all.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
+use yadgar_iam::rotate;
 use yadgar_iam::serve;
 use yadgar_iam::service::{
     EnrolmentConfig, Iam, ResponseFloors, DEFAULT_LOGIN_RESPONSE_FLOOR,
@@ -82,6 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
     let mut server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
 
+    // THE WATCH SET IS BUILT AS EACH FILE IS READ, NOT AT THE END. Every method
+    // on `Inputs` hashes its file immediately, so the baseline is taken beside
+    // the code that loaded it. Collecting the paths here and reading them once
+    // the watcher first polls would put the whole of the rest of boot inside a
+    // window where a kubelet swap makes the NEW file the baseline — the real
+    // rotation then goes unnoticed for ever, and the gauge describes a
+    // certificate this listener is not serving.
+    let mut tls_inputs = rotate::Inputs::default().listener(listen_tls.as_ref());
+
     // Fails boot loudly if the keys are absent or unreadable — deliberately
     // before the listener binds. See the module doc above for why this one
     // dependency is NOT allowed to degrade gracefully the way iam-db is.
@@ -116,6 +135,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "connected to iam-db"
     );
 
+    // The CA bundle the dial above just read, hashed now for the same reason.
+    tls_inputs = tls_inputs.upstream(db_tls.as_ref());
+
+    // How often those files are re-hashed, and how long THIS pod waits before
+    // acting on a change. The splay is what stops both replicas exiting inside
+    // the same kubelet sync window — a PDB constrains eviction and does not
+    // govern a self-exit.
+    //
+    // THE DECISION LIVES IN `rotate`, not here, for the reason `boot` gives:
+    // nothing in a binary entry point is reachable from a test, and one of the
+    // ways to get this wrong — a poll interval of 0 — is a hot loop nobody would
+    // see. `.to_string()` on the way out because `Box<dyn Error>` prints with
+    // DEBUG and these messages are sentences.
+    let schedule = rotate::Schedule::from_env().map_err(|e| e.to_string())?;
+
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
@@ -124,6 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
+
+    // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
+    // recorder is a value nobody ever sees. This is the half of the rotation
+    // work that makes a failure LOUD — if the watcher below dies, this gauge
+    // still shows the loaded leaf ageing out.
+    tls_inputs.export_not_after();
 
     // The broker, for D72's cache invalidation. Does NOT gate startup: a broker
     // outage must not become an authentication outage, and the TTL is the
@@ -199,6 +239,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to protect. Here there is.
     let enrolment = match EnrolmentConfig::from_env() {
         Ok(config) => {
+            // WATCHED TOO, and it is not a transport input. The CA every D73
+            // enrolment token carries is read once from a file the chart mounts
+            // as a DIRECTORY — mounted that way precisely so that a rotation
+            // propagates into the pod. Left unwatched, a gateway CA rotation
+            // leaves this process minting tokens carrying a CA that no longer
+            // signs anything: no exit, no gauge movement, no log. That is the
+            // silently-stale material the exit-on-change ruling exists to
+            // refuse, so the ruling's own test puts it in scope.
+            tls_inputs = tls_inputs.enrolment(Some(&config));
             tracing::info!("enrolment tokens carry this deployment's gateway and CA (D73)");
             Some(config)
         }
@@ -214,26 +263,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
+
+    // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
+    // than an accident of where the line sits. `serve::shutdown` installs both
+    // signal handlers when it is CALLED — a SIGTERM arriving between here and
+    // the first poll of the future would otherwise take the process's default
+    // disposition and kill it outright.
+    let signals = serve::shutdown().map_err(|e| {
+        format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
+    })?;
     // `tls` is recorded because "is this listener encrypted?" must be answerable
     // from the boot log rather than inferred from which variables somebody
     // believes they set.
-    tracing::info!(%addr, tls = listen_tls.is_some(), "iam listening");
-    server
-        .add_service(IamServiceServer::new(Iam::new(
-            keys,
-            db,
-            invalidator,
-            ResponseFloors {
-                login: login_response_floor,
-                redeem: redeem_response_floor,
-            },
-            enrolment,
-        )))
-        .serve_with_shutdown(addr, async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
-        .await?;
+    tracing::info!(
+        %addr,
+        tls = listen_tls.is_some(),
+        watching = tls_inputs.watched().len(),
+        rotation_poll_secs = schedule.poll().as_secs(),
+        rotation_splay_max_secs = schedule.splay_max().as_secs(),
+        drain_budget_secs = serve::DRAIN_BUDGET.as_secs(),
+        "iam listening"
+    );
+
+    // THE SERVER IS SPAWNED WITH A ONESHOT AS ITS SHUTDOWN FUTURE, and the wait
+    // happens OUTSIDE it. `serve::drain_within` starts the budget's clock when
+    // shutdown is REQUESTED; a `timeout` wrapped round the serving future itself
+    // would fix its deadline at boot and end the process 25 seconds later on
+    // every boot, having asked nothing to stop. That defect shipped on this
+    // branch — see `tests/drain.rs`.
+    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(
+        server
+            .add_service(IamServiceServer::new(Iam::new(
+                keys,
+                db,
+                invalidator,
+                ResponseFloors {
+                    login: login_response_floor,
+                    redeem: redeem_response_floor,
+                },
+                enrolment,
+            )))
+            // ONE DRAIN PATH, TWO REASONS TO TAKE IT. `serve_with_shutdown` stops
+            // accepting and lets in-flight calls finish, so the rotation exit
+            // gets the same drain a signal does rather than a second mechanism
+            // beside it.
+            .serve_with_shutdown(addr, async {
+                let _ = stop_requested.await;
+            }),
+    );
+
+    // WHAT ENDS THE SERVE, and nothing else does.
+    let stop = async {
+        tokio::select! {
+            // SIGTERM and SIGINT, already armed above. SIGTERM is the one
+            // Kubernetes sends, and the one this binary used to ignore.
+            () = signals => {}
+            // `rotate::watch` resolves ONLY when it has read a change, and never
+            // at all when there is nothing to watch.
+            () = rotate::watch(tls_inputs, schedule) => {}
+        }
+    };
+
+    match serve::drain_within(serving, ask_to_stop, stop, serve::DRAIN_BUDGET).await {
+        serve::Drain::Finished(result) => result?,
+        // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
+        // an error in the log, not a CrashLoopBackOff on top of it.
+        serve::Drain::Overran => tracing::error!(
+            budget_secs = serve::DRAIN_BUDGET.as_secs(),
+            "the drain did not finish within its budget; ending anyway with calls still in \
+             flight. A request blocked this long is the thing to look at"
+        ),
+    }
 
     Ok(())
 }

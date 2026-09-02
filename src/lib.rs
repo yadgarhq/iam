@@ -13,6 +13,9 @@
 pub mod boot;
 pub mod crypto;
 pub mod invalidate;
+/// What this process does when the certificate it read at boot is replaced
+/// underneath it. [`serve`] reads those files once; this notices they changed.
+pub mod rotate;
 /// The certificate this service PRESENTS; [`upstream`] is how it VERIFIES the
 /// one `iam-db` presents. Two directions, one word.
 pub mod serve;
