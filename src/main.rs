@@ -15,6 +15,14 @@
 //! data field (D72) — a failure mode that looks like a healthy pod until traffic
 //! hits it. Failing fast at boot turns that into a CrashLoopBackOff, which is
 //! legible, instead of a pod that passes its readiness probe and is wrong.
+//!
+//! **The TRANSPORT to `iam-db` follows the crypto keys' rule, not the twin's.**
+//! Whether `iam-db` is REACHABLE is an outage and degrades a request; whether the
+//! CA bundle it is verified against is usable is a deployment mistake, and D69
+//! fails boot on those. A bundle that is missing, undecodable or empty therefore
+//! stops the process, because the only other thing to do with it is connect in
+//! cleartext — and this connection carries every password verification and every
+//! encrypted personal-data field in the system.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -60,9 +68,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_host = env_or("IAM_DB_HOST", "iam-db");
     let db_port: u16 = env_or("IAM_DB_PORT", "50051").parse()?;
 
-    let db = upstream::connect(&db_host, db_port).await?;
+    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
+    // the cleartext dial this service has always done — no server in the estate
+    // serves TLS yet, so the cut-over is a later change that can be reverted on
+    // its own.
+    //
+    // `.to_string()` on the way out, and not decoration: `main` returns
+    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
+    // `NoCaFile("IAM_DB")` on the operator's terminal instead of the sentence
+    // naming the missing variable and saying why cleartext is not the answer.
+    let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB).map_err(|e| e.to_string())?;
+    let db = upstream::connect(&db_host, db_port, db_tls.as_ref())
+        .await
+        // Same reasoning, and it matters more here: `BalanceError`'s messages
+        // are paragraphs explaining that an empty bundle trusts nobody and that
+        // a missing one is not a reason to connect in cleartext. Debug prints
+        // the struct and throws all of that away.
+        .map_err(|e| e.to_string())?;
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
+        tls = db_tls.is_some(),
         "connected to iam-db"
     );
 

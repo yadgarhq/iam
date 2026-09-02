@@ -57,6 +57,29 @@ spec:
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT
               value: {{ .Values.iamDb.port | quote }}
+            {{- if .Values.iamDb.tls.enabled }}
+            # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
+            # cut over sends the binary nothing at all and takes the cleartext
+            # path it always took. Absence is the default, and the flag is the
+            # whole of the lever.
+            - name: IAM_DB_TLS_ENABLED
+              value: "1"
+            # A PATH, never an issuer-specific resource (D80) — the same shape
+            # ENROLMENT_CA_PEM_FILE below already uses. cert-manager writes this
+            # file in the reference deployment and a hand-assembled Secret writes
+            # it anywhere else; neither the chart nor the binary can tell the
+            # difference, which is the point.
+            - name: IAM_DB_TLS_CA_FILE
+              value: /var/run/config/iam-db-ca/ca.pem
+            {{- if .Values.iamDb.tls.domain }}
+            # Only when the certificate names something other than the Service.
+            # Unset means "verify against iamDb.host", which is what makes a
+            # certificate issued for the Service name work while the balancer
+            # dials pod addresses.
+            - name: IAM_DB_TLS_DOMAIN
+              value: {{ .Values.iamDb.tls.domain | quote }}
+            {{- end }}
+            {{- end }}
             # The crypto keys (D72). YADGAR_KEYS_DIR names where Keys::from_env
             # reads them; the Secret itself is mounted below.
             - name: YADGAR_KEYS_DIR
@@ -139,6 +162,15 @@ spec:
             - name: keys
               mountPath: /var/run/secrets/iam-keys
               readOnly: true
+            {{- if .Values.iamDb.tls.enabled }}
+            # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
+            # the enrolment CA below: a subPath mount is a one-time copy that
+            # kubelet never refreshes, so a rotated authority would never reach
+            # this process.
+            - name: iam-db-ca
+              mountPath: /var/run/config/iam-db-ca
+              readOnly: true
+            {{- end }}
             {{- if .Values.enrolment.caSecret }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
             # copy that kubelet never refreshes, so the CA would freeze at
@@ -153,6 +185,31 @@ spec:
         - name: keys
           secret:
             secretName: {{ .Values.keysSecret }}
+        {{- if .Values.iamDb.tls.enabled }}
+        - name: iam-db-ca
+          secret:
+            secretName: {{ required "iamDb.tls.caSecret holds the CA bundle iam-db is verified against and must be set whenever iamDb.tls.enabled is; see the chart's values.yaml" .Values.iamDb.tls.caSecret }}
+            # OPTIONAL, and here it means the OPPOSITE of what it means on the
+            # enrolment CA below. There it buys availability: the CA belongs to
+            # one administrative RPC, so a missing Secret must not stop the
+            # authentication plane. Here the process MUST NOT START without a
+            # usable bundle, and optional is simply which error says so. A
+            # required mount that cannot be satisfied leaves the pod in
+            # ContainerCreating with a FailedMount event about a volume; an
+            # optional one mounts an empty directory, the binary finds no file at
+            # IAM_DB_TLS_CA_FILE, and it exits naming THAT PATH and saying that
+            # TLS was asked for so cleartext is not the answer. Neither starts;
+            # only one of them explains itself.
+            optional: true
+            # ONE KEY, not the whole Secret. A certificate Secret also holds a
+            # PRIVATE KEY, and iam has no business being able to read iam-db's.
+            # Selecting a single key is what keeps it out of the pod, and it is
+            # also what renames whatever the issuer called it to the `ca.pem`
+            # that IAM_DB_TLS_CA_FILE names.
+            items:
+              - key: {{ required "iamDb.tls.caSecretKey names the key inside iamDb.tls.caSecret that holds the CA bundle and must be set whenever iamDb.tls.enabled is; see the chart's values.yaml" .Values.iamDb.tls.caSecretKey | quote }}
+                path: ca.pem
+        {{- end }}
         {{- if .Values.enrolment.caSecret }}
         - name: enrolment-ca
           secret:
