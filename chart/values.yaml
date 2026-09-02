@@ -177,9 +177,19 @@ nats:
   # it wrong is loud rather than silent — a pod that exits at boot naming
   # `/var/run/secrets/nats/password`, not one that quietly runs.
   #
-  # THE SECRET MUST EXIST BEFORE THIS CHART SYNCS. It is not created here and not
-  # in git; `yadgarhq/deploy`'s MIGRATION_NOTES.md has the `kubectl create secret`
-  # for it, alongside the broker that reads the same object.
+  # THE SECRET MUST EXIST BEFORE THIS CHART SYNCS, and it is not created here and
+  # not in git. In the reference deployment nobody creates it by hand: ADR-0517
+  # says anything the deployment can generate for itself it generates, so
+  # `yadgarhq/deploy`'s `infra/bootstrap/` creates `nats-auth` on first sync,
+  # idempotently, alongside the broker that reads the same object. This comment
+  # used to point at a `kubectl create secret` in that repository's
+  # MIGRATION_NOTES.md — the manual step ADR-0517 exists to delete, and the class
+  # of instruction that fails invisibly when the operator's editor leaves a
+  # newline in the file.
+  #
+  # AN ADOPTER SUPPLIES IT HOWEVER THEY LIKE. The chart names a Secret and mounts
+  # a key from it, so Vault, External Secrets, SOPS or a cloud secret manager
+  # substitute for the bootstrap step and this chart is unchanged (D80).
   #
   # WHILE IT IS EMPTY THE HOP IS UNAUTHENTICATED and iam says so in a warning at
   # every boot. Anything on the pod network can publish on D72's invalidation

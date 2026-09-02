@@ -524,9 +524,26 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
     // BOTH hashes are floored, and independently. Flooring only the stored one
     // would leave the dummy covered by the equality test alone — two tests each
     // load-bearing on the other is the coupling this whole file is about.
+    //
+    // THE VARIANT IS ASSERTED HERE TOO, AND FOR THE SAME REASON THE COSTS ARE.
+    // The equality test compares `stored.algorithm` to `dummy.algorithm`, which
+    // is the relative assertion again: `hash_secret` mints both, so switching it
+    // to `Algorithm::Argon2d` moves the pair together and the entire suite stays
+    // green — measured, before this line existed. The module header's own table
+    // rules Argon2d out, and only an ABSOLUTE assertion holds it to that.
+    //
+    // p = 1 IS NOT ASSERTED, and its absence is deliberate rather than an
+    // oversight. `MIN_P_COST: u32 = 1` with `p_cost() >= MIN_P_COST` used to sit
+    // beside the two floors below, described as load-bearing with them and unable
+    // to fail: `argon2 0.5.3`'s `Params::new` REFUSES `p_cost < 1` (its own
+    // `Params::MIN_P_COST`), and `Params::try_from(&PasswordHash)` builds through
+    // `ParamsBuilder` into that same constructor — so no PHC string reaching this
+    // loop can carry a lower lane count. The crate enforces it; a test that
+    // restates a structural invariant reports agreement rather than correctness,
+    // which is the failure this whole file is about. Named rather than elided so
+    // it is not re-added.
     const MIN_M_COST: u32 = 19 * 1024;
     const MIN_T_COST: u32 = 2;
-    const MIN_P_COST: u32 = 1;
 
     let k = loaded_keys("absolute-cost");
 
@@ -537,6 +554,16 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
     ] {
         let parsed = PasswordHash::new(phc).expect("the hash parses");
         let params = argon2::Params::try_from(&parsed).expect("its parameters");
+        // ABSOLUTE, against the crate's own identifier rather than against the
+        // other hash. Argon2d is the GPU-hardened, side-channel-vulnerable
+        // variant and Argon2i the reverse; Argon2id is the hybrid, and it is the
+        // one the module header commits to for a stored password.
+        assert_eq!(
+            parsed.algorithm,
+            argon2::Algorithm::Argon2id.ident(),
+            "{which}: the variant is {}, and a stored password must be Argon2id",
+            parsed.algorithm
+        );
         assert!(
             params.m_cost() >= MIN_M_COST,
             "{which}: m={} is below OWASP's {MIN_M_COST} KiB minimum for Argon2id",
@@ -546,11 +573,6 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
             params.t_cost() >= MIN_T_COST,
             "{which}: t={} is below OWASP's {MIN_T_COST}-pass minimum for Argon2id",
             params.t_cost()
-        );
-        assert!(
-            params.p_cost() >= MIN_P_COST,
-            "{which}: p={} is below OWASP's {MIN_P_COST}-lane minimum for Argon2id",
-            params.p_cost()
         );
     }
 }

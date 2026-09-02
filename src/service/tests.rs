@@ -58,6 +58,15 @@ struct FakeDb {
     /// What `RedeemEnrolment` answers. `None` is an unknown secret, which is the
     /// default an attacker's presentation gets.
     redeem: Option<db::RedeemEnrolmentResponse>,
+    /// A `(code, message)` to fail `RedeemEnrolment` with, rather than answering
+    /// with an outcome.
+    ///
+    /// **THE STORE HAS A REFUSAL THE OUTCOME ENUM CANNOT CARRY**, and it is the
+    /// one an unauthenticated caller can provoke: an idempotency key already
+    /// recorded against a DIFFERENT secret is `INVALID_ARGUMENT`, decided before
+    /// the presented secret is looked up. Without this field the fake can only
+    /// answer, so no test could see what `iam` does with that error.
+    redeem_fails: Option<(tonic::Code, &'static str)>,
     recorded: Arc<Mutex<Recorded>>,
 }
 
@@ -120,6 +129,9 @@ impl IamDbService for FakeDb {
             .expect("recorded")
             .redeem_enrolment
             .push(req.into_inner());
+        if let Some((code, message)) = self.redeem_fails {
+            return Err(Status::new(code, message));
+        }
         Ok(Response::new(self.redeem.clone().unwrap_or(
             db::RedeemEnrolmentResponse {
                 outcome: db::RedeemOutcome::NotFound as i32,
@@ -1271,6 +1283,80 @@ async fn unknown_spent_and_expired_are_one_refusal() {
 }
 
 #[tokio::test]
+async fn a_redeemed_key_and_an_unredeemed_one_refuse_identically() {
+    // THE STATUS-CODE ORACLE ON THE UNAUTHENTICATED ENDPOINT, and it needs no
+    // secret at all. The store compares a presented `secret_hash` against the one
+    // its ledger already holds for this key BEFORE it looks the secret up — by
+    // design, because a refusal issued after the lookup would report whether that
+    // secret exists. So an attacker sends any key with a garbage secret:
+    //
+    //   - the key HAS been redeemed  -> the ledger row's hash differs -> the store
+    //     refuses with INVALID_ARGUMENT;
+    //   - the key has NOT been redeemed -> no ledger row -> the spend matches
+    //     nothing -> the store answers NOT_FOUND, and this service refuses with
+    //     UNAUTHENTICATED.
+    //
+    // Two codes, one bit, no credential spent. `RedeemEnrolment`'s response-time
+    // floor equalises TIME and never STATUS, which is exactly why the status code
+    // has to be equalised here instead.
+    //
+    // THE ASSERTION RELATES THE TWO PATHS TO EACH OTHER rather than each to a
+    // constant. A test asserting only "a refusal happened" passes against the
+    // broken version, because both paths do refuse — what differed was which
+    // refusal, and only a comparison sees that.
+    //
+    // MUTATION THIS CATCHES: restoring `.map_err(upstream_failed)?` on the
+    // `RedeemEnrolment` call. `upstream_failed` replaces the MESSAGE and keeps the
+    // CODE, deliberately and correctly for every other call site — so the leak
+    // survives redaction and is invisible to any test that reads messages alone.
+    let garbage = "not the secret this key redeemed";
+
+    let (iam, _recorded, _inv) = iam_with(FakeDb {
+        // The store's own words, so a reader can see what is being collapsed.
+        redeem_fails: Some((
+            tonic::Code::InvalidArgument,
+            "this idempotency key was used with a different enrolment secret",
+        )),
+        ..Default::default()
+    })
+    .await;
+    let redeemed_key = iam
+        .redeem_enrolment(redeem(garbage, "chosen one", "k1"))
+        .await
+        .expect_err("a key already spent on another secret does not redeem");
+
+    let (iam, _recorded, _inv) = iam_with(FakeDb {
+        redeem: refusal(db::RedeemOutcome::NotFound),
+        ..Default::default()
+    })
+    .await;
+    let unredeemed_key = iam
+        .redeem_enrolment(redeem(garbage, "chosen one", "k1"))
+        .await
+        .expect_err("an unknown secret does not redeem either");
+
+    assert_eq!(
+        redeemed_key.code(),
+        tonic::Code::Unauthenticated,
+        "a key the store refuses must not answer in a code of its own"
+    );
+    assert_eq!(
+        (
+            redeemed_key.code(),
+            redeemed_key.message().to_string(),
+            redeemed_key.details().to_vec()
+        ),
+        (
+            unredeemed_key.code(),
+            unredeemed_key.message().to_string(),
+            unredeemed_key.details().to_vec()
+        ),
+        "a spent idempotency key and an unspent one must be indistinguishable to a \
+         caller presenting a secret it does not hold"
+    );
+}
+
+#[tokio::test]
 async fn validation_runs_before_the_secret_is_looked_up() {
     // THE STATUS CODE IS THE ORACLE THIS CLOSES, and constant work does not
     // touch it. If a check that needs no secret ran AFTER the lookup, then
@@ -1526,6 +1612,22 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
             "a spent secret",
             FakeDb {
                 redeem: refusal(db::RedeemOutcome::Spent),
+                ..Default::default()
+            },
+        ),
+        (
+            // THE STORE'S OWN REFUSAL, which is a fourth path and not a fourth
+            // outcome — it arrives as an ERROR rather than a `RedeemOutcome`, so
+            // it leaves the handler through a `return` of its own. A path that
+            // escapes the floor would answer in the microseconds the store took
+            // to refuse, which is the same oracle in time that collapsing its
+            // status code closes in the response.
+            "a key the store refuses",
+            FakeDb {
+                redeem_fails: Some((
+                    tonic::Code::InvalidArgument,
+                    "this idempotency key was used with a different enrolment secret",
+                )),
                 ..Default::default()
             },
         ),

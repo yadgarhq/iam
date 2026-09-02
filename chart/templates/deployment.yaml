@@ -132,10 +132,18 @@ spec:
             # `enrolment.caSecret` above already uses.
             #
             # BOTH, OR NEITHER. The broker's authorization block names an account
-            # and a password together, so iam refuses to start with a password and
-            # no user. `required` here rather than a bare lookup: an override that
-            # nulls the user would otherwise render an empty string, and the
-            # failure would be a CrashLoop three layers from its cause.
+            # and a password together, so iam refuses to start with either one
+            # alone, in BOTH directions.
+            #
+            # WHICH MAKES THE `if` ABOVE LOAD-BEARING rather than tidy: it renders
+            # this variable and the password path TOGETHER, so an adopter who
+            # clears `nats.passwordSecret` drops both and boots with no credential
+            # — the supported state — even though `nats.user` still carries its
+            # default. Rendering this one on its own would refuse the boot.
+            #
+            # `required` here rather than a bare lookup: an override that nulls
+            # the user would otherwise render an empty string, and the failure
+            # would be a CrashLoop three layers from its cause.
             - name: NATS_USER
               value: {{ required "nats.user names the broker account iam authenticates as and must be set whenever nats.passwordSecret is; see the chart's values.yaml" .Values.nats.user | quote }}
             # A PATH, never the value (D80). A password in the environment is a
