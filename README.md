@@ -141,6 +141,77 @@ fail every request touching a credential or a personal-data field — a pod that
 looks healthy and is wrong. `main.rs` calls `crypto::Keys::from_env()` before
 binding the listener for exactly that reason.
 
+## A renewed certificate arrives by restart, not by reload
+
+The certificate this service presents is read ONCE, when the listener is built,
+and `tonic 0.14` cannot swap a running server's TLS configuration:
+`Server::tls_config` builds an acceptor there and then, and TLS settings are
+documented as ignored under `serve_with_incoming`, the only custom-acceptor path.
+cert-manager renews 30 days before expiry and kubelet refreshes the mounted files
+— the chart mounts those Secrets as DIRECTORIES rather than with `subPath`
+precisely so it does — but nothing would make the process re-read them.
+
+So `rotate` hashes the files `main` opened, one digest per file, as each is read:
+the serving certificate, its key, the CA bundle `iam-db` is verified against, and
+the CA every D73 enrolment token carries. When one of them changes it logs which
+file, and the old and new leaf fingerprint, waits out this pod's splay, drains
+through the same `serve_with_shutdown` a signal takes, and returns. **A rotated
+certificate is not an error, so the process exits 0.**
+
+**The enrolment CA is watched even though it is token payload rather than a
+transport input.** The chart mounts it as a directory so a rotation propagates
+into the pod; left unwatched, a gateway CA rotation would leave this process
+minting tokens carrying a CA that no longer signs anything, with no exit, no
+gauge movement and no log. It also means the watcher RUNS ON A DEFAULT INSTALL
+WITH TLS OFF: `enrolment.caSecret` ships with a default, so the watch set is
+empty only when `tls.enabled` is false and that value is unset.
+
+**The baseline is the bytes that were loaded**, captured beside the code that
+loaded them rather than when the watcher first polls. Otherwise the rest of boot
+— the `iam-db` dial, the broker connect — is a window in which a kubelet swap
+quietly becomes the baseline, and the real rotation is never noticed.
+
+**The drain is bounded.** Nothing outside the process ends a drain the process
+started: `terminationGracePeriodSeconds` never runs for a self-exit, and tokio
+keeps its signal handler installed after the rotation arm wins, so a later
+SIGTERM is swallowed rather than fatal. `serve::DRAIN_BUDGET` is 25s against the
+default 30s grace period; on expiry the process logs an error and ends anyway.
+
+**The budget's clock starts when shutdown is REQUESTED, not when the server
+starts**, which is why `serve::drain_within` takes an already-spawned server and
+the sender that asks it to stop. Wrapping the serving future in
+`tokio::time::timeout` instead bounds the server's whole life, and ends the
+process one budget after boot on every boot, with nothing having asked it to
+stop. That defect shipped on this branch and passed 123 tests; `tests/drain.rs`
+keeps it dead.
+
+**That drain had to be fixed first.** `main` registered `tokio::signal::ctrl_c`
+alone, which is SIGINT — a signal Kubernetes never sends. It sends SIGTERM, waits
+out `terminationGracePeriodSeconds`, then SIGKILLs, so the drain was reached on
+no rollout at all and whatever was in flight died with the process.
+`serve::shutdown` now hears both, armed before the server is spawned so a signal
+arriving in that window cannot take SIGTERM's default disposition.
+`tests/shutdown.rs` sends a real SIGTERM to the test process and asserts the
+server RETURNED and released its port — a killed process reaches neither
+assertion. `task` fixed this first and the spelling here is a copy of its
+`serve::shutdown`; `iam-db` and `gateway` still need the same one.
+
+**A hash, never a modification time.** Kubelet rotates a mounted Secret by
+renaming a new `..data` symlink over the old one, so every path resolves to a new
+inode with a fresh mtime on every resync, changed or not. An mtime check would
+restart both replicas for nothing. `tests/tls_rotation.rs` performs that exact
+swap, including the case where the new generation holds identical bytes.
+
+**The splay is the only thing separating the replicas.** They see the refreshed
+file inside the same kubelet sync window, and a PodDisruptionBudget constrains
+eviction — it does not govern a process that exits on its own.
+
+**And if the watcher dies you get the old behaviour, never worse.** An unreadable
+file is not a changed one, and an empty watch set means no watch.
+`yadgar_tls_certificate_not_after_seconds` is the half that makes that failure
+loud: it carries the expiry of the certificate this process actually loaded, so a
+watcher that stopped working still shows up as a leaf ageing out.
+
 ## Local development
 
 ```bash
@@ -152,19 +223,21 @@ cargo test     # the rules; they need no engine and no -db
 
 ## Configuration
 
-| variable                                       | default            |                                                                                                                                                                                                                                                                       |
-| ---------------------------------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `IAM_DB_HOST` / `IAM_DB_PORT`                  | `iam-db` / `50051` | the twin's headless Service                                                                                                                                                                                                                                           |
-| `YADGAR_KEYS_DIR`                              | —                  | where `crypto::Keys::from_env` reads the AES-GCM/HMAC keys (D72)                                                                                                                                                                                                      |
-| `LISTEN`                                       | `0.0.0.0:50052`    |                                                                                                                                                                                                                                                                       |
-| `LISTEN_TLS_ENABLED`                           | unset              | serve gRPC over TLS. Exactly `1` enables it; anything else, `true` included, leaves the plaintext listener. Off by default                                                                                                                                            |
-| `LISTEN_TLS_CERT_FILE` / `LISTEN_TLS_KEY_FILE` | unset              | the PEM certificate this service PRESENTS, and its private key. Both required when `LISTEN_TLS_ENABLED` is `1`. A missing path, an unreadable file, a PEM holding no certificate, and a key that does not match the certificate each refuse the boot, naming the file |
-| `IAM_DB_TLS_ENABLED`                           | unset              | dial `iam-db` over TLS. Exactly `1` enables it. Off by default. The opposite direction from `LISTEN_TLS_*`                                                                                                                                                            |
-| `IAM_DB_TLS_CA_FILE` / `IAM_DB_TLS_DOMAIN`     | unset              | the PEM bundle `iam-db`'s certificate is VERIFIED against, and the name to check it for. The CA file is required when `IAM_DB_TLS_ENABLED` is `1`; the domain defaults to `IAM_DB_HOST`                                                                               |
-| `METRICS_LISTEN`                               | `0.0.0.0:9090`     |                                                                                                                                                                                                                                                                       |
-| `LOGIN_RESPONSE_FLOOR_MS`                      | `250`              | the shortest time `Login` may answer in                                                                                                                                                                                                                               |
-| `REDEEM_RESPONSE_FLOOR_MS`                     | `750`              | the same, for `RedeemEnrolment`, which does more work                                                                                                                                                                                                                 |
-| `ENROLMENT_GATEWAY`                            | —                  | the address enrolment tokens carry; unset disables IssueEnrolment only                                                                                                                                                                                                |
-| `ENROLMENT_CA_PEM_FILE`                        | —                  | PEM of the root CA; absent means system trust applies                                                                                                                                                                                                                 |
-| `NATS_URL`                                     | —                  | the broker D72's cache invalidation is published on. Absent or unreachable is survivable and loudly logged                                                                                                                                                            |
-| `NATS_USER` / `NATS_PASSWORD_FILE`             | unset              | the broker account and a FILE holding its password. Unset connects unauthenticated and WARNs. An unreadable or empty password file, or a password with no user, EXITS at boot rather than connecting anonymously                                                      |
+| variable                                       | default            |                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IAM_DB_HOST` / `IAM_DB_PORT`                  | `iam-db` / `50051` | the twin's headless Service                                                                                                                                                                                                                                                                                                                                           |
+| `YADGAR_KEYS_DIR`                              | —                  | where `crypto::Keys::from_env` reads the AES-GCM/HMAC keys (D72)                                                                                                                                                                                                                                                                                                      |
+| `LISTEN`                                       | `0.0.0.0:50052`    |                                                                                                                                                                                                                                                                                                                                                                       |
+| `LISTEN_TLS_ENABLED`                           | unset              | serve gRPC over TLS. Exactly `1` enables it; anything else, `true` included, leaves the plaintext listener. Off by default                                                                                                                                                                                                                                            |
+| `LISTEN_TLS_CERT_FILE` / `LISTEN_TLS_KEY_FILE` | unset              | the PEM certificate this service PRESENTS, and its private key. Both required when `LISTEN_TLS_ENABLED` is `1`. A missing path, an unreadable file, a PEM holding no certificate, and a key that does not match the certificate each refuse the boot, naming the file                                                                                                 |
+| `IAM_DB_TLS_ENABLED`                           | unset              | dial `iam-db` over TLS. Exactly `1` enables it. Off by default. The opposite direction from `LISTEN_TLS_*`                                                                                                                                                                                                                                                            |
+| `IAM_DB_TLS_CA_FILE` / `IAM_DB_TLS_DOMAIN`     | unset              | the PEM bundle `iam-db`'s certificate is VERIFIED against, and the name to check it for. The CA file is required when `IAM_DB_TLS_ENABLED` is `1`; the domain defaults to `IAM_DB_HOST`                                                                                                                                                                               |
+| `TLS_ROTATION_POLL_SECS`                       | `60`               | how often the TLS files read at boot are re-hashed. A CHANGE ends the serve: the process drains and exits 0 so kubelet restarts it onto the new certificate. `0` is REFUSED at boot — it is a hot loop, not a way of turning the watcher off. Parsed at boot whether or not TLS is on, and the watcher still runs with TLS off whenever an enrolment CA is configured |
+| `TLS_ROTATION_SPLAY_MAX_SECS`                  | `300`              | the longest this pod waits before that exit, drawn per pod inside the range. Both replicas see the same rotation at once and a PDB does not govern a self-exit, so this is the only thing keeping them apart. `0` exits at once                                                                                                                                       |
+| `METRICS_LISTEN`                               | `0.0.0.0:9090`     |                                                                                                                                                                                                                                                                                                                                                                       |
+| `LOGIN_RESPONSE_FLOOR_MS`                      | `250`              | the shortest time `Login` may answer in                                                                                                                                                                                                                                                                                                                               |
+| `REDEEM_RESPONSE_FLOOR_MS`                     | `750`              | the same, for `RedeemEnrolment`, which does more work                                                                                                                                                                                                                                                                                                                 |
+| `ENROLMENT_GATEWAY`                            | —                  | the address enrolment tokens carry; unset disables IssueEnrolment only                                                                                                                                                                                                                                                                                                |
+| `ENROLMENT_CA_PEM_FILE`                        | —                  | PEM of the root CA; absent means system trust applies                                                                                                                                                                                                                                                                                                                 |
+| `NATS_URL`                                     | —                  | the broker D72's cache invalidation is published on. Absent or unreachable is survivable and loudly logged                                                                                                                                                                                                                                                            |
+| `NATS_USER` / `NATS_PASSWORD_FILE`             | unset              | the broker account and a FILE holding its password. Unset connects unauthenticated and WARNs. An unreadable or empty password file, or a password with no user, EXITS at boot rather than connecting anonymously                                                                                                                                                      |

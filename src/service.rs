@@ -4,6 +4,7 @@
 //! encrypted or hashed *here* before it crosses the storage boundary. The
 //! division is what makes a stolen database backup worthless on its own.
 
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
@@ -19,7 +20,10 @@ use crate::pb::yadgar::iam::v1::*;
 use crate::pb::yadgar::iamdb::v1 as db;
 use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
 
-const SERVICE: &str = "iam";
+/// The `service` label every metric this binary emits carries (D67). Public so
+/// that [`crate::rotate`]'s expiry gauge lands on the same bounded label as
+/// every call metric, rather than on a second spelling of the same name.
+pub const SERVICE: &str = "iam";
 
 /// D73's 24 hours, and NOT configurable.
 ///
@@ -124,6 +128,19 @@ pub struct ResponseFloors {
 pub struct EnrolmentConfig {
     gateway: String,
     ca_pem: Option<String>,
+    /// WHERE that PEM was read from, kept alongside the bytes rather than
+    /// discarded.
+    ///
+    /// The value is what a token carries; the PATH is what [`crate::rotate`]
+    /// watches. cert-manager rewrites the gateway's Secret and kubelet refreshes
+    /// this file — the chart mounts it as a DIRECTORY precisely so that
+    /// propagation happens — but this process read it once. Without the path,
+    /// nothing can notice, and `iam` goes on minting D73 tokens carrying a CA
+    /// that no longer signs anything, with no exit, no gauge movement and no log.
+    ///
+    /// `None` when no CA is configured, which is a deployment rather than an
+    /// error: it means the gateway has a publicly-trusted certificate.
+    ca_path: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -162,7 +179,13 @@ impl EnrolmentConfig {
         if ca_pem.as_deref().is_some_and(|p| p.trim().is_empty()) {
             return Err(EnrolmentConfigError::EmptyCa(CA_PEM_ENV));
         }
-        Ok(Self { gateway, ca_pem })
+        Ok(Self {
+            gateway,
+            ca_pem,
+            // NO PATH, because this constructor was handed the VALUE. Only
+            // `load` reads a file, so only `load` has a path to record.
+            ca_path: None,
+        })
     }
 
     /// Everything [`Self::from_env`] does except read the environment.
@@ -174,14 +197,24 @@ impl EnrolmentConfig {
     pub fn load(gateway: &str, ca_path: Option<&str>) -> Result<Self, EnrolmentConfigError> {
         // ABSENT IS A DEPLOYMENT, NOT AN ERROR: no CA means a publicly-trusted
         // certificate and the client's own system trust.
-        let ca_pem = match ca_path.filter(|p| !p.is_empty()) {
+        let ca_path = ca_path.filter(|p| !p.is_empty());
+        let ca_pem = match ca_path {
             None => None,
             Some(path) => Some(
                 std::fs::read_to_string(path)
                     .map_err(|e| EnrolmentConfigError::UnreadableCa(path.to_string(), e))?,
             ),
         };
-        Self::new(gateway.to_string(), ca_pem)
+        Ok(Self {
+            ca_path: ca_path.map(PathBuf::from),
+            ..Self::new(gateway.to_string(), ca_pem)?
+        })
+    }
+
+    /// The file this deployment's CA was read from, for [`crate::rotate`] to
+    /// watch. `None` when no CA is configured.
+    pub fn ca_path(&self) -> Option<&Path> {
+        self.ca_path.as_deref()
     }
 
     /// Load from the environment.

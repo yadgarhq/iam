@@ -36,6 +36,21 @@ tonic-prost = "0.14"
 # WHICH of the two files an operator has to fix. It is the same reasoning, and
 # the same crate, that `yadgar_dial::TlsOptions::prepare` uses on a CA bundle.
 rustls-pki-types = { version = "1", features = ["std"] }
+# READ-ONLY, and for ONE FIELD: the `notAfter` of the certificate this process
+# actually loaded, which `rotate` publishes as a gauge (D67). Nothing here
+# verifies anything — rustls does all the verification there is — so this parses
+# a certificate that has already been accepted rather than deciding whether to
+# accept one. `rustls-pki-types` decodes PEM to DER and stops there; no crate
+# already in this tree exposes a validity period.
+#
+# Pure Rust over `ring`, which `tls-ring` above already pulls in, so the musl
+# target (D63) is unaffected.
+x509-parser = "0.18"
+# THE FACADE ONLY, and the SAME major `yadgar-telemetry` links — a second
+# `metrics` in the tree is a second global recorder, and then the gauge silently
+# never appears while everything still compiles and passes. The exporter is
+# installed by this binary and by nothing else; see `main`.
+metrics = "0.24"
 yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e9ec92a6efd74363e68c694fe6c0fa" }
 
 # The shared instrumentation seam (D67). Pinned by revision, like every other
@@ -43,7 +58,23 @@ yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1694475a7eab9a8332f2955671987c57bf3234e8", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# `signal` for `serve::shutdown`; `sync` for the oneshot that carries the
+# shutdown REQUEST to the spawned server, which is what lets the drain budget's
+# clock start when shutdown is asked for rather than when the server started;
+# `time` for `tokio::time::sleep` in `rotate` and `tokio::time::timeout` around
+# the drain.
+#
+# `time` IS NAMED RATHER THAN INHERITED, and that is the same discipline
+# `tls-ring` above is declared under. A transitive dependency enables it today,
+# so this crate compiles without asking; the day that dependency changes, the
+# feature disappears and the error lands on a line nobody edited.
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 http = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -98,6 +129,14 @@ tokio = { version = "1", features = [
 # the repository is a secret in the repository, and it expires on a date nobody
 # is watching.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `DebuggingRecorder` + `with_local_recorder`: the only way to assert that the
+# metric NAME a dashboard queries, and the LABEL it carries, are what this crate
+# claims — a typo in either compiles, passes clippy, and produces a series
+# nothing queries. MUST resolve against `metrics 0.24`: a metrics-util built on
+# another major links a SECOND facade, and then the snapshot is empty while every
+# assertion still passes vacuously. `yadgar-telemetry` pairs the same two
+# versions for the same reason.
+metrics-util = { version = "0.20", features = ["debugging"] }
 # Wraps a `TcpListener` the rig owns into the stream `serve_with_incoming` takes,
 # which is how the same builder the binary uses gets served on a port the test
 # chose. Dev-only, so the shipped tree is unchanged.
