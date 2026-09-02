@@ -69,3 +69,57 @@ login:
   #
   # Lowering it is a security change, not a latency optimisation.
   responseFloorMs: 250
+
+redeemEnrolment:
+  # The same control for RedeemEnrolment, and DELIBERATELY A SEPARATE NUMBER.
+  #
+  # That RPC is unauthenticated by construction — the enrolment secret is the
+  # whole authenticator — and its three refusals (unknown, spent, expired) are
+  # decided inside iam-db. A timing difference between them therefore arises in
+  # ANOTHER PROCESS, which no amount of constant work inside iam can equalise;
+  # only a floor over the whole handler covers it.
+  #
+  # 750 rather than Login's 250 because a redemption legitimately costs more: it
+  # HASHES the chosen password and then VERIFIES it against what the store holds,
+  # two Argon2id operations against Login's one, plus a further round trip.
+  # Sharing Login's floor would put every successful redemption over it, so iam
+  # would warn on every call — an alert that always fires is an alert on nothing,
+  # and it would drown the Login warning that means something.
+  #
+  # Measured on dev hardware, like Login's. Re-measure here, and raise it if the
+  # slowest legitimate redemption on THIS cluster approaches it.
+  responseFloorMs: 750
+
+# What iam puts into every enrolment token it mints (D73). An admin assembles
+# neither value and so cannot get either wrong — which puts the whole burden of
+# holding correct ones here.
+enrolment:
+  # The gateway address a person's first client connects to.
+  #
+  # EMPTY HERE AND MUST BE SET PER DEPLOYMENT. There is no default that could be
+  # right: this is the address a stranger's laptop dials, and the chart cannot
+  # know it.
+  #
+  # LEAVING IT EMPTY DISABLES IssueEnrolment AND NOTHING ELSE. iam warns at boot
+  # and the RPC refuses with FAILED_PRECONDITION naming this variable; Login and
+  # ResolveCredential are unaffected. It is deliberately NOT a boot failure —
+  # iam is the authentication plane, and a CrashLoopBackOff here would take the
+  # estate's credential resolution down over one administrative value. What the
+  # refusal protects is the contract's rule that a minted token never carries an
+  # empty gateway: the field has no presence, so such a token would be
+  # structurally valid and point at nothing, and its failure would surface on
+  # that stranger's machine as an undiagnosable connection error.
+  gateway: ""
+
+  # A ConfigMap holding the root CA the token carries, under the key `ca.pem`.
+  #
+  # EMPTY MEANS SYSTEM TRUST, which is a legitimate deployment rather than a
+  # missing value: the mechanism exists for development and private deployments,
+  # and a publicly-trusted certificate needs no anchor handed over. Absent and
+  # empty are different instructions to a client, and iam refuses a CA file that
+  # is present and empty for exactly that reason.
+  #
+  # A ConfigMap and not a Secret: a root CA certificate is public by
+  # construction. Putting it in a Secret would claim a confidentiality it does
+  # not have and does not need.
+  caConfigMap: ""

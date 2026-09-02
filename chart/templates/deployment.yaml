@@ -85,6 +85,36 @@ spec:
             # change is about.
             - name: LOGIN_RESPONSE_FLOOR_MS
               value: {{ required "login.responseFloorMs is the Login response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.login.responseFloorMs | quote }}
+            # The same control for RedeemEnrolment, and its own number. That RPC
+            # is unauthenticated and its three refusals are decided inside
+            # iam-db, so the difference a floor hides here arises in another
+            # process and constant work in iam cannot reach it. `required` for
+            # the reason above: a floor nobody chose is a security control
+            # configured by accident.
+            - name: REDEEM_RESPONSE_FLOOR_MS
+              value: {{ required "redeemEnrolment.responseFloorMs is the RedeemEnrolment response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.redeemEnrolment.responseFloorMs | quote }}
+            # The gateway address every enrolment token carries (D73).
+            #
+            # NOT `required`, and NOT a boot failure either. No default can know
+            # a deployment's EXTERNAL address, so the chart cannot supply one —
+            # and iam must not CrashLoopBackOff over it, because iam is the
+            # authentication plane: stopping the process would halt every
+            # dependent service's credential resolution once the gateway's 300s
+            # cache expired, over a value belonging to one administrative RPC.
+            #
+            # Unset means IssueEnrolment refuses with FAILED_PRECONDITION naming
+            # this variable, and iam WARNs about it at boot. The contract's rule
+            # — never mint a token carrying an empty gateway — is kept by the
+            # refusal, without an availability cost.
+            - name: ENROLMENT_GATEWAY
+              value: {{ .Values.enrolment.gateway | quote }}
+            {{- if .Values.enrolment.caConfigMap }}
+            # Set ONLY when a CA is configured. Absence is the whole of "use
+            # system trust", so an empty value here would be a token assembled
+            # wrong rather than a deployment without a CA — and iam refuses that.
+            - name: ENROLMENT_CA_PEM_FILE
+              value: /var/run/config/iam-ca/ca.pem
+            {{- end }}
           # This service does NOT wait for iam-db before listening, so the port
           # opening means "process up", not "dependency healthy" — deliberately.
           # Blocking startup on a -db that is still migrating would turn one
@@ -109,7 +139,17 @@ spec:
             - name: keys
               mountPath: /var/run/secrets/iam-keys
               readOnly: true
+            {{- if .Values.enrolment.caConfigMap }}
+            - name: enrolment-ca
+              mountPath: /var/run/config/iam-ca
+              readOnly: true
+            {{- end }}
       volumes:
         - name: keys
           secret:
             secretName: {{ .Values.keysSecret }}
+        {{- if .Values.enrolment.caConfigMap }}
+        - name: enrolment-ca
+          configMap:
+            name: {{ .Values.enrolment.caConfigMap }}
+        {{- end }}

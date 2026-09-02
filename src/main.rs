@@ -21,7 +21,10 @@ use std::time::Duration;
 
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
-use yadgar_iam::service::{Iam, DEFAULT_LOGIN_RESPONSE_FLOOR};
+use yadgar_iam::service::{
+    EnrolmentConfig, Iam, ResponseFloors, DEFAULT_LOGIN_RESPONSE_FLOOR,
+    DEFAULT_REDEEM_RESPONSE_FLOOR,
+};
 use yadgar_iam::upstream;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -93,10 +96,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_floor_ms = DEFAULT_LOGIN_RESPONSE_FLOOR.as_millis().to_string();
     let login_response_floor =
         Duration::from_millis(env_or("LOGIN_RESPONSE_FLOOR_MS", &default_floor_ms).parse()?);
+
+    // ITS OWN VALUE, because `RedeemEnrolment` legitimately does more work — two
+    // Argon2id operations and a further round trip — and a floor sized for
+    // `Login` would be exceeded by every successful redemption, turning the
+    // warning that says "raise this" into one that fires on every call.
+    let default_redeem_ms = DEFAULT_REDEEM_RESPONSE_FLOOR.as_millis().to_string();
+    let redeem_response_floor =
+        Duration::from_millis(env_or("REDEEM_RESPONSE_FLOOR_MS", &default_redeem_ms).parse()?);
     tracing::info!(
-        floor_ms = login_response_floor.as_millis() as u64,
-        "Login answers no sooner than its response-time floor"
+        login_floor_ms = login_response_floor.as_millis() as u64,
+        redeem_floor_ms = redeem_response_floor.as_millis() as u64,
+        "Login and RedeemEnrolment answer no sooner than their response-time floors"
     );
+
+    // WARNS AND DEGRADES ONE RPC. It does NOT fail boot, and the difference
+    // matters more here than anywhere else in this file: `iam` is the
+    // authentication plane. A CrashLoopBackOff would stop `Login` at once and
+    // every dependent service's credential resolution as soon as the gateway's
+    // 300s cache expired — an estate-wide outage caused by a value that belongs
+    // to ONE administrative RPC.
+    //
+    // The contract's rule is about the TOKEN — never mint one carrying an empty
+    // gateway — and `IssueEnrolment` keeps it whole by refusing with
+    // FAILED_PRECONDITION. That is loud to the operator who calls it, and this
+    // warning is loud to the operator who deploys it; between them nothing is
+    // silent, and nothing else stops working.
+    //
+    // Contrast the crypto keys above, which DO fail boot: without them every
+    // request touching a credential fails, so there is no reduced service left
+    // to protect. Here there is.
+    let enrolment = match EnrolmentConfig::from_env() {
+        Ok(config) => {
+            tracing::info!("enrolment tokens carry this deployment's gateway and CA (D73)");
+            Some(config)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "IssueEnrolment is UNAVAILABLE on this deployment and will refuse \
+                 with FAILED_PRECONDITION; everything else, ResolveCredential and \
+                 Login included, is unaffected. Set ENROLMENT_GATEWAY to enable it."
+            );
+            None
+        }
+    };
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
     tracing::info!(%addr, "iam listening");
@@ -105,7 +149,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             keys,
             db,
             invalidator,
-            login_response_floor,
+            ResponseFloors {
+                login: login_response_floor,
+                redeem: redeem_response_floor,
+            },
+            enrolment,
         )))
         .serve_with_shutdown(addr, async {
             let _ = tokio::signal::ctrl_c().await;

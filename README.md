@@ -34,6 +34,64 @@ Everything a credential store has no business doing itself (D72):
   `CreateUser` and the team-membership RPCs are GitOps or CLI surface; an agent
   presents a credential, it never issues one.
 
+## Enrolment: the admin creates the account, the person sets the password
+
+`IssueEnrolment` mints a single-use secret and `RedeemEnrolment` spends it (D73).
+The admin never learns the password, so an audit trail can tell the person from
+whoever onboarded them, and the password never travels through a chat message.
+
+What the admin hands over is one base64 string. It carries the secret **and the
+trust anchor** — the gateway address and the root CA — because a client that has
+never met this deployment has nothing else to verify the gateway against. `iam`
+fills both from its own configuration, so an admin assembles neither and cannot
+get either wrong.
+
+**An unconfigured deployment disables `IssueEnrolment` and nothing else.** `iam`
+warns at boot naming `ENROLMENT_GATEWAY`, and the RPC refuses with
+`FAILED_PRECONDITION` naming it again. That keeps the contract's rule whole — the
+fields have no presence, so a token minted without them would be structurally
+valid and point at nothing — without the availability cost of refusing to start.
+The crypto keys are the opposite case and still fail boot: without them every
+request touching a credential fails, so there is no reduced service left to
+protect. Here there is, and `iam` is the authentication plane for the estate.
+
+**`RedeemEnrolment` is unauthenticated by construction** — the secret is the
+whole authenticator — so it carries `Login`'s enumeration problem in a sharper
+form, and takes three precautions rather than two:
+
+- **One failure, not three.** Unknown, spent and expired are all
+  `UNAUTHENTICATED` with one message. The store tells them apart and records
+  which; the caller cannot.
+- **Constant work.** The chosen password is hashed with Argon2id _before_ the
+  secret is looked up, and the refusal path pays the same verification the
+  success path pays. Both cost two Argon2id operations, so the response time is
+  not a function of what the store found.
+- **Validation before lookup.** Every check that does not need the secret runs
+  first. Otherwise `INVALID_ARGUMENT` arrives only once the secret is confirmed
+  and the status code itself says the secret was good — an oracle cleaner than
+  timing, and one constant work does not touch.
+
+**It has its own response-time floor, and not `Login`'s.** The three refusals are
+decided inside `iam-db`, so any timing difference between them arises in another
+process and no amount of constant work here can equalise it; only a floor over
+the whole handler covers that. The value is separate because a redemption
+legitimately costs more — two Argon2id operations and a further round trip — and
+`Login`'s floor would be exceeded by every successful redemption, turning the
+warning that says "raise this" into one that fires on every call.
+
+Two residuals are accepted rather than hidden, and both are in the contract:
+
+- A retry mints a **fresh** credential, because a token shown once and kept as a
+  hash cannot be replayed. Every attempt but the last leaves an orphan.
+  `ListCredentials` exists to find those and is **not implemented yet** — until
+  it is, an orphan is reachable only in the store.
+- A **replayed `IssueEnrolment` key returns a token that cannot be redeemed.**
+  The key is forwarded and the store deduplicates it, so the replay answers with
+  the original `enrolment_id` while keeping the original secret's hash — and the
+  secret in the token was minted afresh. The store keeps only a hash, which is
+  the same fact that puts token _resend_ outside D73's first cut. The recovery is
+  the one this RPC already is: mint another.
+
 ## Client-side balancing, and the part that gets forgotten
 
 gRPC holds **one** long-lived HTTP/2 connection. A normal Service balances at
@@ -94,9 +152,13 @@ cargo test     # the rules; they need no engine and no -db
 
 ## Configuration
 
-| variable                      | default            |                                                                  |
-| ----------------------------- | ------------------ | ---------------------------------------------------------------- |
-| `IAM_DB_HOST` / `IAM_DB_PORT` | `iam-db` / `50051` | the twin's headless Service                                      |
-| `YADGAR_KEYS_DIR`             | —                  | where `crypto::Keys::from_env` reads the AES-GCM/HMAC keys (D72) |
-| `LISTEN`                      | `0.0.0.0:50052`    |                                                                  |
-| `METRICS_LISTEN`              | `0.0.0.0:9090`     |                                                                  |
+| variable                      | default            |                                                                        |
+| ----------------------------- | ------------------ | ---------------------------------------------------------------------- |
+| `IAM_DB_HOST` / `IAM_DB_PORT` | `iam-db` / `50051` | the twin's headless Service                                            |
+| `YADGAR_KEYS_DIR`             | —                  | where `crypto::Keys::from_env` reads the AES-GCM/HMAC keys (D72)       |
+| `LISTEN`                      | `0.0.0.0:50052`    |                                                                        |
+| `METRICS_LISTEN`              | `0.0.0.0:9090`     |                                                                        |
+| `LOGIN_RESPONSE_FLOOR_MS`     | `250`              | the shortest time `Login` may answer in                                |
+| `REDEEM_RESPONSE_FLOOR_MS`    | `750`              | the same, for `RedeemEnrolment`, which does more work                  |
+| `ENROLMENT_GATEWAY`           | —                  | the address enrolment tokens carry; unset disables IssueEnrolment only |
+| `ENROLMENT_CA_PEM_FILE`       | —                  | PEM of the root CA; absent means system trust applies                  |

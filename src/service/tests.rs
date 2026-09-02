@@ -17,6 +17,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+// `base64::Engine` is NOT imported here: `use super::*` already carries
+// `service.rs`'s own anonymous import of it, and a second one is an unused
+// import. `prost::Message` is not in that glob and IS needed, for
+// `EnrolmentToken::decode`.
+use prost::Message as _;
 use tonic::transport::{Channel, Endpoint};
 
 use super::*;
@@ -29,6 +34,12 @@ use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbSer
 struct Recorded {
     create_credential: Vec<db::CreateCredentialRequest>,
     get_password_hash: Vec<db::GetPasswordHashRequest>,
+    create_enrolment: Vec<db::CreateEnrolmentRequest>,
+    /// **THE ORDERING WITNESS.** `validation_runs_before_the_secret_is_looked_up`
+    /// asserts this is EMPTY, which is the only way to see that a refusal came
+    /// before the lookup rather than after it — the status code is identical
+    /// either way, and it is the status code that would become the oracle.
+    redeem_enrolment: Vec<db::RedeemEnrolmentRequest>,
 }
 
 /// A stand-in for `iam-db`: answers from a fixed script and records the asking.
@@ -41,6 +52,12 @@ struct FakeDb {
     create_user_fails: Option<(tonic::Code, &'static str)>,
     /// What `ResolveCredential` answers.
     resolves_to: Option<String>,
+    /// D73's flag, as the STORE reports it. Separate from `resolves_to` so a
+    /// test can pin that the value travels rather than being invented here.
+    resolves_admin: bool,
+    /// What `RedeemEnrolment` answers. `None` is an unknown secret, which is the
+    /// default an attacker's presentation gets.
+    redeem: Option<db::RedeemEnrolmentResponse>,
     recorded: Arc<Mutex<Recorded>>,
 }
 
@@ -52,6 +69,7 @@ impl IamDbService for FakeDb {
     ) -> Result<Response<db::ResolveCredentialResponse>, Status> {
         Ok(Response::new(db::ResolveCredentialResponse {
             user_id: self.resolves_to.clone().unwrap_or_default(),
+            is_admin: self.resolves_admin,
             ..Default::default()
         }))
     }
@@ -77,6 +95,58 @@ impl IamDbService for FakeDb {
         _req: Request<db::SetPasswordRequest>,
     ) -> Result<Response<db::SetPasswordResponse>, Status> {
         Ok(Response::new(db::SetPasswordResponse {}))
+    }
+
+    async fn create_enrolment(
+        &self,
+        req: Request<db::CreateEnrolmentRequest>,
+    ) -> Result<Response<db::CreateEnrolmentResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .create_enrolment
+            .push(req.into_inner());
+        Ok(Response::new(db::CreateEnrolmentResponse {
+            enrolment_id: "yadgar:enrolment:fake".into(),
+        }))
+    }
+
+    async fn redeem_enrolment(
+        &self,
+        req: Request<db::RedeemEnrolmentRequest>,
+    ) -> Result<Response<db::RedeemEnrolmentResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .redeem_enrolment
+            .push(req.into_inner());
+        Ok(Response::new(self.redeem.clone().unwrap_or(
+            db::RedeemEnrolmentResponse {
+                outcome: db::RedeemOutcome::NotFound as i32,
+                ..Default::default()
+            },
+        )))
+    }
+
+    async fn list_credentials(
+        &self,
+        _req: Request<db::ListCredentialsRequest>,
+    ) -> Result<Response<db::ListCredentialsResponse>, Status> {
+        Ok(Response::new(db::ListCredentialsResponse::default()))
+    }
+
+    async fn set_user_admin(
+        &self,
+        _req: Request<db::SetUserAdminRequest>,
+    ) -> Result<Response<db::SetUserAdminResponse>, Status> {
+        Ok(Response::new(db::SetUserAdminResponse {}))
+    }
+
+    async fn set_rate_limit_override(
+        &self,
+        _req: Request<db::SetRateLimitOverrideRequest>,
+    ) -> Result<Response<db::SetRateLimitOverrideResponse>, Status> {
+        Ok(Response::new(db::SetRateLimitOverrideResponse {}))
     }
 
     async fn create_credential(
@@ -180,18 +250,76 @@ async fn twin(fake: FakeDb) -> (Channel, Arc<Mutex<Recorded>>) {
 /// discovered.
 const NOMINAL_FLOOR: Duration = Duration::from_millis(5);
 
+/// The gateway address and CA a minted token carries, in tests.
+///
+/// FIXED VALUES SO THE TOKEN CAN BE ASSERTED ON. An admin never assembles
+/// either, so the only way to see that `iam` put its OWN configuration into the
+/// token — rather than an empty string, which the contract forbids and no client
+/// can diagnose — is to configure something recognisable and look for it.
+const TEST_GATEWAY: &str = "gateway.yadgar.test:443";
+const TEST_CA: &str = "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n";
+
+fn enrolment_config() -> Option<EnrolmentConfig> {
+    Some(EnrolmentConfig::new(TEST_GATEWAY.into(), Some(TEST_CA.into())).expect("a valid config"))
+}
+
 async fn iam_with(fake: FakeDb) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
     iam_with_floor(fake, NOMINAL_FLOOR).await
 }
 
 async fn iam_with_floor(fake: FakeDb, floor: Duration) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    iam_with_floors(
+        fake,
+        ResponseFloors {
+            login: floor,
+            redeem: NOMINAL_FLOOR,
+        },
+        enrolment_config(),
+    )
+    .await
+}
+
+async fn iam_with_redeem_floor(
+    fake: FakeDb,
+    floor: Duration,
+) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    iam_with_floors(
+        fake,
+        ResponseFloors {
+            login: NOMINAL_FLOOR,
+            redeem: floor,
+        },
+        enrolment_config(),
+    )
+    .await
+}
+
+/// An `Iam` on a deployment that has NOT configured enrolment.
+async fn iam_without_enrolment(fake: FakeDb) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    iam_with_floors(
+        fake,
+        ResponseFloors {
+            login: NOMINAL_FLOOR,
+            redeem: NOMINAL_FLOOR,
+        },
+        None,
+    )
+    .await
+}
+
+async fn iam_with_floors(
+    fake: FakeDb,
+    floors: ResponseFloors,
+    enrolment: Option<EnrolmentConfig>,
+) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
     let (channel, recorded) = twin(fake).await;
     let invalidator = Invalidator::connect(None).await;
     let iam = Iam::new(
         crate::crypto::tests::keys(),
         channel,
         invalidator.clone(),
-        floor,
+        floors,
+        enrolment,
     );
     // LAST, and both halves of that matter. It installs the WARN tap, so no login
     // any test performs can precede the global subscriber; and it drains this
@@ -500,7 +628,7 @@ async fn the_floor_is_anchored_to_the_start_not_added_to_the_work() {
 
     for work in [Duration::from_millis(1), Duration::from_millis(200)] {
         let t0 = tokio::time::Instant::now();
-        iam.hold_until_floor(work).await;
+        iam.hold_until_floor(iam.login_floor, work).await;
         assert_eq!(
             t0.elapsed(),
             FLOOR - work,
@@ -593,11 +721,37 @@ fn warnings() -> Vec<String> {
     WARNINGS.with(|w| w.borrow().clone())
 }
 
-/// Just the floor's own warnings, so an unrelated one cannot pass for it.
+/// Just `Login`'s floor warnings, so nothing else can pass for one.
+///
+/// **FILTERED ON THE `rpc` FIELD AS WELL AS THE TEXT**, because the text is no
+/// longer unique: `RedeemEnrolment` is floored by the same mechanism and emits
+/// the same sentence. Every enrolment test below runs against `NOMINAL_FLOOR`
+/// and two Argon2id operations, so each of them exceeds its floor and warns —
+/// matching on the text alone would let one of those stand in for the `Login`
+/// warning these assertions are about. Today the thread-local keeps them apart
+/// anyway; that is a property of how the tests happen to be scheduled, and this
+/// filter is the one that does not depend on it.
 fn floor_warnings() -> Vec<String> {
+    floor_warnings_for("Login")
+}
+
+/// The same, for `RedeemEnrolment`.
+///
+/// **THIS IS WHAT LETS THE REDEEM FLOOR TESTS FAIL RATHER THAN GO VACUOUS.** A
+/// per-path lower bound passes whether the floor padded anything or not: on a
+/// loaded runner every path exceeds the floor, nothing is padded, the response
+/// times separate by whatever the work cost, and the assertion is still green.
+/// The warning is the service's own report that it padded NOTHING, so asserting
+/// on its absence turns that silent vacuity into a failure.
+fn redeem_floor_warnings() -> Vec<String> {
+    floor_warnings_for("RedeemEnrolment")
+}
+
+fn floor_warnings_for(rpc: &str) -> Vec<String> {
+    let field = format!("rpc={rpc}");
     warnings()
         .into_iter()
-        .filter(|w| w.contains("response-time floor"))
+        .filter(|w| w.contains("response-time floor") && w.contains(&field))
         .collect()
 }
 
@@ -833,4 +987,860 @@ async fn a_negative_resolve_is_not_cacheable() {
     // The other half: if the TTL were zeroed unconditionally the assertion above
     // would still pass and the gateway's cache would do nothing at all.
     assert_eq!(found.valid_for_seconds, 300);
+}
+
+// ---------------------------------------------------------------------------
+// Enrolment (D73). An admin creates the account, the PERSON sets the password.
+// ---------------------------------------------------------------------------
+
+/// A store answer for a secret that was accepted and spent.
+///
+/// `external_id_ciphertext` is encrypted with the SAME fixture keys the service
+/// holds, because that is the only way the boundary is honest: the store never
+/// sees a plaintext name in either direction, so a redemption can only learn the
+/// username by decrypting what it is handed.
+fn redeemed(username: &str) -> Option<db::RedeemEnrolmentResponse> {
+    Some(db::RedeemEnrolmentResponse {
+        outcome: db::RedeemOutcome::Redeemed as i32,
+        user_id: "yadgar:user:1".into(),
+        enrolment_id: "yadgar:enrolment:fake".into(),
+        external_id_ciphertext: crate::crypto::tests::keys()
+            .encrypt(username)
+            .expect("encrypt the fixture username"),
+    })
+}
+
+fn refusal(outcome: db::RedeemOutcome) -> Option<db::RedeemEnrolmentResponse> {
+    Some(db::RedeemEnrolmentResponse {
+        outcome: outcome as i32,
+        ..Default::default()
+    })
+}
+
+fn redeem(secret: &str, password: &str, key: &str) -> Request<RedeemEnrolmentRequest> {
+    Request::new(RedeemEnrolmentRequest {
+        secret: secret.into(),
+        password: password.into(),
+        label: "laptop".into(),
+        idempotency: Some(Idempotency { key: key.into() }),
+    })
+}
+
+fn issue(key: &str) -> Request<IssueEnrolmentRequest> {
+    Request::new(IssueEnrolmentRequest {
+        idempotency: Some(Idempotency { key: key.into() }),
+        user_id: "yadgar:user:1".into(),
+    })
+}
+
+#[tokio::test]
+async fn an_enrolment_token_carries_the_secret_whose_hash_was_stored() {
+    // TWO PROPERTIES THAT ARE ONE PROPERTY FROM BOTH SIDES: the store holds the
+    // hash of the secret the admin was handed, and the plaintext secret never
+    // crosses the boundary.
+    //
+    // MUTATION THIS CATCHES: minting twice — hashing one secret and putting
+    // another in the token. Every enrolment issued would then be unredeemable,
+    // and no assertion that merely checks "a token came back" can tell. It is
+    // the same mutation `the_token_returned_is_the_one_that_was_stored` catches
+    // for a credential, and it is worth catching twice because the two mints are
+    // separate code.
+    let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
+
+    let out = iam
+        .issue_enrolment(issue("attempt-1"))
+        .await
+        .expect("issue")
+        .into_inner();
+
+    // STANDARD ALPHABET, WITH PADDING (RFC 4648 section 4). Decoding is not
+    // enough on its own — a URL-safe unpadded string of the right length can
+    // decode under a permissive reader — so the assertion is a ROUND TRIP:
+    // re-encoding the bytes must reproduce the string byte for byte, which no
+    // other alphabet or padding rule does.
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&out.token)
+        .expect("the token must decode under the standard alphabet");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.encode(&raw),
+        out.token,
+        "the token must be standard-alphabet base64 WITH padding; a URL-safe or \
+         unpadded one decodes to noise on exactly the machines that have never \
+         met this deployment"
+    );
+
+    let token = EnrolmentToken::decode(&raw[..]).expect("the bytes are an EnrolmentToken");
+
+    assert!(
+        !token.secret.is_empty(),
+        "a minted token never carries an empty secret"
+    );
+    assert_eq!(
+        token.gateway, TEST_GATEWAY,
+        "iam fills the gateway from its OWN configuration, so an admin cannot \
+         get it wrong — and an empty one mints a token pointing at nothing"
+    );
+    assert_eq!(
+        token.ca_pem.as_deref(),
+        Some(TEST_CA),
+        "the trust anchor travels with the secret, on the channel that is \
+         already trusted"
+    );
+
+    let stored = recorded.lock().expect("recorded").create_enrolment.clone();
+    assert_eq!(stored.len(), 1, "one issuance is one enrolment");
+    assert_eq!(
+        stored[0].secret_hash,
+        Keys::token_hash(&token.secret),
+        "the store must hold the hash of the secret the admin was handed, or the \
+         enrolment cannot be redeemed by anyone"
+    );
+    assert!(
+        !format!("{:?}", stored[0]).contains(&token.secret),
+        "the plaintext secret must not appear anywhere in the outbound request"
+    );
+    assert_eq!(
+        stored[0].idempotency.as_ref().map(|i| i.key.as_str()),
+        Some("attempt-1"),
+        "the caller's key reaches the store, which is where D9's deduplication \
+         lives"
+    );
+}
+
+#[tokio::test]
+async fn an_enrolment_expires_in_twenty_four_hours() {
+    // MUTATION THIS CATCHES: reporting one deadline and storing another. The
+    // stored one is what the store enforces against its own clock, so a response
+    // that named a later time would have an admin hand over a token that stops
+    // working before the person is told it would — a failure nobody can diagnose
+    // from either end.
+    let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
+
+    let out = iam
+        .issue_enrolment(issue("attempt-1"))
+        .await
+        .expect("issue")
+        .into_inner();
+
+    let stored = recorded.lock().expect("recorded").create_enrolment.clone();
+    assert_eq!(
+        out.expires_at, stored[0].expires_at,
+        "the deadline reported must be the deadline stored"
+    );
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&out.token)
+        .expect("decode");
+    let token = EnrolmentToken::decode(&raw[..]).expect("decode");
+    assert_eq!(
+        token.expires_at, out.expires_at,
+        "the token states its own deadline, so a client can say WHY an enrolment \
+         failed rather than reporting a generic refusal"
+    );
+
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64;
+    let deadline = out.expires_at.expect("set").seconds;
+    assert!(
+        (deadline - now - 24 * 60 * 60).abs() <= 60,
+        "D73's 24 hours; got {} seconds from now",
+        deadline - now
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_enrolment_secret_costs_the_same_argon2_work_as_a_valid_one() {
+    // THE CONSTANT-WORK PROPERTY, AND IT IS AN EQUALITY BETWEEN TWO PATHS rather
+    // than a bound on each. A per-path assertion against a constant this code
+    // chose proves only that the code does what it does; what the property says
+    // is that the two paths cost THE SAME, and only a comparison between them
+    // can say it. Deterministic, and no clock is read.
+    //
+    // WHAT THE COUNTER ACTUALLY COUNTS, stated precisely because an earlier
+    // version of this comment overclaimed: `CountingArgon2` is constructed only
+    // inside `verify_counted`, so it counts VERIFICATIONS and not every Argon2
+    // hashing. `hash_secret` mints through a bare `Argon2::default()` and is
+    // invisible here. So this reads 1 against 1 — the verification each path
+    // pays — and NOT 2 against 2.
+    //
+    // MUTATION THIS CATCHES: deleting the `verify_password(None, …)` on the
+    // refusal path. A refusal would then cost zero verifications against a
+    // redemption's one, and the response time says which secrets exist.
+    //
+    // THE OTHER ORDERING — hashing only after the store confirms the secret — is
+    // NOT tested here because it is STRUCTURALLY UNREACHABLE: the hash is a
+    // FIELD of `db::RedeemEnrolmentRequest`, so it must exist before the store
+    // call is built. The contract's constant-work rule is kept by the type, not
+    // by this assertion, and claiming otherwise would be an assertion taking
+    // credit for something it cannot see.
+    //
+    // Both paths are driven on ONE thread, which the counter's thread-local
+    // storage requires — see the note on NOMINAL_FLOOR.
+    let (iam, _rec, _inv) = iam_with(FakeDb {
+        redeem: redeemed("ada"),
+        password: known_user("chosen one"),
+        ..Default::default()
+    })
+    .await;
+
+    let before = argon2_verifications();
+    iam.redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+        .await
+        .expect("a valid secret redeems");
+    let valid = argon2_verifications() - before;
+
+    let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
+
+    let before = argon2_verifications();
+    let err = iam
+        .redeem_enrolment(redeem("not a secret", "chosen one", "k2"))
+        .await
+        .expect_err("an unknown secret must not redeem");
+    let unknown = argon2_verifications() - before;
+
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert!(
+        valid > 0,
+        "a redemption must do real Argon2 work, or this equality is 0 == 0 and \
+         asserts nothing"
+    );
+    assert_eq!(
+        unknown, valid,
+        "an unknown secret must cost the same Argon2 work a valid one does; \
+         {unknown} against {valid} is a response time that says which secrets \
+         exist"
+    );
+}
+
+#[tokio::test]
+async fn unknown_spent_and_expired_are_one_refusal() {
+    // ONE FAILURE, NOT THREE. The store tells the three apart and records which;
+    // a caller that could would learn whether a secret it does not hold ever
+    // existed, and whether somebody has already used it.
+    //
+    // MUTATION THIS CATCHES: mapping the outcomes to three statuses, or to one
+    // status with three messages. Either is an oracle in the response itself,
+    // which no amount of constant work touches.
+    let mut refusals = Vec::new();
+    for outcome in [
+        db::RedeemOutcome::NotFound,
+        db::RedeemOutcome::Spent,
+        db::RedeemOutcome::Expired,
+    ] {
+        let (iam, recorded, _inv) = iam_with(FakeDb {
+            redeem: refusal(outcome),
+            ..Default::default()
+        })
+        .await;
+
+        let err = iam
+            .redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+            .await
+            .expect_err("none of the three redeems");
+
+        assert!(
+            recorded
+                .lock()
+                .expect("recorded")
+                .create_credential
+                .is_empty(),
+            "{outcome:?}: a refused redemption must mint ZERO credentials"
+        );
+        refusals.push((
+            err.code(),
+            err.message().to_string(),
+            err.details().to_vec(),
+        ));
+    }
+
+    assert_eq!(
+        refusals[0].0,
+        tonic::Code::Unauthenticated,
+        "all three are UNAUTHENTICATED"
+    );
+    assert_eq!(
+        refusals[0], refusals[1],
+        "unknown and spent must be identical"
+    );
+    assert_eq!(
+        refusals[1], refusals[2],
+        "spent and expired must be identical"
+    );
+}
+
+#[tokio::test]
+async fn validation_runs_before_the_secret_is_looked_up() {
+    // THE STATUS CODE IS THE ORACLE THIS CLOSES, and constant work does not
+    // touch it. If a check that needs no secret ran AFTER the lookup, then
+    // INVALID_ARGUMENT would come back only once the secret had been confirmed —
+    // so the code itself would say the secret was good, cleanly and without any
+    // timing measurement at all.
+    //
+    // ASSERTING THE STORE WAS NEVER ASKED IS THE ONLY WAY TO SEE THE ORDER. The
+    // status code is INVALID_ARGUMENT either way; what differs is whether the
+    // secret was presented before the refusal, and the recorded call is the
+    // witness.
+    for (name, req) in [
+        (
+            "no password",
+            Request::new(RedeemEnrolmentRequest {
+                secret: "s3cret".into(),
+                password: String::new(),
+                label: "laptop".into(),
+                idempotency: Some(Idempotency { key: "k1".into() }),
+            }),
+        ),
+        (
+            "no idempotency key",
+            Request::new(RedeemEnrolmentRequest {
+                secret: "s3cret".into(),
+                password: "chosen one".into(),
+                label: "laptop".into(),
+                idempotency: None,
+            }),
+        ),
+        (
+            "an oversized label",
+            Request::new(RedeemEnrolmentRequest {
+                secret: "s3cret".into(),
+                password: "chosen one".into(),
+                label: "l".repeat(4096),
+                idempotency: Some(Idempotency { key: "k1".into() }),
+            }),
+        ),
+    ] {
+        // The twin would ACCEPT this secret, so nothing but the ordering can
+        // produce the refusal below.
+        let (iam, recorded, _inv) = iam_with(FakeDb {
+            redeem: redeemed("ada"),
+            password: known_user("chosen one"),
+            ..Default::default()
+        })
+        .await;
+
+        // `expect_err` takes a `&str` and NOT a format string, so `name` is
+        // passed rather than interpolated. Written the wrong way it emits the
+        // braces literally, and the panic message on a regression names nothing
+        // — in the one test whose whole job is proving an ordering.
+        let err = iam.redeem_enrolment(req).await.expect_err(name);
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{name}");
+        assert!(
+            recorded
+                .lock()
+                .expect("recorded")
+                .redeem_enrolment
+                .is_empty(),
+            "{name}: the secret must not be presented to the store before a \
+             check that did not need it has refused the request"
+        );
+    }
+
+    // THE POSITIVE CONTROL, and without it every assertion above is satisfied by
+    // a validator that refuses everything. A label AT the bound is accepted, so
+    // MAX_LABEL_BYTES is a bound on an oversized label rather than a refusal of
+    // ordinary ones — and the loop above is discriminating rather than
+    // universal.
+    let (iam, _rec, _inv) = iam_with(FakeDb {
+        redeem: redeemed("ada"),
+        password: known_user("chosen one"),
+        ..Default::default()
+    })
+    .await;
+
+    let mut at_the_bound = redeem("s3cret", "chosen one", "k1");
+    at_the_bound.get_mut().label = "l".repeat(256);
+    iam.redeem_enrolment(at_the_bound)
+        .await
+        .expect("a label at the bound is accepted, not refused");
+}
+
+#[tokio::test]
+async fn a_key_replayed_with_a_different_password_is_refused() {
+    // REFUSED, NOT REPLAYED. The store's replay does not re-apply the password,
+    // so answering with the first attempt's outcome would leave the FIRST
+    // password live while the person believed the second had taken effect.
+    //
+    // `iam` tells the two apart REMEMBERING NOTHING — it holds no store (D4) —
+    // by verifying the presented password against the hash the store already
+    // holds. Here the store holds a hash of "the first password" and the caller
+    // presents another, which is exactly the shape of a replay under a reused
+    // key.
+    //
+    // MUTATION THIS CATCHES: deleting the verification and returning the store's
+    // outcome directly. Every assertion about a successful redemption stays
+    // green, and the person's chosen password silently does not take effect.
+    let (iam, recorded, _inv) = iam_with(FakeDb {
+        redeem: redeemed("ada"),
+        password: known_user("the first password"),
+        ..Default::default()
+    })
+    .await;
+
+    let err = iam
+        .redeem_enrolment(redeem("s3cret", "a second password", "k1"))
+        .await
+        .expect_err("a key reused with a different password is refused");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        recorded
+            .lock()
+            .expect("recorded")
+            .create_credential
+            .is_empty(),
+        "a refused replay must mint no credential"
+    );
+}
+
+#[tokio::test]
+async fn a_redemption_returns_the_username_and_the_credential_the_store_holds() {
+    // THE USERNAME IS THE HALF A LOST RESPONSE TAKES AWAY. A person enrolling on
+    // their first machine has no in-band way to learn it, and `iam` holds no
+    // store to have remembered it in — so it is re-read from the store on every
+    // attempt, as ciphertext, and decrypted here.
+    //
+    // MUTATION THIS CATCHES: returning `user_id` in its place, or leaving it
+    // empty. Both look like a successful redemption and leave the person unable
+    // to log in afterwards.
+    let (iam, recorded, _inv) = iam_with(FakeDb {
+        redeem: redeemed("Ada Lovelace"),
+        password: known_user("chosen one"),
+        ..Default::default()
+    })
+    .await;
+
+    let out = iam
+        .redeem_enrolment(redeem("s3cret", "chosen one", "attempt-1"))
+        .await
+        .expect("a valid secret redeems")
+        .into_inner();
+
+    assert_eq!(
+        out.username, "Ada Lovelace",
+        "the response carries who they now are"
+    );
+
+    let credentials = recorded.lock().expect("recorded").create_credential.clone();
+    assert_eq!(credentials.len(), 1, "one redemption is one credential");
+    assert!(!out.token.is_empty());
+    assert_eq!(
+        credentials[0].token_hash,
+        Keys::token_hash(&out.token),
+        "the store must hold the hash of the token the caller was given"
+    );
+
+    // THE CREDENTIAL IS NOT COVERED BY THE CALLER'S KEY, and cannot be: the
+    // token is shown once and kept as a hash, so no replay could return the
+    // first one. A retry mints a FRESH credential under its own key — which is
+    // what leaves the orphan the contract accepts and ListCredentials exists to
+    // find.
+    //
+    // MUTATION THIS CATCHES: passing the caller's key through to
+    // CreateCredential. The store would then replay the FIRST credential row and
+    // hand back a credential_id whose token nobody holds — a retry that reports
+    // success and leaves the person with nothing.
+    let key = credentials[0]
+        .idempotency
+        .as_ref()
+        .expect("the credential is written under a key of its own")
+        .key
+        .clone();
+    assert!(
+        !key.is_empty(),
+        "a write with an empty key is a write D9 cannot deduplicate"
+    );
+    assert_ne!(
+        key, "attempt-1",
+        "the credential must NOT be minted under the caller's key"
+    );
+
+    // The spend, though, IS the caller's key: that is what makes a retry reach
+    // the store as the same write rather than as a second presentation.
+    let spends = recorded.lock().expect("recorded").redeem_enrolment.clone();
+    assert_eq!(
+        spends[0].idempotency.as_ref().map(|i| i.key.as_str()),
+        Some("attempt-1"),
+        "the caller's key is passed through unchanged"
+    );
+    assert!(
+        !format!("{:?}", spends[0]).contains("chosen one"),
+        "the plaintext password must never cross the storage boundary"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
+    // THE FLOOR'S OWN ARGUMENT HERE IS NOT `Login`'s. The three refusals are
+    // decided INSIDE `iam-db`, by a RedeemOutcome this service only reads, and a
+    // miss, a row found spent and a row found expired need not cost the store
+    // the same. No amount of constant work in THIS process can equalise a
+    // difference that arises in another one, so collapsing the three into one
+    // status code and leaving the response time free would make "one failure,
+    // not three" true of the code and false of the endpoint.
+    //
+    // MUTATION THIS CATCHES, and it is the reason this test is not the
+    // wall-clock lower bound it started as: passing `Duration::ZERO` in place of
+    // `started.elapsed()`, so the floor PADS the work instead of being ANCHORED
+    // to the start of the call. The total becomes `work + floor` rather than
+    // `floor`, and the response time goes on reporting exactly how much work was
+    // done — the leak wearing the floor's clothes.
+    //
+    // A LOWER BOUND CANNOT SEE THAT, and the first version of this test was one.
+    // `assert!(elapsed >= FLOOR)` holds for any implementation that waits AT
+    // LEAST long enough, the padding mutant included. Worse, it passes VACUOUSLY
+    // the moment a runner is slow enough that the work alone clears the bound:
+    // measured on CI at a 700ms floor, every path exceeded it, nothing was
+    // padded, and the assertion was green while the paths separated by whatever
+    // their work cost. Raising the constant only moves the load at which that
+    // happens — under 40 spinners on 24 cores even 2s was beaten. No wall-clock
+    // constant survives an arbitrarily loaded runner.
+    //
+    // A PAUSED CLOCK IS WHAT REMOVES THE RUNNER FROM THE QUESTION, exactly as it
+    // does for `the_floor_is_anchored_to_the_start_not_added_to_the_work` beside
+    // it. Time advances only when the runtime is idle, so what is measured is
+    // THE SLEEP THE CODE ASKED FOR rather than how long the machine took to
+    // deliver it. `started.elapsed()` inside the handler is a `std::time::Instant`
+    // and still measures the REAL Argon2 work, so this runs the real handler,
+    // the real hashing and the real round trips to the twin — it just reads the
+    // hold on a clock no load can move.
+    //
+    // THE ASSERTION IS STRICTLY LESS THAN THE FLOOR, and that is the anchoring
+    // property itself: the hold must SHRINK by the work already done. It holds
+    // however slow the machine is — if the work exceeded the floor the hold is
+    // zero, which is also less — and it fails under the padding mutant, which
+    // always holds for the full floor. There is no regime in which it is
+    // vacuous and none in which it flakes.
+    //
+    // 10 SECONDS COSTS NO WALL TIME, because the sleep is instantaneous under a
+    // paused clock. A floor far above the real work is therefore free here, and
+    // it is what keeps the warning assertion below meaningful rather than a
+    // second thing to tune.
+    const FLOOR: Duration = Duration::from_secs(10);
+
+    for (name, fake) in [
+        ("an unknown secret", FakeDb::default()),
+        (
+            "a spent secret",
+            FakeDb {
+                redeem: refusal(db::RedeemOutcome::Spent),
+                ..Default::default()
+            },
+        ),
+        (
+            "a successful redemption",
+            FakeDb {
+                redeem: redeemed("ada"),
+                password: known_user("chosen one"),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let (iam, _rec, _inv) = iam_with_redeem_floor(fake, FLOOR).await;
+
+        let t0 = tokio::time::Instant::now();
+        let _ = iam
+            .redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+            .await;
+        let held = t0.elapsed();
+
+        // BOTH SIDES, AND THE LOWER ONE IS WHAT GIVES THIS TEST ITS REACH.
+        // `held < FLOOR` is one-sided: it is satisfied by a hold of ZERO, so on
+        // its own it would pass against a handler that never called
+        // `hold_until_floor` at all — and it would also pass if the virtual
+        // clock had moved for some reason other than that sleep, leaving the
+        // test asserting on a number it did not produce. A correct handler here
+        // sleeps roughly `FLOOR` minus a second of real Argon2 work, so a hold
+        // of zero means the sleep did not happen and the round trips are not
+        // reaching the handler the way this test claims.
+        assert!(
+            held > Duration::ZERO,
+            "{name}: the hold was {held:?} — the floor was not applied to this \
+             path at all, so the assertion below proves nothing about anchoring"
+        );
+        assert!(
+            held < FLOOR,
+            "{name}: the hold was {held:?} against a {FLOOR:?} floor — the floor \
+             was ADDED to the work rather than anchored to the start of the \
+             call, so the response time is still a function of that work"
+        );
+
+        // AND THE FLOOR MUST HAVE COVERED SOMETHING. The service warns exactly
+        // when it did not, so its silence is the evidence. At this floor a
+        // warning would mean the real work exceeded ten seconds, which is a
+        // broken machine rather than a slow one.
+        assert!(
+            redeem_floor_warnings().is_empty(),
+            "{name}: the floor covered nothing — this call cost more than \
+             {FLOOR:?} of real work, so the assertion above proved nothing about \
+             padding. Warnings: {:?}",
+            redeem_floor_warnings()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_redemption_slower_than_the_floor_answers_normally_and_warns() {
+    // THE SELF-CHECK, and it is the half that makes this a control rather than a
+    // decoration — the same half `a_login_slower_than_the_floor_answers_normally_and_warns`
+    // provides for `Login`, and which `RedeemEnrolment` shipped without.
+    //
+    // MUTATION THIS CATCHES, and it is the one a lower bound cannot see: passing
+    // `Duration::ZERO` in place of `started.elapsed()`, so the floor PADS the
+    // work instead of being ANCHORED to the start of the call. The total becomes
+    // `work + floor` rather than `floor`, every path still clears the bound, and
+    // the response time goes on reporting exactly how much work was done. Under
+    // that mutant nothing ever exceeds the floor, so nothing ever warns — and
+    // this assertion is what turns that silence red.
+    //
+    // A 1ms floor against real Argon2id work, which costs two orders of
+    // magnitude more in any build. No timing tolerance is involved: the gap is
+    // the oracle.
+    const FLOOR: Duration = Duration::from_millis(1);
+
+    let (iam, recorded, _inv) = iam_with_redeem_floor(
+        FakeDb {
+            redeem: redeemed("ada"),
+            password: known_user("chosen one"),
+            ..Default::default()
+        },
+        FLOOR,
+    )
+    .await;
+
+    let out = iam
+        .redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+        .await
+        .expect("EXCEEDING THE FLOOR IS NOT AN ERROR — a slow redemption is still a correct one")
+        .into_inner();
+
+    assert!(
+        !out.token.is_empty(),
+        "a warned redemption still issues its credential"
+    );
+    assert_eq!(
+        recorded.lock().expect("recorded").create_credential.len(),
+        1,
+        "a warned redemption is still a redemption"
+    );
+
+    let warned = redeem_floor_warnings();
+    let all = warnings();
+    assert_eq!(
+        warned.len(),
+        1,
+        "exceeding the floor must warn exactly once; everything this thread \
+         emitted: {all:?}"
+    );
+    let text = &warned[0];
+    assert!(
+        text.contains("WARN"),
+        "the floor must WARN, not be noted at a level nobody alerts on: {text:?}"
+    );
+    assert!(
+        text.contains("floor_ms=1"),
+        "the warning must name the CONFIGURED floor: {text:?}"
+    );
+    assert!(
+        text.contains("observed_ms="),
+        "the warning must name the OBSERVED duration, or an operator cannot tell \
+         what to raise it TO: {text:?}"
+    );
+    // THE WHOLE REASON `Floor` CARRIES ITS ENV VAR. Two floors are configured
+    // separately now, so a warning that does not say WHICH variable to raise
+    // sends an operator to raise the one that was already fine.
+    assert!(
+        text.contains("floor_env=REDEEM_RESPONSE_FLOOR_MS"),
+        "the warning must name the variable an operator raises, and it is NOT \
+         Login's: {text:?}"
+    );
+
+    assert!(
+        floor_warnings().is_empty(),
+        "the Login floor warned about nothing here; its filter must not pick up \
+         a redemption's warning: {:?}",
+        floor_warnings()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Enrolment configuration, and what an unconfigured deployment does.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_unconfigured_deployment_refuses_to_mint_and_serves_everything_else() {
+    // THE BLAST RADIUS OF A MISSING ENROLMENT_GATEWAY, pinned. An earlier
+    // revision failed BOOT on this, which keeps the contract's rule — never mint
+    // a token with an empty gateway — by stopping the authentication plane for
+    // the whole estate. Refusing to MINT keeps the same rule and costs nothing
+    // else.
+    //
+    // MUTATION THIS CATCHES: minting anyway with an empty gateway. The contract
+    // says a client that decodes such a token refuses it and names the field, so
+    // the failure would surface on a stranger's machine on their first contact
+    // with this deployment — the one place it cannot be diagnosed.
+    let (iam, recorded, _inv) = iam_without_enrolment(FakeDb {
+        resolves_to: Some("yadgar:user:1".into()),
+        ..Default::default()
+    })
+    .await;
+
+    let err = iam
+        .issue_enrolment(issue("attempt-1"))
+        .await
+        .expect_err("an unconfigured deployment cannot mint an enrolment");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "the request is well formed and the service is not broken — it is not \
+         configured for this"
+    );
+    assert!(
+        err.message().contains("ENROLMENT_GATEWAY"),
+        "the refusal must name the variable an operator sets: {:?}",
+        err.message()
+    );
+    assert!(
+        recorded
+            .lock()
+            .expect("recorded")
+            .create_enrolment
+            .is_empty(),
+        "the refusal must come BEFORE the store is touched, or a deployment that \
+         cannot hand a token over still spends a row and a secret"
+    );
+
+    // AND THE REST OF THE SERVICE IS UNAFFECTED. This is the whole argument for
+    // not failing boot: `iam` is the authentication plane, and one unset
+    // administrative value must not stop credential resolution for the estate.
+    let resolved = iam
+        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .await
+        .expect("ResolveCredential is unaffected by enrolment configuration")
+        .into_inner();
+    assert_eq!(resolved.user_id, "yadgar:user:1");
+}
+
+#[test]
+fn an_absent_ca_is_a_deployment_and_an_empty_one_is_a_mistake() {
+    // ABSENT AND EMPTY ARE DIFFERENT INSTRUCTIONS TO A CLIENT, and the contract
+    // states the rule for both ends. Absent means the deployment uses a
+    // publicly-trusted certificate and system trust applies — legitimate, so it
+    // is modelled rather than treated as an error. Present-and-empty is a token
+    // assembled wrong, which a client is required to refuse; minting one would
+    // put that refusal on a stranger's machine instead of here.
+    //
+    // MUTATION THIS CATCHES: collapsing the two into `unwrap_or_default()`, so
+    // an empty CA silently becomes "use system trust" and the misconfiguration
+    // never surfaces at all.
+    let absent = EnrolmentConfig::load(TEST_GATEWAY, None).expect("no CA is a deployment");
+    assert!(
+        format!("{absent:?}").contains("ca_pem: None"),
+        "absence must survive as absence: {absent:?}"
+    );
+
+    let dir = std::env::temp_dir().join(format!("iam-ca-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let empty = dir.join("empty.pem");
+    std::fs::write(&empty, "   \n").expect("write");
+    assert!(
+        matches!(
+            EnrolmentConfig::load(TEST_GATEWAY, empty.to_str()),
+            Err(EnrolmentConfigError::EmptyCa(_))
+        ),
+        "a CA file with nothing in it is a mistake, not a deployment without a CA"
+    );
+
+    let real = dir.join("ca.pem");
+    std::fs::write(&real, TEST_CA).expect("write");
+    let loaded = EnrolmentConfig::load(TEST_GATEWAY, real.to_str()).expect("a real CA loads");
+    assert!(
+        format!("{loaded:?}").contains("BEGIN CERTIFICATE"),
+        "the CA is read from the file, not merely its path recorded: {loaded:?}"
+    );
+
+    assert!(
+        matches!(
+            EnrolmentConfig::load(TEST_GATEWAY, dir.join("nope.pem").to_str()),
+            Err(EnrolmentConfigError::UnreadableCa(_, _))
+        ),
+        "a CA path naming no file is refused rather than read as absence"
+    );
+
+    assert!(
+        matches!(
+            EnrolmentConfig::load("", None),
+            Err(EnrolmentConfigError::NoGateway(_))
+        ),
+        "an empty gateway is refused; the field has no presence to say so with"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// What v1.6.0 added and this change does NOT implement.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_unbuilt_rpcs_refuse_rather_than_answering() {
+    // MUTATION THIS CATCHES, and it is the one the doc-comment on
+    // `list_credentials` claims to prevent: returning
+    // `Ok(ListCredentialsResponse::default())`. An empty list is an ANSWER — it
+    // says this user holds no credentials — and the orphan a lost redemption
+    // response leaves is exactly what a caller would be looking for. Silence
+    // that reads as an answer is worse than a refusal.
+    let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
+
+    let listed = iam
+        .list_credentials(Request::new(ListCredentialsRequest::default()))
+        .await
+        .expect_err("ListCredentials is not built");
+    assert_eq!(listed.code(), tonic::Code::Unimplemented);
+
+    let admin = iam
+        .set_user_admin(Request::new(SetUserAdminRequest::default()))
+        .await
+        .expect_err("SetUserAdmin is not built");
+    assert_eq!(admin.code(), tonic::Code::Unimplemented);
+
+    let limit = iam
+        .set_rate_limit_override(Request::new(SetRateLimitOverrideRequest::default()))
+        .await
+        .expect_err("SetRateLimitOverride is not built");
+    assert_eq!(limit.code(), tonic::Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn the_admin_flag_travels_from_the_store_rather_than_being_decided_here() {
+    // D73's FLAG ON THE HOT PATH, and it is privilege-bearing: the gateway gates
+    // the administrative path on it and filters `tools/list` with it.
+    //
+    // MUTATION THIS CATCHES — both directions, which is why both are asserted. A
+    // hardcoded `false` silently denies administration to every admin, and a
+    // hardcoded `true` grants it to everyone. Neither is visible from a response
+    // that is only checked in one state.
+    for reported in [true, false] {
+        let (iam, _rec, _inv) = iam_with(FakeDb {
+            resolves_to: Some("yadgar:user:1".into()),
+            resolves_admin: reported,
+            ..Default::default()
+        })
+        .await;
+
+        let got = iam
+            .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+            .await
+            .expect("resolve")
+            .into_inner();
+
+        assert_eq!(
+            got.is_admin, reported,
+            "is_admin must be what the store said, not what this service assumed"
+        );
+    }
 }
