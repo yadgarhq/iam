@@ -38,6 +38,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // client half.
         .build_server(true)
         .build_client(true)
+        // `yadgar/telemetry/v1` ARRIVES IN THE VENDORED TREE AND IS DELIBERATELY
+        // NOT COMPILED HERE. `iam.proto` and `iamdb.proto` import it from v1.6.0
+        // onward — D74 keys a rate limit on D67's `Kind` rather than on a second
+        // taxonomy — so `buf export` follows the import graph and brings the file
+        // along. Generating it into this crate as well would produce a SECOND
+        // `Kind`, a different Rust type from the one `yadgar_telemetry`'s
+        // `Call::start` already takes on every handler in `service.rs`, and the
+        // two would not be interchangeable. Pointing prost at the shared module
+        // keeps one type for one concept.
+        .extern_path(
+            ".yadgar.telemetry.v1",
+            "::yadgar_telemetry::pb::yadgar::telemetry::v1",
+        )
         // All three files: prost generates only for the files it is given, and
         // iam.proto / iamdb.proto merely IMPORTING common.proto does not
         // produce a module for it.
