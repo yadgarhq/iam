@@ -313,7 +313,7 @@ async fn iam_with_floors(
     enrolment: Option<EnrolmentConfig>,
 ) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
     let (channel, recorded) = twin(fake).await;
-    let invalidator = Invalidator::connect(None).await;
+    let invalidator = Invalidator::connect(None, None).await;
     let iam = Iam::new(
         crate::crypto::tests::keys(),
         channel,

@@ -161,6 +161,63 @@ autoscaling:
 nats:
   url: nats://nats:4222
 
+  # The Secret holding this service's broker password (ledger 518).
+  #
+  # SET BY DEFAULT, unlike the two `tls` blocks above, and the difference is
+  # worth the paragraph. Those are off by default because turning one on against
+  # a server that cannot answer BREAKS the hop. This one is on by default because
+  # the reference deployment has nowhere else to put it: `yadgarhq/argocd`'s
+  # ApplicationSet enumerates modules rather than listing them (D54), so its Helm
+  # values are uniform across every module and cannot carry a per-module Secret
+  # name. The module's own values.yaml is the override point that comment names.
+  #
+  # AN ADOPTER WHOSE BROKER HAS NO AUTHORIZATION BLOCK CLEARS THIS, and empty is
+  # a fully supported state: the chart then sends the binary no credential, and
+  # iam connects exactly as every deployment did before this. The cost of getting
+  # it wrong is loud rather than silent — a pod that exits at boot naming
+  # `/var/run/secrets/nats/password`, not one that quietly runs.
+  #
+  # THE SECRET MUST EXIST BEFORE THIS CHART SYNCS. It is not created here and not
+  # in git; `yadgarhq/deploy`'s MIGRATION_NOTES.md has the `kubectl create secret`
+  # for it, alongside the broker that reads the same object.
+  #
+  # WHILE IT IS EMPTY THE HOP IS UNAUTHENTICATED and iam says so in a warning at
+  # every boot. Anything on the pod network can publish on D72's invalidation
+  # subjects — forging a revocation, or drowning real ones under a flood — and
+  # the same broker carries D25's audit outbox, whose events are injectable for
+  # the same reason. That second half is not this chart's to fix.
+  #
+  # A SECRET, AND A PASSWORD IS ACTUALLY SECRET — unlike the CA bundles
+  # elsewhere in this file, which are Secrets only because that is where an
+  # issuer writes them. It is mounted as a FILE rather than read into an
+  # environment variable, because an environment variable is visible in
+  # `kubectl describe pod` and in every `/proc/<pid>/environ` in the container.
+  #
+  # NOT A PASSWORD SPLICED INTO `url` ABOVE. `nats://user:pass@host` would put a
+  # credential in every `helm get values` and every Argo diff, and a password
+  # containing `@`, `/` or `#` is silently truncated by URL parsing — a different
+  # password sent than the one in the Secret, failing as an authorization
+  # violation with no visible cause.
+  #
+  # THE TWO FAILURES DIFFER ON PURPOSE. Set with no readable, non-empty file
+  # behind it: the pod exits at boot naming the path, because a deployment that
+  # asked for a credential and cannot produce one has a mistake in it, and
+  # connecting anonymously instead would be the silent fall back this exists to
+  # remove. A broker that REFUSES the credential: iam starts and serves, because
+  # it is the authentication plane and a broker fault must not become an
+  # authentication outage — the failure is logged as a deployment error rather
+  # than as an outage, and D72's TTL is the backstop for the window.
+  passwordSecret: nats-auth
+  # The key inside that Secret which holds the password, mounted as `password`.
+  # Named rather than assumed, for the same reason the CA keys are: a Secret
+  # assembled by hand is free to call it something else.
+  passwordSecretKey: password
+  # The account this service authenticates as, which must match a user in the
+  # broker's `authorization` block. Required whenever `passwordSecret` is set:
+  # the block names an account and a password together, and iam refuses to start
+  # with one and not the other.
+  user: iam
+
 login:
   # The shortest time Login may answer in, in milliseconds. It floors the WHOLE
   # call, success and failure alike, so the response time stops being a function

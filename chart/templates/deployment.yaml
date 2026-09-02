@@ -20,6 +20,22 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
+      # ITS OWN, rather than the namespace's `default` (ledger 511). Every pod
+      # gets a ServiceAccount whether or not anybody names one, so the choice is
+      # never "an identity or none" — it is "an identity this workload owns, or
+      # the one every unnamed workload in the namespace shares". A shared identity
+      # cannot be granted a permission without granting it to all of them, and
+      # this is the authentication plane: it is the last workload in the estate
+      # that should share an identity with anything.
+      serviceAccountName: {{ .Chart.Name }}
+      # NO KUBERNETES API TOKEN IN THE POD. `iam` never calls the API server: it
+      # serves gRPC, dials `iam-db`, and publishes to the broker. Mounting a token
+      # it does not use hands a credential to anything that reaches the
+      # filesystem — and this pod also holds the AES-GCM and HMAC keys of D72, so
+      # it is the one whose filesystem is worth reaching. Set here as well as on
+      # the ServiceAccount because the pod spec wins, and the pod spec is what a
+      # reader of this file sees.
+      automountServiceAccountToken: false
       # POD-level, and distinct from the container block below. Setting only the
       # container context leaves the pod admitting root — runAsNonRoot is the
       # assertion that actually refuses an image which would run as one, rather
@@ -108,6 +124,34 @@ spec:
             # backstop for exactly that window.
             - name: NATS_URL
               value: {{ .Values.nats.url | quote }}
+            {{- if .Values.nats.passwordSecret }}
+            # RENDERED ONLY WHEN THE BROKER ASKS FOR A CREDENTIAL, so a
+            # deployment that has not cut over sends the binary nothing at all
+            # and connects exactly as it always did. Absence is the default and
+            # the Secret is the whole of the lever — the same shape
+            # `enrolment.caSecret` above already uses.
+            #
+            # BOTH, OR NEITHER. The broker's authorization block names an account
+            # and a password together, so iam refuses to start with a password and
+            # no user. `required` here rather than a bare lookup: an override that
+            # nulls the user would otherwise render an empty string, and the
+            # failure would be a CrashLoop three layers from its cause.
+            - name: NATS_USER
+              value: {{ required "nats.user names the broker account iam authenticates as and must be set whenever nats.passwordSecret is; see the chart's values.yaml" .Values.nats.user | quote }}
+            # A PATH, never the value (D80). A password in the environment is a
+            # password in `kubectl describe pod`; a file is readable only inside
+            # the container.
+            #
+            # THERE IS NO SILENT MIDDLE STATE. A path that names no readable,
+            # non-empty file fails the pod at boot naming the path — iam never
+            # falls back to an unauthenticated broker connection. A broker that
+            # REFUSES the credential is survivable, because iam is the
+            # authentication plane and a broker fault must not become an
+            # authentication outage; it is logged as a deployment error rather
+            # than as an outage, and D72's TTL becomes the backstop meanwhile.
+            - name: NATS_PASSWORD_FILE
+              value: /var/run/secrets/nats/password
+            {{- end }}
             # The shortest time Login may answer in. A security control rather
             # than a tuning knob: it is what stops the response time from
             # reporting how much Argon2 work a row cost, and so which usernames
@@ -180,6 +224,15 @@ spec:
             - name: keys
               mountPath: /var/run/secrets/iam-keys
               readOnly: true
+            {{- if .Values.nats.passwordSecret }}
+            # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
+            # the enrolment CA below: a subPath mount is a one-time copy kubelet
+            # never refreshes, so a rotated broker password would never reach this
+            # process and it would keep presenting the old one.
+            - name: nats-password
+              mountPath: /var/run/secrets/nats
+              readOnly: true
+            {{- end }}
             {{- if .Values.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
             # the enrolment CA below: a subPath mount is a one-time copy that
@@ -213,6 +266,28 @@ spec:
         - name: keys
           secret:
             secretName: {{ .Values.keysSecret }}
+        {{- if .Values.nats.passwordSecret }}
+        - name: nats-password
+          secret:
+            secretName: {{ .Values.nats.passwordSecret }}
+            # OPTIONAL, and it means what it means on the iam-db CA below rather
+            # than what it means on the enrolment CA: the process MUST NOT START
+            # without the password, and optional is simply which error says so. A
+            # required mount that cannot be satisfied leaves the pod in
+            # ContainerCreating with a FailedMount event about a volume; an
+            # optional one mounts an empty directory, the binary finds no file at
+            # NATS_PASSWORD_FILE, and it exits naming THAT PATH. Neither starts;
+            # only one of them explains itself. There is no third outcome in which
+            # this pod connects to the broker without a credential it was told to
+            # present.
+            optional: true
+            # ONE KEY, renamed to the `password` the environment names above, so
+            # whatever the Secret's author called it does not travel into the
+            # binary's configuration.
+            items:
+              - key: {{ required "nats.passwordSecretKey names the key inside nats.passwordSecret that holds the broker password and must be set whenever nats.passwordSecret is; see the chart's values.yaml" .Values.nats.passwordSecretKey | quote }}
+                path: password
+        {{- end }}
         {{- if .Values.tls.enabled }}
         - name: serving-cert
           secret:

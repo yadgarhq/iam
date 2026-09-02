@@ -81,12 +81,18 @@ tonic-prost-build = "0.14"
 #
 # `net` and `time` for the TLS rig in tests/serve_tls.rs: it binds its own
 # listeners and waits for the port rather than sleeping a guessed interval.
+#
+# `io-util` for the fake broker in tests/nats_auth.rs, which reads the CONNECT
+# line off the socket to assert what actually went on the wire. Named here rather
+# than relied on: async-nats enables it too, so feature unification would supply
+# it today, and a dependency that moved would take these tests with it.
 tokio = { version = "1", features = [
   "macros",
   "rt-multi-thread",
   "test-util",
   "net",
   "time",
+  "io-util",
 ] }
 # Certificates are MINTED PER TEST RUN rather than checked in: a fixture key in
 # the repository is a secret in the repository, and it expires on a date nobody

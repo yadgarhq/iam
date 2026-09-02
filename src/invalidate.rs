@@ -49,6 +49,31 @@ pub mod subject {
     pub const TEAMS_CHANGED: &str = "yadgar.iam.user.teams-changed";
 }
 
+/// What this service presents to the broker.
+///
+/// **A pair, and both halves come from the deployment.** The user names an
+/// account in the broker's `authorization` block and the password is read from a
+/// mounted Secret — see `main`, which refuses to start if the deployment asked
+/// for a credential and cannot produce one.
+///
+/// `Debug` is written by hand rather than derived. A derived one would print the
+/// password into any log line, panic message or test failure that formatted the
+/// struct, which is how a credential ends up in a place nobody meant to put it.
+#[derive(Clone)]
+pub struct Credentials {
+    pub user: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// A publisher, or nothing.
 ///
 /// `None` when no broker is configured, which is a legitimate state for a local
@@ -76,7 +101,27 @@ impl Invalidator {
     /// A broker that cannot be reached at boot does not stop the service: `iam`
     /// still authenticates, and refusing to start would turn a broker outage into
     /// an authentication outage. The cost is recorded in the log, not hidden.
-    pub async fn connect(url: Option<&str>) -> Self {
+    ///
+    /// `credentials` is what this service presents. `None` means the broker asks
+    /// for none, and it is a real state rather than an omission — it is what
+    /// every deployment of this was before ledger 518, and it is what lets this
+    /// image be rolled BEFORE the broker gains an `authorization` block. The
+    /// state that is NOT allowed is "the deployment named a credential and could
+    /// not produce one", and that never reaches here: `main` exits at boot rather
+    /// than calling this with `None`, because connecting anonymously at that
+    /// point is precisely the silent fall back to an unauthenticated connection
+    /// this exists to stop.
+    ///
+    /// # A refused credential is not a broker outage, and the log says which
+    ///
+    /// Both end in a publisher that publishes nothing, because the availability
+    /// argument above applies to both: `iam` is the authentication plane and must
+    /// not stop authenticating over the broker. They are told apart in the log,
+    /// which is the only place the difference can be acted on. An outage ends by
+    /// itself; a rejected password does not, and an operator who reads
+    /// "cannot reach the broker" for a wrong password goes looking for a network
+    /// fault that is not there.
+    pub async fn connect(url: Option<&str>, credentials: Option<Credentials>) -> Self {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             tracing::warn!(
                 "no broker configured: cache invalidation will NOT be published, so a \
@@ -84,10 +129,47 @@ impl Invalidator {
             );
             return Self::with(None);
         };
-        match async_nats::connect(url).await {
+        // BUILT FROM THE PAIR, never spliced into the URL. `nats://user:pass@host`
+        // carries a password only URL-encoded, so a password containing `@`, `/`
+        // or `#` would be silently truncated and a DIFFERENT one sent than the one
+        // in the Secret — a WRONGPASS whose cause is invisible at every layer.
+        let options = match &credentials {
+            Some(c) => async_nats::ConnectOptions::with_user_and_password(
+                c.user.clone(),
+                c.password.clone(),
+            ),
+            None => async_nats::ConnectOptions::new(),
+        };
+        match options.connect(url).await {
             Ok(client) => {
-                tracing::info!(%url, "publishing cache invalidation");
+                tracing::info!(
+                    %url,
+                    // WHETHER, never WHAT. This log is shipped.
+                    authenticated = credentials.is_some(),
+                    "publishing cache invalidation"
+                );
+                if credentials.is_none() {
+                    tracing::warn!(
+                        "the connection to the broker is UNAUTHENTICATED: no NATS_PASSWORD_FILE \
+                         is configured, so anything on the pod network can publish D72's \
+                         invalidation events, or drown them under a flood. Set an authorization \
+                         block on the broker and mount its Secret."
+                    );
+                }
                 Self::with(Some(client))
+            }
+            // SEPARATED FROM THE OUTAGE ARM, and it is the whole reason this
+            // match has two error arms. See the section on this method.
+            Err(e) if e.kind() == async_nats::ConnectErrorKind::AuthorizationViolation => {
+                tracing::error!(
+                    %url, error = %e,
+                    "the broker REFUSED this service's credential, so cache invalidation will \
+                     NOT be published and revocations will be honoured late. This is a \
+                     deployment error rather than an outage: it does not recover on its own. \
+                     Check NATS_USER and NATS_PASSWORD_FILE against the broker's authorization \
+                     block."
+                );
+                Self::with(None)
             }
             Err(e) => {
                 tracing::error!(
@@ -98,6 +180,19 @@ impl Invalidator {
                 Self::with(None)
             }
         }
+    }
+
+    /// Whether this instance holds a live connection to the broker.
+    ///
+    /// **A test asserting that a credential was CONFIGURED would pass against a
+    /// broker that ignored it.** This is what lets a test assert the outcome
+    /// instead: the same fake broker refuses one connection and accepts the
+    /// other, and only the pair distinguishes an authenticated broker from an
+    /// open one. It is `pub` rather than `cfg(test)` for that reason — the
+    /// property is proved from `tests/`, which compiles against the shipped
+    /// crate.
+    pub fn is_publishing(&self) -> bool {
+        self.client.is_some()
     }
 
     fn with(client: Option<async_nats::Client>) -> Self {
@@ -160,15 +255,35 @@ mod tests {
         // The alternative — refusing to construct — would make a missing broker
         // an authentication outage, which is a worse failure than a late
         // revocation.
-        let inv = Invalidator::connect(None).await;
+        let inv = Invalidator::connect(None, None).await;
         inv.credential_revoked("yadgar:user:x").await;
         inv.teams_changed("yadgar:user:x").await;
+        assert!(!inv.is_publishing());
     }
 
     #[tokio::test]
     async fn an_unreachable_broker_does_not_panic_or_block() {
-        let inv = Invalidator::connect(Some("nats://127.0.0.1:1")).await;
+        let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), None).await;
         inv.credential_revoked("yadgar:user:y").await;
+        assert!(!inv.is_publishing());
+    }
+
+    #[test]
+    fn a_credential_never_prints_itself() {
+        // The one place a password reaches a formatter. A derived `Debug` would
+        // put it into every panic message and test failure that touched the
+        // struct, which is how a secret ends up in a log nobody meant to write
+        // it to.
+        let c = Credentials {
+            user: "iam".into(),
+            password: "sentinel-of-the-nats-password".into(),
+        };
+        let printed = format!("{c:?}");
+        assert!(
+            !printed.contains("sentinel-of-the-nats-password"),
+            "{printed}"
+        );
+        assert!(printed.contains("iam"), "{printed}");
     }
 
     #[test]
