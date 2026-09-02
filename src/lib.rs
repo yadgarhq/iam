@@ -10,6 +10,9 @@
 
 pub mod crypto;
 pub mod invalidate;
+/// The certificate this service PRESENTS; [`upstream`] is how it VERIFIES the
+/// one `iam-db` presents. Two directions, one word.
+pub mod serve;
 pub mod service;
 pub mod upstream;
 

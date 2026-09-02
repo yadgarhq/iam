@@ -16,6 +16,54 @@ resources:
   limits:
     memory: 128Mi
 
+# THE CERTIFICATE THIS SERVICE PRESENTS TO ITS CALLERS — the gRPC listener's own
+# transport.
+#
+# READ THIS TOGETHER WITH `iamDb.tls` BELOW, AND DO NOT CONFUSE THEM. They share
+# a word and mean opposite directions: this block is what iam SERVES, and
+# `iamDb.tls` is how iam VERIFIES the certificate iam-db serves. Turning one on
+# says nothing about the other.
+#
+# The callers on this side are the gateway and, in time, every other module that
+# resolves a credential. Their half of the hop is configured in their own charts
+# and ships off by default too, so a cut-over turns both ends on together.
+#
+# PATHS AND A FLAG, NEVER AN ISSUER-SPECIFIC RESOURCE (D80) — the same shape
+# `enrolment.caSecret` below already uses. The chart names a Secret and two keys
+# inside it, and the binary is handed two file paths. In the reference deployment
+# cert-manager writes that Secret; on EKS a Secret assembled by hand produces
+# something neither the chart nor the binary can tell apart. Nothing here
+# requires a CRD, an issuer or a mesh.
+tls:
+  # OFF, and it stays off until both halves of the hop can be turned on
+  # together. The code ships first and the cut-over is a separate, revertible
+  # change — the same discipline the attestation cut-over used.
+  #
+  # THERE IS NO SILENT MIDDLE STATE. `true` with no usable certificate fails at
+  # boot naming the file, before the crypto keys are even read; it never falls
+  # back to a plaintext listener. `false` with a certificate still configured is
+  # the reverted state, and iam logs a warning saying the listener is in
+  # cleartext so nobody has to infer it.
+  enabled: false
+  # The Secret holding the certificate this service serves AND its private key.
+  #
+  # BOTH KEYS ARE MOUNTED HERE, which is the one place in this chart where that
+  # is correct: a listener cannot present a certificate it has no key for. The
+  # two mounts below select `ca.crt` alone precisely to keep somebody else's
+  # private key out of this pod; this key is this pod's own.
+  #
+  # NOT A PEM PASTED INTO THIS FILE. The certificate rotates, and a copy in git
+  # is correct only until the rotation nobody remembered to follow.
+  certSecret: iam-tls
+  # The key inside that Secret holding the certificate, mounted as `tls.pem`.
+  # Named rather than assumed: `tls.crt` is what cert-manager calls it, and a
+  # Secret assembled by hand for a deployment cert-manager does not run in is
+  # free to call it something else.
+  certSecretKey: tls.crt
+  # The key inside that Secret holding the private key, mounted as
+  # `tls-key.pem`. Named for the same reason.
+  keySecretKey: tls.key
+
 # The HEADLESS Service of the -db twin (D23). Resolving this name yields every
 # ready pod address rather than one virtual IP, which is what makes client-side
 # balancing possible at all.
@@ -23,6 +71,10 @@ iamDb:
   host: iam-db
   port: 50051
 
+  # HOW THIS SERVICE VERIFIES THE CERTIFICATE iam-db PRESENTS — the opposite
+  # direction from the top-level `tls` block above, which is what iam itself
+  # serves. Same word, two directions.
+  #
   # The TRANSPORT to that twin, and the worst cleartext hop in the system: every
   # password verification, every credential resolution and every encrypted
   # personal-data field (D72) crosses it. On a flat pod network that is readable
@@ -35,8 +87,12 @@ iamDb:
   # assembled by hand produces something neither the chart nor the binary can
   # tell apart. Nothing here requires a CRD, an issuer or a mesh.
   tls:
-    # OFF, and it stays off until the servers can answer. **iam-db does not serve
-    # TLS yet**, so turning this on today breaks the hop rather than securing it.
+    # OFF, and it stays off until the cut-over. **iam-db CAN now serve TLS** —
+    # its chart's `tls.enabled`, also off by default — so this is no longer
+    # waiting on a server that cannot answer. It is waiting on certificates, and
+    # on turning BOTH ends on in one change: this value alone breaks the hop,
+    # and iam-db's alone breaks it from the other side.
+    #
     # The code ships first and the cut-over is a separate, revertible change —
     # the same discipline the attestation cut-over used.
     #

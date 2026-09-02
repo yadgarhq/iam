@@ -15,7 +15,15 @@
 //! **OPT-IN, and OFF unless a deployment asks for it.** With nothing configured
 //! this dials exactly as it always has, in cleartext. That is deliberate rather
 //! than timid: the code ships first and the cut-over is a separate change that
-//! can be reverted on its own, and no server in the estate serves TLS yet.
+//! can be reverted on its own. `iam-db` can now serve TLS — opt-in and off by
+//! default, the same shape [`crate::serve`] gives this service's own listener —
+//! so the cut-over is the one change that turns both ends of the hop on
+//! together.
+//!
+//! **This module is the VERIFYING half.** [`crate::serve`] is the presenting
+//! half, and the two are easy to confuse because they share a word: here a
+//! CA bundle checks the certificate `iam-db` presents; there a certificate and a
+//! key are what this service presents to its own callers.
 //!
 //! **The cleartext hop this closes is the worst one in the system.** Every
 //! password verification, every credential resolution and every encrypted
