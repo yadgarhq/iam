@@ -51,11 +51,14 @@ x509-parser = "0.18"
 # never appears while everything still compiles and passes. The exporter is
 # installed by this binary and by nothing else; see `main`.
 metrics = "0.24"
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e9ec92a6efd74363e68c694fe6c0fa" }
+# Pinned by RELEASE TAG. A published tag never moves in this organisation — a
+# correction is a new tag — and Cargo.lock records the revision it resolved to,
+# so the pin is as exact as the revision it replaces.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.1.0" }
 
-# The shared instrumentation seam (D67). Pinned by revision, like every other
-# in-org crate — a branch is a moving target.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1694475a7eab9a8332f2955671987c57bf3234e8", features = ["grpc"] }
+# The shared instrumentation seam (D67). Pinned by release tag, like every other
+# in-org crate — a branch is a moving target, a published tag is not.
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.0", features = ["grpc"] }
 prost = "0.14"
 prost-types = "0.14"
 # `signal` for `serve::shutdown`; `sync` for the oneshot that carries the
