@@ -77,7 +77,15 @@ pub fn nats_credentials(
     if user.is_empty() {
         return Err(BootError::NatsPasswordWithoutUser);
     }
-    Ok(Some(Credentials { user, password }))
+    // THE PATH TRAVELS WITH THE VALUE. `rotate::Inputs` watches every file this
+    // process read at boot and is forbidden from reading the environment a
+    // second time to find out which they were, so the resolved credential is
+    // the only thing that can carry it there. See `Credentials`.
+    Ok(Some(Credentials {
+        user,
+        password,
+        password_file: path.into(),
+    }))
 }
 
 #[derive(Debug, thiserror::Error)]

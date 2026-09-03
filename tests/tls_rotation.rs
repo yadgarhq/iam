@@ -37,6 +37,7 @@ use rcgen::{
 };
 use tokio::time::timeout;
 
+use yadgar_iam::invalidate::Credentials;
 use yadgar_iam::rotate::{self, Inputs, Presented, Schedule, CERTIFICATE_NOT_AFTER};
 use yadgar_iam::serve::{self, ServerTls};
 use yadgar_iam::service::EnrolmentConfig;
@@ -118,6 +119,20 @@ fn generation(san: &str) -> Generation {
             format!("{}{}", client_leaf.pem(), ca.pem()),
         ),
         ("client-key.pem".to_string(), client_key.serialize_pem()),
+        // NOT A CERTIFICATE, and in the set for the reason the enrolment CA is:
+        // the process read it at boot, the chart mounts it as a DIRECTORY
+        // precisely so it can rotate, and `async_nats` bakes it into the
+        // `ConnectOptions` of a client cached for the life of the process. A
+        // TRAILING NEWLINE, because `kubectl create secret --from-file` keeps
+        // the one an editor added and `boot::nats_credentials` trims it.
+        //
+        // Unique per generation, so a replacement minted independently cannot
+        // coincide with the old one by construction — the same property every
+        // key above gets from being freshly generated.
+        (
+            "nats-password".to_string(),
+            format!("sentinel-broker-password-{}\n", unique()),
+        ),
     ]
 }
 
@@ -230,24 +245,35 @@ impl Drop for Mount {
 }
 
 /// A name no other case in this run can collide with.
+///
+/// **A PROCESS-WIDE COUNTER, not the clock alone, and it is not belt-and-braces.**
+/// Cases run in parallel threads and two of them can read the SAME nanosecond —
+/// measured, as an intermittent `EEXIST` out of `Mount::new`'s `create_dir` in
+/// whichever case lost the race, in roughly one run in five. Adding the broker
+/// password to the mount raised how often this helper is called and turned a
+/// latent collision into a visible flake. The counter makes the name unique by
+/// construction, so it no longer depends on the clock's resolution.
 fn unique() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
 }
 
-/// The inputs a TLS deployment of this service reads at boot, **assembled from
-/// the resolved configuration exactly as `main` assembles them**: the listener's
-/// certificate and key, the CA bundle `iam-db` is verified against, the client
-/// certificate and key this service presents to `iam-db` (ADR-0516), and the CA
+/// The inputs a deployment of this service reads at boot, **assembled from the
+/// resolved configuration exactly as `main` assembles them, and in the same
+/// order**: the listener's certificate and key, the CA bundle `iam-db` is
+/// verified against, the client certificate and key this service presents to
+/// `iam-db` (ADR-0516), the password it presents to the broker, and the CA
 /// every D73 enrolment token carries.
 ///
-/// **Built through the three config-taking methods rather than by naming four
+/// **Built through the four config-taking methods rather than by naming seven
 /// paths.** A helper that spelled the paths out would prove only that `rotate`
 /// watches what it is handed — never that a deployment's configuration puts them
 /// there, which is the half that can silently be wrong. Dropping the enrolment
@@ -256,6 +282,7 @@ fn inputs(mount: &Mount) -> Inputs {
     Inputs::default()
         .listener(Some(&listener_tls(mount)))
         .upstream(Some(&upstream_tls(mount)))
+        .broker(Some(&broker_credentials(mount)))
         .enrolment(Some(&enrolment_config(mount)))
 }
 
@@ -302,6 +329,33 @@ fn upstream_tls(mount: &Mount) -> UpstreamTls {
     })
     .expect("a complete configuration")
     .expect("the flag is set")
+}
+
+/// The broker credential as a DEPLOYMENT states it — through the same two
+/// variables the chart renders, and through `boot::nats_credentials` rather than
+/// by naming the path.
+///
+/// **The whole point is the wiring.** Handing `Inputs::broker` a path spelled out
+/// here would prove that `rotate` watches what it is given; it would say nothing
+/// about whether the value `main` actually resolves carries the path at all. The
+/// gap this closes was exactly that shape — a password file read at boot and
+/// absent from every builder.
+fn broker_credentials(mount: &Mount) -> Credentials {
+    let vars = [
+        (
+            "NATS_USER".to_string(),
+            "sentinel-broker-account".to_string(),
+        ),
+        (
+            "NATS_PASSWORD_FILE".to_string(),
+            mount.path("nats-password").display().to_string(),
+        ),
+    ];
+    yadgar_iam::boot::nats_credentials(move |k| {
+        vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    })
+    .expect("a complete configuration")
+    .expect("both variables are set")
 }
 
 /// The enrolment CA, loaded the way `main` loads it — which is what records the
@@ -588,9 +642,9 @@ fn no_certificate_exports_no_gauge() {
 /// EVERY WATCHED FILE IS WATCHED, one at a time.
 ///
 /// **This is the case a whole-generation swap cannot make.** `swap_shortly`
-/// rewrites all four files, so an implementation that hashed only the first
+/// rewrites all seven files, so an implementation that hashed only the first
 /// would pass every other case in this file — measured, and it did. Here each
-/// file is rotated with the other three left byte-identical, so a file missing
+/// file is rotated with the other six left byte-identical, so a file missing
 /// from the watch set is a case that hangs.
 #[tokio::test]
 async fn each_watched_file_ends_the_watch_on_its_own() {
@@ -601,6 +655,7 @@ async fn each_watched_file_ends_the_watch_on_its_own() {
         "enrolment-ca.pem",
         "client.pem",
         "client-key.pem",
+        "nats-password",
     ] {
         let base = generation("iam");
         let mount = Arc::new(Mount::new(&base));
@@ -715,6 +770,7 @@ async fn the_watch_set_holds_every_file_the_configuration_named() {
         "enrolment-ca.pem",
         "client.pem",
         "client-key.pem",
+        "nats-password",
     ] {
         let expected = mount.path(name).display().to_string();
         assert!(
@@ -723,7 +779,7 @@ async fn the_watch_set_holds_every_file_the_configuration_named() {
              Watching: {watched:?}"
         );
     }
-    assert_eq!(watched.len(), 6, "and nothing else: {watched:?}");
+    assert_eq!(watched.len(), 7, "and nothing else: {watched:?}");
 }
 
 /// THE CERTIFICATE IS FIRST, because it is the one the gauge and the
