@@ -27,6 +27,7 @@ use tonic::transport::{Channel, Endpoint};
 use super::*;
 use crate::crypto::argon2_verifications;
 use crate::invalidate::subject;
+use crate::pb::yadgar::common::v1::InheritedSetting;
 use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbServiceServer};
 
 /// Everything the fake twin was asked to do.
@@ -40,6 +41,12 @@ struct Recorded {
     /// before the lookup rather than after it — the status code is identical
     /// either way, and it is the status code that would become the oracle.
     redeem_enrolment: Vec<db::RedeemEnrolmentRequest>,
+    /// **THE SECOND ORDERING WITNESS**, on the first one's reasoning. `iam.proto`
+    /// says this service refuses `SetInheritedSetting`'s clauses ITSELF rather
+    /// than forwarding them, and every clause is `INVALID_ARGUMENT` — so the
+    /// status code cannot tell a refusal made here from one the store made. An
+    /// EMPTY vector is what says the store was never asked.
+    set_inherited_setting: Vec<db::SetInheritedSettingRequest>,
 }
 
 /// A stand-in for `iam-db`: answers from a fixed script and records the asking.
@@ -58,6 +65,16 @@ struct FakeDb {
     /// What `RedeemEnrolment` answers. `None` is an unknown secret, which is the
     /// default an attacker's presentation gets.
     redeem: Option<db::RedeemEnrolmentResponse>,
+    /// ADR-0522's setting, as the STORE reports it on `ResolveCredential`.
+    ///
+    /// **AN `Option` SO ABSENT IS REACHABLE.** `iam-db` answers with this message
+    /// ABSENT when the organisation row is not there, which is the case a
+    /// substituted default is invisible in — a fake that could only ever answer
+    /// with a present message could not see it at all.
+    resolves_setting: Option<InheritedSetting>,
+    /// What `SetInheritedSetting` answers with. The setting WHOLE, including the
+    /// level and the team overrides the caller did not send.
+    setting_now: Option<InheritedSetting>,
     /// A `(code, message)` to fail `RedeemEnrolment` with, rather than answering
     /// with an outcome.
     ///
@@ -79,6 +96,7 @@ impl IamDbService for FakeDb {
         Ok(Response::new(db::ResolveCredentialResponse {
             user_id: self.resolves_to.clone().unwrap_or_default(),
             is_admin: self.resolves_admin,
+            owner_reads_own_record: self.resolves_setting.clone(),
             ..Default::default()
         }))
     }
@@ -159,6 +177,20 @@ impl IamDbService for FakeDb {
         _req: Request<db::SetRateLimitOverrideRequest>,
     ) -> Result<Response<db::SetRateLimitOverrideResponse>, Status> {
         Ok(Response::new(db::SetRateLimitOverrideResponse {}))
+    }
+
+    async fn set_inherited_setting(
+        &self,
+        req: Request<db::SetInheritedSettingRequest>,
+    ) -> Result<Response<db::SetInheritedSettingResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .set_inherited_setting
+            .push(req.into_inner());
+        Ok(Response::new(db::SetInheritedSettingResponse {
+            setting: self.setting_now.clone(),
+        }))
     }
 
     async fn create_credential(
@@ -1945,4 +1977,406 @@ async fn the_admin_flag_travels_from_the_store_rather_than_being_decided_here() 
             "is_admin must be what the store said, not what this service assumed"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0522's inheritable setting. `iam` carries the INPUTS and resolves nothing.
+// ---------------------------------------------------------------------------
+
+/// A setting with something in every field, so a rebuild that drops one dies.
+///
+/// The map is NON-EMPTY deliberately: `team_override` is the field a
+/// field-by-field reconstruction is most likely to leave behind, and an empty
+/// one is indistinguishable from a dropped one.
+fn stated(value: SettingValue, locked: bool) -> Option<InheritedSetting> {
+    Some(InheritedSetting {
+        org_value: value as i32,
+        org_locked: locked,
+        team_override: [
+            ("yadgar:team:a".to_string(), SettingValue::On as i32),
+            ("yadgar:team:b".to_string(), SettingValue::Off as i32),
+        ]
+        .into_iter()
+        .collect(),
+    })
+}
+
+async fn resolved_setting(fake: FakeDb) -> Option<InheritedSetting> {
+    let (iam, _rec, _inv) = iam_with(fake).await;
+    iam.resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .await
+        .expect("resolve")
+        .into_inner()
+        .owner_reads_own_record
+}
+
+#[tokio::test]
+async fn an_absent_setting_stays_absent_rather_than_becoming_a_default() {
+    // MUTATION THIS CATCHES: `got.owner_reads_own_record.unwrap_or_default()`,
+    // or any `.unwrap_or(InheritedSetting { .. })`.
+    //
+    // `iam-db` answers with the message ABSENT when the organisation row is not
+    // there. Absent and present-holding-UNSPECIFIED are ONE case, which a -db
+    // that reads this setting REFUSES rather than reading as OFF — so
+    // manufacturing a present message here would convert a refusal the
+    // deployment is owed into a policy nobody stated.
+    assert!(
+        resolved_setting(FakeDb {
+            resolves_to: Some("yadgar:user:1".into()),
+            resolves_setting: None,
+            ..Default::default()
+        })
+        .await
+        .is_none(),
+        "an absent setting must arrive absent: substituting one states a policy \
+         the deployment never chose"
+    );
+}
+
+#[tokio::test]
+async fn an_unstated_setting_travels_unstated_rather_than_being_completed() {
+    // MUTATION THIS CATCHES, AND IT IS A DIFFERENT ONE FROM THE TEST ABOVE: the
+    // message is PRESENT, so `unwrap_or_default` cannot fire. What fires here is
+    // a handler that reads the falsy zero and helpfully fills it in —
+    // `if org_value == 0 { org_value = ON }` — or one that hardcodes the lock.
+    //
+    // (UNSPECIFIED, false) IS THE SHAPE THE HAZARD WEARS. `org_locked` is a bool
+    // and cannot say "unknown", so false is indistinguishable from a stated
+    // "clear" — the PERMISSIVE half of a policy nobody stated. Only `org_value`
+    // can carry "nothing was said", and only if it arrives unchanged.
+    let got = resolved_setting(FakeDb {
+        resolves_to: Some("yadgar:user:1".into()),
+        resolves_setting: Some(InheritedSetting::default()),
+        ..Default::default()
+    })
+    .await
+    .expect("the message was present");
+
+    assert_eq!(
+        got.org_value,
+        SettingValue::Unspecified as i32,
+        "an unset organisation value must reach the resolution unset, so it can \
+         be refused there"
+    );
+    assert!(
+        !got.org_locked,
+        "a lock nobody set must not arrive set, and must not arrive as anything \
+         this service decided"
+    );
+}
+
+#[tokio::test]
+async fn the_setting_travels_from_the_store_rather_than_being_decided_here() {
+    // BOTH DIRECTIONS OF BOTH FIELDS, for `the_admin_flag_travels_...`'s reason:
+    // a hardcode is invisible from a response only ever checked in one state. A
+    // locked organisation with contradicting overrides and a clear one with the
+    // same overrides are the two combinations that discriminate, and they are
+    // the two an implementation gets right by accident.
+    //
+    // **AND ON THE NEGATIVE PATH TOO**, which is a THIRD mutant and not a
+    // thoroughness flourish: `owner_reads_own_record: if resolved { .. } else
+    // { None }`. That edit reads as the obvious analogy to `valid_for_seconds`
+    // directly above it, and it is wrong for a stated reason — the TTL is zeroed
+    // because a negative answer is worth caching for no interval, while this
+    // setting is DEPLOYMENT-WIDE rather than credential-scoped. Without a
+    // negative-path case the whole suite goes green on a handler that drops what
+    // the store sent.
+    for user in [Some("yadgar:user:1".to_string()), None] {
+        for value in [SettingValue::On, SettingValue::Off] {
+            for locked in [true, false] {
+                let reported = stated(value, locked);
+                let got = resolved_setting(FakeDb {
+                    resolves_to: user.clone(),
+                    resolves_setting: reported.clone(),
+                    ..Default::default()
+                })
+                .await;
+
+                assert_eq!(
+                    got, reported,
+                    "the setting must be what the store said, whole — the value, \
+                     the lock and every team override — and on the negative path \
+                     as much as the positive one"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SetInheritedSetting (ADR-0524). Validate here, store there.
+// ---------------------------------------------------------------------------
+
+/// A well-formed organisation-level write. Every refusal case below is this with
+/// exactly one thing changed, so what the test names is what the test changes.
+fn org_write() -> SetInheritedSettingRequest {
+    SetInheritedSettingRequest {
+        idempotency: Some(Idempotency {
+            key: "01J0000000000000000000000K".into(),
+        }),
+        scope: SettingScope::Org as i32,
+        team_id: None,
+        name: "owner_reads_own_record".into(),
+        value: Some(SettingValue::On as i32),
+        locked: Some(true),
+        clear: false,
+    }
+}
+
+/// A well-formed team-level write.
+fn team_write() -> SetInheritedSettingRequest {
+    SetInheritedSettingRequest {
+        team_id: Some("yadgar:team:a".into()),
+        scope: SettingScope::Team as i32,
+        locked: None,
+        value: Some(SettingValue::Off as i32),
+        ..org_write()
+    }
+}
+
+#[tokio::test]
+async fn a_write_reaches_the_store_with_its_presence_intact() {
+    // MUTATION THIS CATCHES: `value: r.value.unwrap_or_default()` or
+    // `locked: Some(r.locked.unwrap_or(false))` — anything that collapses an
+    // Option on the way through. Presence is what separates "said nothing" from
+    // "said this", and it is the whole of ADR-0524's guard.
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        setting_now: stated(SettingValue::On, true),
+        ..Default::default()
+    })
+    .await;
+
+    let sent = org_write();
+    let got = iam
+        .set_inherited_setting(Request::new(sent.clone()))
+        .await
+        .expect("a well-formed organisation write")
+        .into_inner();
+
+    let seen = rec.lock().expect("recorded").set_inherited_setting.clone();
+    assert_eq!(seen.len(), 1, "the store is asked exactly once");
+    let seen = &seen[0];
+    assert_eq!(seen.idempotency, sent.idempotency, "D9's key travels");
+    assert_eq!(seen.scope, sent.scope);
+    assert_eq!(seen.team_id, sent.team_id);
+    assert_eq!(seen.name, sent.name);
+    assert_eq!(seen.value, sent.value, "the value keeps its presence");
+    assert_eq!(seen.locked, sent.locked, "the lock keeps its presence");
+    assert_eq!(seen.clear, sent.clear);
+
+    // MUTATION THIS CATCHES: rebuilding the response. What comes back carries
+    // the OTHER level and every OTHER team's override, none of which the caller
+    // sent — a reconstruction here silently narrows a policy an operator is
+    // reading back.
+    assert_eq!(
+        got.setting,
+        stated(SettingValue::On, true),
+        "the response is the store's setting, whole"
+    );
+}
+
+#[tokio::test]
+async fn a_withdrawal_is_forwarded_as_a_withdrawal() {
+    // THE ONE DELETING SHAPE: team scope, `clear` set, `value` absent. It must
+    // survive the hop with `value` still absent — a handler that filled it in
+    // would turn a withdrawal into a statement of whatever it chose.
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        setting_now: stated(SettingValue::On, false),
+        ..Default::default()
+    })
+    .await;
+
+    let sent = SetInheritedSettingRequest {
+        value: None,
+        clear: true,
+        ..team_write()
+    };
+    iam.set_inherited_setting(Request::new(sent))
+        .await
+        .expect("clearing an override is well formed");
+
+    let seen = rec.lock().expect("recorded").set_inherited_setting.clone();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].clear, "the affirmative byte travels");
+    assert_eq!(
+        seen[0].value, None,
+        "an absent value must stay absent, or the withdrawal becomes a statement"
+    );
+}
+
+#[tokio::test]
+async fn every_refusal_lands_before_the_store_is_asked() {
+    // THE CLAUSES ARE `yadgar.common.v1.SettingScope`'s, and `iam.proto` says
+    // THIS service refuses them rather than forwarding them.
+    //
+    // THE ORDERING IS THE PART A STATUS CODE CANNOT SHOW. All of them are
+    // `INVALID_ARGUMENT`, and the fake store answers `Ok` to everything — so a
+    // handler that forwarded first and refused afterwards would produce an
+    // identical code on every row here. The EMPTY recording is the only witness.
+    //
+    // MUTATION THIS CATCHES, per row: deleting that clause from
+    // `check_inherited_setting`. The fake answers `Ok`, so a deleted clause
+    // turns the row's `expect_err` into a success.
+    let cases: Vec<(&str, SetInheritedSettingRequest)> = vec![
+        (
+            "scope unspecified",
+            SetInheritedSettingRequest {
+                scope: SettingScope::Unspecified as i32,
+                locked: None,
+                ..org_write()
+            },
+        ),
+        (
+            "scope is not a member this contract declares",
+            SetInheritedSettingRequest {
+                // proto3 enums are OPEN, so this arrives intact rather than
+                // collapsing to the zero. A `default:` that fell through would
+                // write the ORGANISATION's policy for a request naming neither.
+                scope: 7,
+                ..org_write()
+            },
+        ),
+        (
+            "team scope with no team id",
+            SetInheritedSettingRequest {
+                team_id: None,
+                ..team_write()
+            },
+        ),
+        (
+            "team scope with an empty team id",
+            SetInheritedSettingRequest {
+                team_id: Some(String::new()),
+                ..team_write()
+            },
+        ),
+        (
+            "org scope carrying a team id",
+            SetInheritedSettingRequest {
+                team_id: Some("yadgar:team:a".into()),
+                ..org_write()
+            },
+        ),
+        (
+            "team scope carrying the lock, set",
+            SetInheritedSettingRequest {
+                locked: Some(true),
+                ..team_write()
+            },
+        ),
+        (
+            // FALSE IS THE HALF A BARE BOOL COULD NOT REFUSE, which is why the
+            // field carries presence. Its instruction would otherwise be
+            // discarded in silence.
+            "team scope carrying the lock, clear",
+            SetInheritedSettingRequest {
+                locked: Some(false),
+                ..team_write()
+            },
+        ),
+        (
+            "org scope with no lock",
+            SetInheritedSettingRequest {
+                locked: None,
+                ..org_write()
+            },
+        ),
+        (
+            "an explicitly unspecified value at org scope",
+            SetInheritedSettingRequest {
+                value: Some(SettingValue::Unspecified as i32),
+                ..org_write()
+            },
+        ),
+        (
+            "an explicitly unspecified value at team scope",
+            SetInheritedSettingRequest {
+                value: Some(SettingValue::Unspecified as i32),
+                ..team_write()
+            },
+        ),
+        (
+            "an absent value with no clear, at org scope",
+            SetInheritedSettingRequest {
+                value: None,
+                ..org_write()
+            },
+        ),
+        (
+            "an absent value with no clear, at team scope",
+            SetInheritedSettingRequest {
+                value: None,
+                ..team_write()
+            },
+        ),
+        (
+            "clear set alongside a value",
+            SetInheritedSettingRequest {
+                clear: true,
+                ..team_write()
+            },
+        ),
+        (
+            "clear at org scope",
+            SetInheritedSettingRequest {
+                value: None,
+                clear: true,
+                ..org_write()
+            },
+        ),
+        (
+            "a name outside the vocabulary",
+            SetInheritedSettingRequest {
+                name: "owner_reads_own_recrod".into(),
+                ..org_write()
+            },
+        ),
+    ];
+
+    for (why, request) in cases {
+        let (iam, rec, _inv) = iam_with(FakeDb {
+            setting_now: stated(SettingValue::On, true),
+            ..Default::default()
+        })
+        .await;
+
+        let err = iam
+            .set_inherited_setting(Request::new(request))
+            .await
+            .expect_err(why);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{why}");
+        assert!(
+            rec.lock()
+                .expect("recorded")
+                .set_inherited_setting
+                .is_empty(),
+            "{why}: the store must never be asked — a refusal that forwarded \
+             first would leave a row, a ledger entry, or a burnt idempotency key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_setting_write_publishes_no_invalidation() {
+    // NOT AN OMISSION — the contract's answer. The setting travels on a cached
+    // credential, an organisation-level write touches EVERY cached credential in
+    // the deployment, and no event on this contract says so. Every subject
+    // `invalidate` publishes is keyed on a `user_id` this request does not
+    // carry, so reaching for one would invent a mechanism for a request that
+    // names nobody. A deployment that tightens this policy WAITS THE CACHE OUT.
+    let (iam, _rec, inv) = iam_with(FakeDb {
+        setting_now: stated(SettingValue::Off, true),
+        ..Default::default()
+    })
+    .await;
+
+    iam.set_inherited_setting(Request::new(org_write()))
+        .await
+        .expect("a well-formed organisation write");
+
+    assert!(
+        inv.published().is_empty(),
+        "a setting write must publish nothing: there is no user to key an \
+         invalidation on, and a wrong key is worse than none"
+    );
 }
