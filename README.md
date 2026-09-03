@@ -92,6 +92,42 @@ Two residuals are accepted rather than hidden, and both are in the contract:
   the same fact that puts token _resend_ outside D73's first cut. The recovery is
   the one this RPC already is: mint another.
 
+## The inheritable setting, which this service carries and never resolves
+
+ADR-0522 makes "an owner reads their own record" a setting rather than a
+constant. An organisation states a value and a lock; a team may hold an
+override, and it applies only where the organisation has not locked.
+
+`ResolveCredential` carries that setting outward beside the identity, and
+`SetInheritedSetting` writes one level of it by forwarding to `iam-db`. **This
+service resolves none of it.** The answer depends on the team of the _row_ being
+read, which no caller upstream of the query knows, so the resolution belongs
+where the reach is computed. What travels here are the inputs.
+
+**Nothing is substituted for an unstated value.** When the organisation row is
+not there, `iam-db` answers with `org_value` `SETTING_VALUE_UNSPECIFIED` and
+`org_locked` false. An absent setting is contract-legal too, and the whole-value
+move carries either one without telling them apart. False is the permissive half
+of a policy the deployment never stated. The value and the lock are carried
+through exactly as received, so a reader that enforces the setting refuses rather
+than inheriting a default nobody chose.
+
+**The write validates here.** The clause list lives on
+`yadgar.common.v1.SettingScope` and every clause is `INVALID_ARGUMENT`. Each
+refusal lands before the store is called, so a rejected request leaves no row and
+burns no idempotency key. Withdrawing a team's override costs an affirmative
+`clear` byte: an omitted value on its own is refused rather than read as a
+deletion (ADR-0524).
+
+**Two gaps, stated rather than left to be found.** The request carries no
+attested caller identity, in common with every administrative RPC here — so
+`iam` can neither verify the caller is an administrator nor record who changed a
+policy governing who may read which records. The check belongs at the gateway,
+which is the one place identity is attested (ADR-0488). And a change binds only
+once the gateway's cached credential is gone: an organisation-level write touches
+every cached credential in the deployment and no event on the contract says so,
+so a deployment that tightens this policy waits the cache out.
+
 ## Client-side balancing, and the part that gets forgotten
 
 gRPC holds **one** long-lived HTTP/2 connection. A normal Service balances at

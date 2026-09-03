@@ -14,7 +14,7 @@ use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::crypto::Keys;
 use crate::invalidate::Invalidator;
-use crate::pb::yadgar::common::v1::Idempotency;
+use crate::pb::yadgar::common::v1::{Idempotency, SettingScope, SettingValue};
 use crate::pb::yadgar::iam::v1::iam_service_server::IamService;
 use crate::pb::yadgar::iam::v1::*;
 use crate::pb::yadgar::iamdb::v1 as db;
@@ -740,6 +740,137 @@ fn refused() -> Status {
     Status::unauthenticated("invalid username or password")
 }
 
+/// The one member of the setting vocabulary (ADR-0522).
+///
+/// A CLOSED SET, ENFORCED RATHER THAN DOCUMENTED. A store that accepted free
+/// text would accrete settings nothing reads, and a typo would be persisted as a
+/// new setting instead of being refused at the call that made it. Adding a
+/// member is a contract release, never a data change.
+const OWNER_READS_OWN_RECORD: &str = "owner_reads_own_record";
+
+/// Every clause `yadgar.common.v1.SettingScope` states, applied HERE.
+///
+/// **THE VALIDATION IS THE CONTRACT'S AND IS STATED ONCE, THERE.** This function
+/// applies it and deliberately does not restate the reasoning: two normative
+/// copies in two files must stay in step for ever, and the copy that drifts is
+/// the one a reader happens to open. Each refusal below names the clause it
+/// enforces so a reader can find it, and every one is `INVALID_ARGUMENT`.
+///
+/// **IT RUNS BEFORE THE STORE IS CALLED**, which is what makes `iam` refuse
+/// these itself rather than forward them. A refused request leaves no row and
+/// burns no idempotency key.
+///
+/// **WHAT IT DELIBERATELY DOES NOT REFUSE: a `value` holding a number this
+/// contract does not name.** The clause list is closed, and it names non-member
+/// refusal for `scope` ALONE — because a `switch` on the scope whose `default:`
+/// falls through writes the ORGANISATION's policy for a request that named
+/// neither level. `iam` does not interpret `value` at all, so it has no such
+/// fall-through, and adding a refusal `iam-db` does not share would make the two
+/// boundaries disagree about one request. The number is copied through and the
+/// store applies its own check (D5: one RPC is one transaction, so a refusal
+/// there changes nothing).
+fn check_inherited_setting(r: &SetInheritedSettingRequest) -> Result<(), Status> {
+    // `scope` IS NOT ONE OF THE MEMBERS THIS ENUM DECLARES. proto3 enums are
+    // open, so an unrecognised number arrives intact rather than collapsing to
+    // the zero — and it must not be treated as either level.
+    let scope = SettingScope::try_from(r.scope).map_err(|_| {
+        Status::invalid_argument(
+            "scope names no level this contract declares; there are two, an \
+             organisation and a team",
+        )
+    })?;
+
+    match scope {
+        SettingScope::Unspecified => {
+            return Err(Status::invalid_argument(
+                "scope is required: a write addresses the organisation's level \
+                 or one team's, and neither is the default",
+            ));
+        }
+        SettingScope::Org => {
+            // There is ONE organisation (D27), so a team id here is a caller
+            // that meant TEAM.
+            if r.team_id.is_some() {
+                return Err(Status::invalid_argument(
+                    "a team id at organisation scope is a request that meant \
+                     team scope; there is one organisation and it is not named",
+                ));
+            }
+            // Every default is wrong: false is the unsafe direction, true locks
+            // a deployment that never asked, and keeping the stored value stops
+            // the verb from stating a wanted result.
+            if r.locked.is_none() {
+                return Err(Status::invalid_argument(
+                    "locked is required at organisation scope: it has no safe \
+                     default, and an unstated lock is the permissive half of a \
+                     policy nobody chose",
+                ));
+            }
+            // The organisation always holds a value — the resolution's first
+            // step refuses an unset one — so there is nothing there to clear.
+            if r.clear {
+                return Err(Status::invalid_argument(
+                    "the organisation's value cannot be cleared: it always \
+                     holds one, and a deployment changes it by stating the \
+                     other value",
+                ));
+            }
+        }
+        SettingScope::Team => {
+            // Nothing names the row to write. ABSENT and PRESENT-AND-EMPTY are
+            // two cases, and this boundary has to refuse the second.
+            if !r.team_id.as_deref().is_some_and(|t| !t.is_empty()) {
+                return Err(Status::invalid_argument(
+                    "a team id is required at team scope: nothing else names \
+                     the override to write",
+                ));
+            }
+            // The lock is meaningful at organisation scope only, and `false`
+            // silently discarded is exactly the case this refusal exists for.
+            if r.locked.is_some() {
+                return Err(Status::invalid_argument(
+                    "locked is meaningful at organisation scope only: a team \
+                     cannot state whether teams may override",
+                ));
+            }
+        }
+    }
+
+    // SENT EXPLICITLY, THE ZERO IS STILL A REFUSAL AND NEVER A CLEAR — at either
+    // scope. It is what a caller that populated nothing sends.
+    if r.value == Some(SettingValue::Unspecified as i32) {
+        return Err(Status::invalid_argument(
+            "value was sent unspecified: that is what an unpopulated field \
+             looks like, and it is never read as a value or as a withdrawal",
+        ));
+    }
+
+    // AN OMITTED VALUE CAN NEVER BE READ AS A DELETION (ADR-0524).
+    if r.value.is_none() && !r.clear {
+        return Err(Status::invalid_argument(
+            "value is required unless clear is set: a request that states \
+             neither says nothing at all",
+        ));
+    }
+
+    // Two contradicting instructions, and neither is the obvious one to discard.
+    if r.clear && r.value.is_some() {
+        return Err(Status::invalid_argument(
+            "clear and value contradict each other: withdraw the override or \
+             state one, never both in the same request",
+        ));
+    }
+
+    if r.name != OWNER_READS_OWN_RECORD {
+        return Err(Status::invalid_argument(
+            "name is not a setting this contract declares; the vocabulary is \
+             closed and adding to it is a contract release",
+        ));
+    }
+
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl IamService for Iam {
     /// The hot path: a bearer token to an identity.
@@ -803,6 +934,32 @@ impl IamService for Iam {
             // storage and API shapes of `RateLimitOverride` and are not part of
             // enrolment; forwarding them is the follow-up this line marks.
             rate_limit_overrides: Vec::new(),
+            // ADR-0522's setting, MOVED WHOLE AND NEVER REBUILT.
+            //
+            // **THE INPUTS, NEVER THE ANSWER.** `iam` resolves none of this. The
+            // resolution depends on the team of the ROW being read, which no
+            // caller upstream of the query knows, so it happens where the reach
+            // is computed. `yadgar.common.v1.InheritedSetting` states the rule
+            // once; writing a second copy of it here is the mistake that
+            // comment exists to prevent.
+            //
+            // **NO DEFAULT IS SUBSTITUTED FOR AN ABSENT ONE, AND THAT IS THE
+            // WHOLE POINT.** `iam-db` answers with the message ABSENT when the
+            // organisation row is not there, and with `org_locked` FALSE — and
+            // false is the PERMISSIVE half of a policy the deployment never
+            // stated. An `unwrap_or_default()` here, or any field-by-field
+            // reconstruction, would hand a -db a policy nobody chose. Absent and
+            // present-holding-UNSPECIFIED are ONE case, which a -db that reads
+            // this setting REFUSES rather than reading as OFF. A single move is
+            // what makes substituting a default unwritable rather than merely
+            // discouraged.
+            //
+            // NOT BRANCHED ON `resolved`, unlike `valid_for_seconds` above. That
+            // TTL is zeroed on the negative path because a negative answer is
+            // worth caching for no interval. This setting is DEPLOYMENT-WIDE
+            // rather than credential-scoped, and no rule in the contract makes
+            // it conditional on a credential matching.
+            owner_reads_own_record: got.owner_reads_own_record,
         };
         call.finish(Outcome {
             status: "OK",
@@ -1062,6 +1219,89 @@ impl IamService for Iam {
         Err(Status::unimplemented(
             "SetRateLimitOverride is not implemented yet",
         ))
+    }
+
+    /// Write ONE LEVEL of ADR-0522's inheritable setting: validate here, store
+    /// there.
+    ///
+    /// **THIS SERVICE REFUSES THE CONTRACT'S CLAUSES ITSELF RATHER THAN
+    /// FORWARDING THEM** — `yadgar.iam.v1`'s comment on this RPC says so, and
+    /// [`check_inherited_setting`] is where it happens. Every refusal lands
+    /// BEFORE the store is called, so a rejected request leaves no row, no
+    /// ledger entry and no idempotency key behind.
+    ///
+    /// **IT RESOLVES NOTHING.** The response carries the setting whole, exactly
+    /// as the store answered. The resolution depends on the team of the ROW
+    /// being read and belongs where the reach is computed; see
+    /// `yadgar.common.v1.InheritedSetting`, which states it once.
+    ///
+    /// **THE AUTHORISATION GAP, STATED RATHER THAN LEFT TO BE FOUND.** This
+    /// request carries no attested caller identity, in common with every
+    /// administrative RPC on this service. So `iam` can neither VERIFY that the
+    /// caller is an administrator nor RECORD which one changed a policy that
+    /// governs who may read which records. The check belongs at the gateway, on
+    /// D73's admin flag, because the gateway is the one place identity is
+    /// attested (ADR-0488) — a second authentication path invented here would be
+    /// a second place for it to be wrong, holding the same secret twice.
+    /// **D73's BOOTSTRAP TOKEN DOES NOT REACH THIS VERB**, and must not be
+    /// extended to it: a token that exists to create the FIRST admin would
+    /// otherwise rewrite the read policy for the whole deployment before an
+    /// admin exists to notice.
+    ///
+    /// **NOTHING IS INVALIDATED, AND THAT IS THE CONTRACT'S ANSWER RATHER THAN
+    /// AN OMISSION.** The setting travels on the credential a gateway caches
+    /// (ADR-0491). An organisation-level write touches every cached credential
+    /// in the deployment and no event on this contract says so, and the
+    /// per-user subjects [`crate::invalidate`] publishes need a `user_id` this
+    /// request does not carry. A deployment that tightens this policy WAITS THE
+    /// CACHE OUT.
+    async fn set_inherited_setting(
+        &self,
+        req: Request<SetInheritedSettingRequest>,
+    ) -> Result<Response<SetInheritedSettingResponse>, Status> {
+        let rid = request_id_of(&req);
+        let call = Call::start(SERVICE, "SetInheritedSetting", Kind::Write, tel(rid, ""));
+
+        if let Err(refusal) = check_inherited_setting(req.get_ref()) {
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
+
+        let r = req.get_ref();
+        // FIELD BY FIELD ONLY BECAUSE THE TWO REQUEST TYPES ARE DIFFERENT — one
+        // per boundary, as every other forwarded write here is. `value` and
+        // `locked` are copied with their PRESENCE intact: absence is a distinct
+        // instruction from any value, and collapsing it would make `clear` the
+        // only way this service can express a withdrawal (ADR-0524).
+        let mut upstream = Request::new(db::SetInheritedSettingRequest {
+            idempotency: r.idempotency.clone(),
+            scope: r.scope,
+            team_id: r.team_id.clone(),
+            name: r.name.clone(),
+            value: r.value,
+            locked: r.locked,
+            clear: r.clear,
+        });
+        forward_request_id(&req, &mut upstream);
+
+        let set = self
+            .client()
+            .set_inherited_setting(upstream)
+            .await
+            .map_err(upstream_failed)?
+            .into_inner();
+
+        call.finish(Outcome {
+            status: "OK",
+            ..Default::default()
+        });
+        // MOVED WHOLE. The store's answer carries the OTHER level and every
+        // OTHER team's override, which the caller did not send — rebuilding it
+        // here is how a field goes missing from a policy an operator is reading
+        // back.
+        Ok(Response::new(SetInheritedSettingResponse {
+            setting: set.setting,
+        }))
     }
 
     async fn issue_credential(
