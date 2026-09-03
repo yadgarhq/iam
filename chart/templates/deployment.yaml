@@ -110,6 +110,12 @@ spec:
             # mounted as DIRECTORIES below, never with subPath, which is what
             # makes kubelet refresh them inside the pod at all.
             #
+            # THE CLIENT CERTIFICATE IS IN THE SAME SET (ADR-0516), and it is the
+            # member with the worst failure: an expired client leaf STOPS the hop
+            # to iam-db rather than degrading it, so a process that never
+            # re-reads works until the expiry date and then cannot call its own
+            # store.
+            #
             # THE SPLAY IS THE ONLY THING SEPARATING THE TWO REPLICAS. Both see
             # the refreshed file inside the same kubelet sync window, and the
             # PodDisruptionBudget does NOT govern a self-exit — it constrains
@@ -161,6 +167,26 @@ spec:
             # difference, which is the point.
             - name: IAM_DB_TLS_CA_FILE
               value: /var/run/config/iam-db-ca/ca.pem
+            {{- if .Values.iamDb.tls.clientCertSecret }}
+            # WHO THIS SERVICE SAYS IT IS ON THAT HOP — mutual TLS (ADR-0516),
+            # and a THIRD direction beside the two above. LISTEN_TLS_* is what
+            # iam serves; IAM_DB_TLS_CA_FILE is how iam verifies iam-db; these
+            # two are what iam PRESENTS so iam-db can authenticate the caller.
+            #
+            # RENDERED ONLY WHEN A SECRET IS NAMED, and `iamDb.tls.clientCertSecret`
+            # is EMPTY by default. So turning `iamDb.tls.enabled` on encrypts the
+            # hop and presents no identity, exactly as before; naming the Secret
+            # is a second, separately revertible lever. The binary refuses one
+            # path without the other, so the two are rendered together or not at
+            # all.
+            #
+            # PATHS, never an issuer-specific resource (D80), for the reason
+            # given on IAM_DB_TLS_CA_FILE above.
+            - name: IAM_DB_TLS_CLIENT_CERT_FILE
+              value: /var/run/secrets/iam-client-tls/client.pem
+            - name: IAM_DB_TLS_CLIENT_KEY_FILE
+              value: /var/run/secrets/iam-client-tls/client-key.pem
+            {{- end }}
             {{- if .Values.iamDb.tls.domain }}
             # Only when the certificate names something other than the Service.
             # Unset means "verify against iamDb.host", which is what makes a
@@ -316,6 +342,17 @@ spec:
               mountPath: /var/run/config/iam-db-ca
               readOnly: true
             {{- end }}
+            {{- if and .Values.iamDb.tls.enabled .Values.iamDb.tls.clientCertSecret }}
+            # A DIRECTORY MOUNT, never subPath — and here the rule is at its most
+            # expensive to break. A subPath mount is a one-time copy kubelet
+            # never refreshes, so a renewed CLIENT certificate would never reach
+            # this process; ADR-0516 makes that an expired leaf that STOPS the
+            # hop to iam-db rather than one that merely weakens it. The watcher
+            # above only works because this is a directory.
+            - name: iam-db-client-cert
+              mountPath: /var/run/secrets/iam-client-tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.enrolment.caSecret }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
             # copy that kubelet never refreshes, so the CA would freeze at
@@ -401,6 +438,33 @@ spec:
             items:
               - key: {{ required "iamDb.tls.caSecretKey names the key inside iamDb.tls.caSecret that holds the CA bundle and must be set whenever iamDb.tls.enabled is; see the chart's values.yaml" .Values.iamDb.tls.caSecretKey | quote }}
                 path: ca.pem
+        {{- end }}
+        {{- if and .Values.iamDb.tls.enabled .Values.iamDb.tls.clientCertSecret }}
+        - name: iam-db-client-cert
+          secret:
+            secretName: {{ .Values.iamDb.tls.clientCertSecret }}
+            # OPTIONAL, and it means what it means on the iam-db CA above rather
+            # than what it means on the enrolment CA below: the process MUST NOT
+            # START without a usable identity once one has been asked for, and
+            # optional is simply which error says so. A required mount that
+            # cannot be satisfied leaves the pod in ContainerCreating with a
+            # FailedMount event about a volume; an optional one mounts an empty
+            # directory, the binary finds no file at IAM_DB_TLS_CLIENT_CERT_FILE,
+            # and `yadgar_dial::connect_tls` refuses naming THAT PATH. Neither
+            # starts; only one of them explains itself. There is no third outcome
+            # in which this pod dials iam-db without the identity it was told to
+            # present.
+            optional: true
+            # BOTH KEYS, because a certificate cannot be presented without the
+            # key that proves it — the second mount in this file meant to carry a
+            # private key, and like the first it is this pod's OWN. Selecting
+            # them by name is also what renames whatever the issuer called them
+            # to the paths the environment names above.
+            items:
+              - key: {{ required "iamDb.tls.clientCertSecretKey names the key inside iamDb.tls.clientCertSecret that holds the client certificate and must be set whenever iamDb.tls.clientCertSecret is; see the chart's values.yaml" .Values.iamDb.tls.clientCertSecretKey | quote }}
+                path: client.pem
+              - key: {{ required "iamDb.tls.clientKeySecretKey names the key inside iamDb.tls.clientCertSecret that holds the client private key and must be set whenever iamDb.tls.clientCertSecret is; see the chart's values.yaml" .Values.iamDb.tls.clientKeySecretKey | quote }}
+                path: client-key.pem
         {{- end }}
         {{- if .Values.enrolment.caSecret }}
         - name: enrolment-ca

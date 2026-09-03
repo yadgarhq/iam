@@ -37,7 +37,7 @@ use rcgen::{
 };
 use tokio::time::timeout;
 
-use yadgar_iam::rotate::{self, Inputs, Schedule, CERTIFICATE_NOT_AFTER};
+use yadgar_iam::rotate::{self, Inputs, Presented, Schedule, CERTIFICATE_NOT_AFTER};
 use yadgar_iam::serve::{self, ServerTls};
 use yadgar_iam::service::EnrolmentConfig;
 use yadgar_iam::upstream::{self, UpstreamTls};
@@ -61,6 +61,12 @@ const PATIENT: Duration = Duration::from_millis(600);
 /// stale leaf loud goes quiet instead.
 const LEAF_NOT_AFTER: i64 = 1_813_017_600; // 2027-06-15T00:00:00Z
 const CA_NOT_AFTER: i64 = 2_128_636_800; // 2037-06-15T00:00:00Z
+
+/// The CLIENT leaf's expiry — a year past the serving leaf's, and deliberately
+/// so. Both are exported under one metric name, separated only by the `kind`
+/// label, so an implementation that gauged the wrong one would land on a
+/// plausible number. A distinct date turns that into a failing equality.
+const CLIENT_NOT_AFTER: i64 = 1_844_640_000; // 2028-06-15T00:00:00Z
 
 /// One generation of the mount: the file names the chart writes, and their
 /// contents.
@@ -88,11 +94,30 @@ fn generation(san: &str) -> Generation {
     params.distinguished_name.push(DnType::CommonName, san);
     let leaf = params.signed_by(&key, &ca).unwrap();
 
+    // THE CLIENT LEAF, and it is a DIFFERENT certificate issued for a DIFFERENT
+    // purpose (ADR-0516). `ClientAuth` rather than `ServerAuth`, because a peer
+    // verifying a client chain refuses a leaf naming the wrong one even though
+    // it trusts the issuer perfectly well — the same authority signs both here,
+    // which is what the reference deployment does.
+    let client_key = KeyPair::generate().unwrap();
+    let mut client_params = CertificateParams::new(vec![format!("{san}-caller")]).unwrap();
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    client_params.not_after = date_time_ymd(2028, 6, 15);
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, format!("{san}-caller"));
+    let client_leaf = client_params.signed_by(&client_key, &ca).unwrap();
+
     vec![
         ("tls.pem".to_string(), format!("{}{}", leaf.pem(), ca.pem())),
         ("tls-key.pem".to_string(), key.serialize_pem()),
         ("ca.pem".to_string(), ca.pem()),
         ("enrolment-ca.pem".to_string(), ca.pem()),
+        (
+            "client.pem".to_string(),
+            format!("{}{}", client_leaf.pem(), ca.pem()),
+        ),
+        ("client-key.pem".to_string(), client_key.serialize_pem()),
     ]
 }
 
@@ -218,7 +243,8 @@ fn unique() -> String {
 
 /// The inputs a TLS deployment of this service reads at boot, **assembled from
 /// the resolved configuration exactly as `main` assembles them**: the listener's
-/// certificate and key, the CA bundle `iam-db` is verified against, and the CA
+/// certificate and key, the CA bundle `iam-db` is verified against, the client
+/// certificate and key this service presents to `iam-db` (ADR-0516), and the CA
 /// every D73 enrolment token carries.
 ///
 /// **Built through the three config-taking methods rather than by naming four
@@ -261,6 +287,14 @@ fn upstream_tls(mount: &Mount) -> UpstreamTls {
         (
             "IAM_DB_TLS_CA_FILE".to_string(),
             mount.path("ca.pem").display().to_string(),
+        ),
+        (
+            "IAM_DB_TLS_CLIENT_CERT_FILE".to_string(),
+            mount.path("client.pem").display().to_string(),
+        ),
+        (
+            "IAM_DB_TLS_CLIENT_KEY_FILE".to_string(),
+            mount.path("client-key.pem").display().to_string(),
         ),
     ];
     UpstreamTls::from_lookup(upstream::IAM_DB, move |k| {
@@ -415,14 +449,23 @@ async fn the_expiry_reported_is_the_leaf_certificate_not_the_chain() {
     let mount = Mount::new(&generation("iam"));
 
     assert_eq!(
-        inputs(&mount).not_after(),
+        inputs(&mount).not_after(Presented::Serving),
         Some(LEAF_NOT_AFTER),
         "the first certificate in the file is the one being served"
     );
     assert_ne!(
-        inputs(&mount).not_after(),
+        inputs(&mount).not_after(Presented::Serving),
         Some(CA_NOT_AFTER),
         "reporting the issuer's expiry would keep the gauge green for a decade"
+    );
+    // The CLIENT leaf is written the same way — leaf, then the authority that
+    // signed it — so the same mistake is available on the same file and would
+    // report a CA expiry a decade out for the material ADR-0516 makes
+    // load-bearing for availability.
+    assert_eq!(
+        inputs(&mount).not_after(Presented::Client),
+        Some(CLIENT_NOT_AFTER),
+        "the first certificate in the client file is the one being presented"
     );
 }
 
@@ -434,12 +477,25 @@ async fn the_fingerprint_distinguishes_two_certificates() {
     let one = Mount::new(&generation("iam"));
     let other = Mount::new(&generation("iam"));
 
-    let a = inputs(&one).fingerprint().expect("a certificate was read");
+    let a = inputs(&one)
+        .fingerprint(Presented::Serving)
+        .expect("a certificate was read");
     let b = inputs(&other)
-        .fingerprint()
+        .fingerprint(Presented::Serving)
         .expect("a certificate was read");
     assert_eq!(a.len(), 64, "SHA-256 over the leaf's DER, hex");
     assert_ne!(a, b, "two certificates must not share a fingerprint");
+
+    // AND THE TWO KINDS ARE NOT EACH OTHER. One process holds both, so a
+    // fingerprint that answered "which certificate am I on" with the wrong one
+    // would read as a plausible answer.
+    let client = inputs(&one)
+        .fingerprint(Presented::Client)
+        .expect("a client certificate was read");
+    assert_ne!(
+        a, client,
+        "the serving and client leaves are different files"
+    );
 }
 
 /// THE GAUGE LANDS UNDER THE NAME AND THE LABEL A DASHBOARD QUERIES.
@@ -469,31 +525,53 @@ fn the_expiry_is_exported_under_the_name_a_dashboard_queries() {
     // would pass vacuously against an empty snapshot.
     assert_eq!(
         emitted.len(),
-        1,
-        "one gauge and nothing else — check for a duplicate `metrics` crate"
+        2,
+        "one gauge per certificate this process loaded, and nothing else — check \
+         for a duplicate `metrics` crate"
     );
-    let (composite, _unit, _description, value) = &emitted[0];
-    let key = composite.key();
 
-    assert_eq!(key.name(), CERTIFICATE_NOT_AFTER);
-    let labels: Vec<(String, String)> = key
-        .labels()
-        .map(|l| (l.key().to_string(), l.value().to_string()))
+    let mut seen: Vec<(Vec<(String, String)>, f64)> = emitted
+        .iter()
+        .map(|(composite, _unit, _description, value)| {
+            let key = composite.key();
+            assert_eq!(key.name(), CERTIFICATE_NOT_AFTER);
+            let labels = key
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            let seconds = match value {
+                DebugValue::Gauge(seconds) => seconds.into_inner(),
+                other => panic!("expected a gauge, got {other:?}"),
+            };
+            (labels, seconds)
+        })
         .collect();
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // BOTH LABELS ARE BOUNDED. `kind` has exactly two values and always will, so
+    // it costs two series rather than one per rotation — which is what D67's
+    // rule is actually about. A fingerprint or a path here would not be.
     assert_eq!(
-        labels,
-        vec![("service".to_string(), "iam".to_string())],
-        "the one BOUNDED label the estate uses; a fingerprint or a path here is \
-         one new series per rotation, forever (D67)"
+        seen,
+        vec![
+            (
+                vec![
+                    ("service".to_string(), "iam".to_string()),
+                    ("kind".to_string(), "client".to_string()),
+                ],
+                CLIENT_NOT_AFTER as f64
+            ),
+            (
+                vec![
+                    ("service".to_string(), "iam".to_string()),
+                    ("kind".to_string(), "serving".to_string()),
+                ],
+                LEAF_NOT_AFTER as f64
+            ),
+        ],
+        "each gauge carries the expiry of the leaf it names, and the two are not \
+         interchangeable: an expired CLIENT leaf STOPS this hop (ADR-0516)"
     );
-    match value {
-        DebugValue::Gauge(seconds) => assert_eq!(
-            seconds.into_inner(),
-            LEAF_NOT_AFTER as f64,
-            "the gauge carries the LOADED leaf's expiry"
-        ),
-        other => panic!("expected a gauge, got {other:?}"),
-    }
 }
 
 /// NOTHING IS PUBLISHED WHEN THERE IS NOTHING TO PUBLISH. An invented number is
@@ -516,7 +594,14 @@ fn no_certificate_exports_no_gauge() {
 /// from the watch set is a case that hangs.
 #[tokio::test]
 async fn each_watched_file_ends_the_watch_on_its_own() {
-    for name in ["tls.pem", "tls-key.pem", "ca.pem", "enrolment-ca.pem"] {
+    for name in [
+        "tls.pem",
+        "tls-key.pem",
+        "ca.pem",
+        "enrolment-ca.pem",
+        "client.pem",
+        "client-key.pem",
+    ] {
         let base = generation("iam");
         let mount = Arc::new(Mount::new(&base));
         let watched = inputs(&mount);
@@ -574,18 +659,28 @@ async fn exchanging_the_contents_of_two_watched_files_ends_the_watch() {
 async fn the_baseline_is_what_was_loaded_not_what_is_on_disk_later() {
     let mount = Arc::new(Mount::new(&generation("iam")));
     let watched = inputs(&mount);
-    let loaded = watched.fingerprint().expect("a certificate was read");
+    let loaded = watched
+        .fingerprint(Presented::Serving)
+        .expect("a certificate was read");
+    let loaded_client = watched
+        .fingerprint(Presented::Client)
+        .expect("a client certificate was read");
 
     // The whole mount is replaced before the watcher has polled once.
     mount.swap(&generation("iam"));
 
     assert_eq!(
-        watched.fingerprint(),
+        watched.fingerprint(Presented::Serving),
         Some(loaded),
         "the fingerprint must name the loaded certificate, not the one now on disk"
     );
     assert_eq!(
-        watched.not_after(),
+        watched.fingerprint(Presented::Client),
+        Some(loaded_client),
+        "and the same for the client leaf, which fails harder when it is stale"
+    );
+    assert_eq!(
+        watched.not_after(Presented::Serving),
         Some(LEAF_NOT_AFTER),
         "and so must the expiry the gauge carries"
     );
@@ -613,7 +708,14 @@ async fn the_watch_set_holds_every_file_the_configuration_named() {
         .map(|p| p.display().to_string())
         .collect();
 
-    for name in ["tls.pem", "tls-key.pem", "ca.pem", "enrolment-ca.pem"] {
+    for name in [
+        "tls.pem",
+        "tls-key.pem",
+        "ca.pem",
+        "enrolment-ca.pem",
+        "client.pem",
+        "client-key.pem",
+    ] {
         let expected = mount.path(name).display().to_string();
         assert!(
             watched.contains(&expected),
@@ -621,7 +723,7 @@ async fn the_watch_set_holds_every_file_the_configuration_named() {
              Watching: {watched:?}"
         );
     }
-    assert_eq!(watched.len(), 4, "and nothing else: {watched:?}");
+    assert_eq!(watched.len(), 6, "and nothing else: {watched:?}");
 }
 
 /// THE CERTIFICATE IS FIRST, because it is the one the gauge and the
@@ -634,7 +736,7 @@ async fn the_listener_certificate_is_the_one_the_gauge_speaks_for() {
         watched.watched().first(),
         Some(&mount.path("tls.pem").as_path())
     );
-    assert_eq!(watched.not_after(), Some(LEAF_NOT_AFTER));
+    assert_eq!(watched.not_after(Presented::Serving), Some(LEAF_NOT_AFTER));
 }
 
 /// EACH HALF CONTRIBUTES ON ITS OWN, so a deployment running cleartext with an

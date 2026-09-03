@@ -18,10 +18,17 @@
 //! This module polls a digest of every TLS input the process read at boot — one
 //! per file, so a change can be reported by NAME. The set is the serving
 //! certificate, the private key belonging to it, the CA bundle `iam-db` is
-//! verified against, and the CA every D73 enrolment token carries. On a change
-//! it logs which file, and the old and new leaf fingerprint, waits out a per-pod
-//! splay, and ends — and the caller selects on that, drains, and returns
+//! verified against, the client certificate and key this service PRESENTS to
+//! `iam-db` (ADR-0516), and the CA every D73 enrolment token carries. On a
+//! change it logs which file, and the old and new leaf fingerprints, waits out a
+//! per-pod splay, and ends — and the caller selects on that, drains, and returns
 //! `Ok(())`.
+//!
+//! **THE CLIENT CERTIFICATE IS THE MEMBER WITH THE WORST FAILURE.** ADR-0516
+//! records that an expired CLIENT leaf STOPS a hop rather than degrading it, so
+//! a process that read it once and never again keeps serving perfectly and stops
+//! being able to reach its own store — on a date, with nothing having warned.
+//! The serving leaf is the milder case this module was originally written for.
 //!
 //! **THE ENROLMENT CA IS IN THAT SET, and it is not a transport input.** The
 //! chart mounts it as a DIRECTORY for the propagation a rotation needs, and
@@ -63,17 +70,22 @@
 //!
 //! # The gauge is the half that makes a failure loud
 //!
-//! [`Inputs::export_not_after`] publishes the expiry of the certificate this
-//! process ACTUALLY LOADED (D67).
+//! [`Inputs::export_not_after`] publishes the expiry of every certificate this
+//! process ACTUALLY LOADED (D67), one series per certificate, told apart by a
+//! `kind` label carrying `serving` or `client`. Two values, forever, which is
+//! what keeps a bounded label inside D67's rule against an unbounded dimension
+//! on a metric label — and a dashboard watching only the serving leaf would be
+//! blind to the one that takes a hop away.
 //!
 //! # "TLS is off" does NOT mean "nothing is watched"
 //!
 //! The enrolment CA is in the set, and the chart ships `enrolment.caSecret` with
 //! a default — so a default install serving CLEARTEXT still has a non-empty
 //! watch set and still exits on a gateway CA rotation. The set is empty only
-//! when neither a listener certificate nor an enrolment CA was read. If the watcher dies, that gauge still shows
-//! the loaded leaf ageing out — which is what a watcher whose own failure is
-//! silent would not give anybody.
+//! when no listener certificate, no upstream material and no enrolment CA was
+//! read. If the watcher dies, that gauge still shows the loaded leaf ageing out
+//! — which is what a watcher whose own failure is silent would not give
+//! anybody.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -195,6 +207,54 @@ impl Schedule {
     }
 }
 
+/// Which direction a certificate this process loaded is presented in.
+///
+/// **Two certificates, two failure modes, and only one of them was ever
+/// gauged.** The serving leaf is what callers verify when they connect here; the
+/// client leaf (ADR-0516) is what this process shows the upstreams it connects
+/// to. ADR-0516 records that the second is load-bearing for AVAILABILITY in a
+/// way the first is not — an expired client leaf STOPS a hop rather than
+/// weakening it — so a deployment that gauges only the serving one is blind to
+/// the harder failure.
+///
+/// **The label is BOUNDED, which is what makes it allowed at all.** D67 forbids
+/// an unbounded dimension on a metric label; this one has exactly two values and
+/// always will, so it costs two series rather than one per rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presented {
+    /// The leaf this process shows to its own callers.
+    Serving,
+    /// The leaf this process shows to the upstreams it dials (ADR-0516).
+    Client,
+}
+
+impl Presented {
+    /// The value of the `kind` label, and the word the log line uses.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Serving => "serving",
+            Self::Client => "client",
+        }
+    }
+}
+
+/// One certificate this process loaded, AS IT WAS READ.
+///
+/// Kept rather than re-read, so the fingerprint and the gauge describe the
+/// certificate actually loaded even after the file underneath has changed. The
+/// path is kept beside it so the certificate ON DISK can be fingerprinted after
+/// a rotation without re-deriving which file it was.
+///
+/// `der` is `None` for a file that was configured and could not be read or could
+/// not be parsed. That is a deployment already broken in a way the boot log
+/// carries, and it is DIFFERENT from the certificate not existing at all — which
+/// is why the file is recorded either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Leaf {
+    der: Option<Vec<u8>>,
+    path: PathBuf,
+}
+
 /// One watched file, and what it held when this process read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Watched {
@@ -221,15 +281,14 @@ struct Watched {
 /// the gauge describes a certificate the listener is not serving.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Inputs {
-    /// The DER of the leaf this service PRESENTS, **as it was read** — kept
-    /// rather than re-read, so the fingerprint and the gauge describe the
-    /// certificate actually loaded even after the file underneath has changed.
-    certificate: Option<Vec<u8>>,
-    /// Where that leaf was read from, so the certificate ON DISK can be
-    /// fingerprinted after a rotation without re-deriving which file it was.
-    certificate_path: Option<PathBuf>,
-    /// Every watched file, the certificate included, in the order they were
-    /// added.
+    /// The leaf this service SERVES, when it serves one.
+    serving: Option<Leaf>,
+    /// The leaf this service PRESENTS TO ITS UPSTREAMS, when it presents one
+    /// (ADR-0516). A different certificate from the one above, issued for a
+    /// different purpose, and gauged separately because it fails differently.
+    client: Option<Leaf>,
+    /// Every watched file, both certificates included, in the order they were
+    /// added and each appearing once.
     files: Vec<Watched>,
 }
 
@@ -238,18 +297,41 @@ impl Inputs {
     ///
     /// Read NOW: the leaf kept here is the one the fingerprint and the gauge
     /// speak for.
-    pub fn serving_certificate(mut self, path: &Path) -> Self {
+    pub fn serving_certificate(self, path: &Path) -> Self {
+        self.certificate(Presented::Serving, path)
+    }
+
+    /// The certificate this service presents to the upstreams it dials
+    /// (ADR-0516).
+    ///
+    /// **The same mechanism, and a worse failure if it is left out.** An expired
+    /// serving leaf degrades what callers see; an expired CLIENT leaf stops the
+    /// hop outright, so this one being unwatched is the more expensive omission
+    /// of the two.
+    pub fn client_certificate(self, path: &Path) -> Self {
+        self.certificate(Presented::Client, path)
+    }
+
+    /// Load one certificate and watch the file it came from, in ONE reading.
+    ///
+    /// One reading rather than two on purpose: reading the bytes for the digest
+    /// separately from the bytes the leaf is parsed from opens a window in which
+    /// a kubelet swap lands between them, and the process would then hold a
+    /// fingerprint from one generation beside a baseline from the next.
+    fn certificate(mut self, which: Presented, path: &Path) -> Self {
         let bytes = std::fs::read(path).ok();
-        self.certificate = bytes
-            .as_deref()
-            .and_then(|b| CertificateDer::pem_slice_iter(b).next()?.ok())
-            .map(|der| der.to_vec());
-        self.certificate_path = Some(path.to_path_buf());
-        self.files.push(Watched {
+        let leaf = Leaf {
+            der: bytes
+                .as_deref()
+                .and_then(|b| CertificateDer::pem_slice_iter(b).next()?.ok())
+                .map(|der| der.to_vec()),
             path: path.to_path_buf(),
-            loaded: bytes.as_deref().map(digest_of),
-        });
-        self
+        };
+        match which {
+            Presented::Serving => self.serving = Some(leaf),
+            Presented::Client => self.client = Some(leaf),
+        }
+        self.watch(path, bytes.as_deref().map(digest_of))
     }
 
     /// The listener's certificate and the private key belonging to it, or
@@ -270,11 +352,29 @@ impl Inputs {
         }
     }
 
-    /// The CA bundle an upstream's certificate is verified against.
+    /// The CA bundle an upstream's certificate is verified against, AND the
+    /// client certificate this service presents to that upstream.
+    ///
+    /// **BOTH HALVES, and the second one is the reason this method changed.**
+    /// The client certificate and its key are read once in
+    /// `yadgar_dial::TlsOptions::prepare`, out of a directory mount that
+    /// rotates — the watcher's exact shape. Left out of the set, this process
+    /// works perfectly until the leaf expires and then fails hard, with no exit,
+    /// no gauge movement and no log. ADR-0516 makes that failure a STOPPED hop
+    /// rather than a degraded one, which is worse than the serving case this
+    /// module was written for.
+    ///
+    /// The identity is `Some`/`Some` or `None`/`None` and cannot be half of one:
+    /// `crate::upstream::UpstreamTls` refuses a certificate without its key at
+    /// boot, so there is no half-configured arm to handle here.
     pub fn upstream(self, tls: Option<&crate::upstream::UpstreamTls>) -> Self {
-        match tls {
-            None => self,
-            Some(tls) => self.also(tls.ca_file()),
+        let Some(tls) = tls else {
+            return self;
+        };
+        let watching = self.also(tls.ca_file());
+        match (tls.client_certificate_file(), tls.client_key_file()) {
+            (Some(certificate), Some(key)) => watching.client_certificate(certificate).also(key),
+            _ => watching,
         }
     }
 
@@ -297,12 +397,35 @@ impl Inputs {
     /// A TLS file read at boot that is not the serving certificate: the private
     /// key belonging to it, the CA bundle each upstream is verified against, and
     /// the CA every enrolment token carries.
-    pub fn also(mut self, path: &Path) -> Self {
+    pub fn also(self, path: &Path) -> Self {
+        if self.is_watching(path) {
+            return self;
+        }
+        let loaded = std::fs::read(path).ok().as_deref().map(digest_of);
+        self.watch(path, loaded)
+    }
+
+    /// Add one file to the set, ONCE.
+    ///
+    /// **The de-duplication is load-bearing rather than tidy.** One process can
+    /// present the SAME client leaf to two upstreams — the gateway does, to
+    /// `iam` and to `task` — so the same two paths arrive twice. Without this
+    /// they would be hashed twice, named twice in the line that reports a
+    /// change, and counted twice by every assertion about membership.
+    fn watch(mut self, path: &Path, loaded: Option<[u8; 32]>) -> Self {
+        if self.is_watching(path) {
+            return self;
+        }
         self.files.push(Watched {
             path: path.to_path_buf(),
-            loaded: std::fs::read(path).ok().as_deref().map(digest_of),
+            loaded,
         });
         self
+    }
+
+    /// Whether this file is already in the set.
+    fn is_watching(&self, path: &Path) -> bool {
+        self.files.iter().any(|f| f.path == path)
     }
 
     /// Nothing was configured, so there is nothing to watch.
@@ -354,25 +477,53 @@ impl Inputs {
             .collect()
     }
 
+    /// One of the two certificates this process holds, or nothing when this
+    /// deployment has no such certificate at all.
+    fn loaded(&self, which: Presented) -> Option<&Leaf> {
+        match which {
+            Presented::Serving => self.serving.as_ref(),
+            Presented::Client => self.client.as_ref(),
+        }
+    }
+
     /// The leaf certificate this service presents, as it was loaded.
     ///
     /// **THE FIRST certificate in the file, and that is load-bearing.**
     /// cert-manager writes the leaf followed by the chain that issued it, so the
     /// LAST one is an authority whose expiry is years away — reporting it would
     /// keep the gauge green while the certificate actually on the wire ages out.
-    fn leaf(&self) -> Option<CertificateDer<'static>> {
-        Some(CertificateDer::from(self.certificate.clone()?))
+    fn leaf(&self, which: Presented) -> Option<CertificateDer<'static>> {
+        Some(CertificateDer::from(self.loaded(which)?.der.clone()?))
     }
 
-    /// The fingerprint of whatever the certificate file holds RIGHT NOW, which
-    /// is what a rotation replaced the loaded one with.
+    /// The fingerprint of whatever that certificate's file holds RIGHT NOW,
+    /// which is what a rotation replaced the loaded one with.
     ///
     /// The only reading in this module that deliberately goes back to disk: the
     /// "after" half of the log line has no other source.
-    fn fingerprint_on_disk(&self) -> Option<String> {
-        let bytes = std::fs::read(self.certificate_path.as_ref()?).ok()?;
+    fn fingerprint_on_disk(&self, which: Presented) -> Option<String> {
+        let bytes = std::fs::read(&self.loaded(which)?.path).ok()?;
         let der = CertificateDer::pem_slice_iter(&bytes).next()?.ok()?;
         Some(hex(&Sha256::digest(&der)))
+    }
+
+    /// A fingerprint for the log line, WITH THE TWO ABSENCES KEPT APART.
+    ///
+    /// `none` means this deployment holds no certificate of that kind — the
+    /// gateway serves nothing, so its serving half is always `none` and that is
+    /// correct rather than broken. `unknown` means one was configured and could
+    /// not be parsed, which is a deployment to look at. Collapsing the two into
+    /// one word is how a real fault reads as an ordinary shape.
+    fn reported(&self, which: Presented, on_disk: bool) -> String {
+        if self.loaded(which).is_none() {
+            return absent();
+        }
+        let found = if on_disk {
+            self.fingerprint_on_disk(which)
+        } else {
+            self.fingerprint(which)
+        };
+        found.unwrap_or_else(unknown)
     }
 
     /// SHA-256 over the leaf's DER, in hex.
@@ -385,13 +536,13 @@ impl Inputs {
     /// **This is what answers "which certificate am I on".** It is the first
     /// question anybody asks when a rotation is suspected, and without it the
     /// log line saying one happened is unfalsifiable.
-    pub fn fingerprint(&self) -> Option<String> {
-        Some(hex(&Sha256::digest(self.leaf()?)))
+    pub fn fingerprint(&self, which: Presented) -> Option<String> {
+        Some(hex(&Sha256::digest(self.leaf(which)?)))
     }
 
     /// When the loaded leaf stops being valid, in seconds since the epoch.
-    pub fn not_after(&self) -> Option<i64> {
-        let der = self.leaf()?;
+    pub fn not_after(&self, which: Presented) -> Option<i64> {
+        let der = self.leaf(which)?;
         let (_, parsed) = X509Certificate::from_der(&der).ok()?;
         Some(parsed.validity().not_after.timestamp())
     }
@@ -403,16 +554,23 @@ impl Inputs {
     /// unparsable, nothing is published: an invented number is worse than a
     /// missing series, because a dashboard cannot tell it apart from a real one.
     pub fn export_not_after(&self) {
-        let Some(seconds) = self.not_after() else {
-            return;
-        };
-        metrics::gauge!(CERTIFICATE_NOT_AFTER, "service" => crate::service::SERVICE)
+        for which in [Presented::Serving, Presented::Client] {
+            let Some(seconds) = self.not_after(which) else {
+                continue;
+            };
+            metrics::gauge!(
+                CERTIFICATE_NOT_AFTER,
+                "service" => crate::service::SERVICE,
+                "kind" => which.label(),
+            )
             .set(seconds as f64);
-        tracing::info!(
-            not_after = seconds,
-            fingerprint = self.fingerprint().unwrap_or_else(unknown),
-            "serving certificate loaded; its expiry is exported as {CERTIFICATE_NOT_AFTER}"
-        );
+            tracing::info!(
+                kind = which.label(),
+                not_after = seconds,
+                fingerprint = self.fingerprint(which).unwrap_or_else(unknown),
+                "certificate loaded; its expiry is exported as {CERTIFICATE_NOT_AFTER}"
+            );
+        }
     }
 }
 
@@ -446,7 +604,8 @@ pub async fn watch_with_seed(inputs: Inputs, schedule: Schedule, seed: u64) {
         tracing::warn!("the TLS inputs could not be read; rotation will not be noticed");
         never().await
     };
-    let before = inputs.fingerprint().unwrap_or_else(unknown);
+    let serving_before = inputs.reported(Presented::Serving, false);
+    let client_before = inputs.reported(Presented::Client, false);
 
     loop {
         tokio::time::sleep(schedule.poll).await;
@@ -463,8 +622,10 @@ pub async fn watch_with_seed(inputs: Inputs, schedule: Schedule, seed: u64) {
 
         let waited = splay(schedule.splay_max, seed);
         tracing::warn!(
-            before,
-            after = inputs.fingerprint_on_disk().unwrap_or_else(unknown),
+            serving_before,
+            serving_after = inputs.reported(Presented::Serving, true),
+            client_before,
+            client_after = inputs.reported(Presented::Client, true),
             changed = inputs.differing(&current).join(", "),
             splay_secs = waited.as_secs(),
             "the TLS files read at boot have CHANGED on disk. tonic cannot swap a running \
@@ -531,6 +692,14 @@ async fn never() -> ! {
 /// bug in the logging rather than an answer.
 fn unknown() -> String {
     "unknown".to_string()
+}
+
+/// What a fingerprint reads as when this deployment holds no certificate of that
+/// kind at all. Deliberately a DIFFERENT word from [`unknown`]: the gateway
+/// serves nothing and so has no serving leaf, which is a correct deployment, and
+/// reading it as `unknown` would send somebody looking for a fault.
+fn absent() -> String {
+    "none".to_string()
 }
 
 /// SHA-256 of one file's contents.
@@ -611,8 +780,45 @@ mod tests {
         let inputs = Inputs::default().also(Path::new("/etc/yadgar/quokka-4d81/absent.pem"));
         assert_eq!(inputs.baseline(), None);
         assert_eq!(inputs.on_disk(), None);
-        assert_eq!(inputs.fingerprint(), None);
-        assert_eq!(inputs.not_after(), None);
+        assert_eq!(inputs.fingerprint(Presented::Serving), None);
+        assert_eq!(inputs.not_after(Presented::Serving), None);
+        assert_eq!(inputs.fingerprint(Presented::Client), None);
+        assert_eq!(inputs.not_after(Presented::Client), None);
+    }
+
+    /// ONE FILE, ONE ENTRY, however many times it is named.
+    ///
+    /// **The gateway presents ONE client leaf to TWO upstreams**, so `upstream`
+    /// runs twice over the same two paths. Without this the pair is hashed
+    /// twice, listed twice in the line that reports a change, and counted twice
+    /// by anything asserting membership.
+    #[test]
+    fn a_file_named_twice_is_watched_once() {
+        let path = Path::new("/etc/yadgar/quokka-4d81/client.pem");
+        let inputs = Inputs::default().also(path).also(path);
+        assert_eq!(inputs.watched(), vec![path]);
+
+        let both = Inputs::default().client_certificate(path).also(path);
+        assert_eq!(both.watched(), vec![path]);
+    }
+
+    /// A CERTIFICATE THAT DOES NOT EXIST AND ONE THAT CANNOT BE READ ARE
+    /// DIFFERENT ANSWERS, and the log line has to say which.
+    ///
+    /// The gateway serves nothing at all, so its serving half is permanently
+    /// absent — a correct deployment. Reporting that as `unknown` would send
+    /// somebody looking for a fault that is not there.
+    #[test]
+    fn an_absent_certificate_reads_differently_from_an_unreadable_one() {
+        assert_eq!(
+            Inputs::default().reported(Presented::Serving, false),
+            "none"
+        );
+
+        let configured =
+            Inputs::default().serving_certificate(Path::new("/etc/yadgar/quokka-4d81/absent.pem"));
+        assert_eq!(configured.reported(Presented::Serving, false), "unknown");
+        assert_eq!(configured.reported(Presented::Serving, true), "unknown");
     }
 
     /// AN ABSURD MAXIMUM MUST NOT PANIC OR OVERSHOOT. In nanoseconds the product
