@@ -73,10 +73,17 @@ tls:
 # would go on serving its day-0 leaf until something restarted it.
 #
 # So iam hashes the TLS files it read at boot — the serving certificate, its key,
-# the CA bundle iam-db is verified against, and the CA every enrolment token
-# carries (D73) — and when one of them changes it logs which, and the old and new
-# fingerprint, waits out this pod's splay, drains, and exits 0. Kubelet restarts
-# the container and the new process reads the fresh files.
+# the CA bundle iam-db is verified against, the client certificate and key iam
+# presents to iam-db (ADR-0516), and the CA every enrolment token carries (D73) —
+# and when one of them changes it logs which, and the old and new fingerprint,
+# waits out this pod's splay, drains, and exits 0. Kubelet restarts the container
+# and the new process reads the fresh files.
+#
+# THE CLIENT CERTIFICATE IS WHAT THIS MATTERS MOST FOR. ADR-0516 records that an
+# expired client leaf STOPS a hop rather than weakening it, so a process that
+# read it once and never again works perfectly until its expiry date and then
+# fails hard. The serving leaf degrades what callers see; this one takes the hop
+# away.
 #
 # THE ENROLMENT CA IS IN THAT SET even though it is token payload rather than a
 # transport input, and `enrolment.caSecret` below is mounted as a directory for
@@ -91,8 +98,13 @@ tls:
 #
 # THE FAILURE MODE IS THE POINT: if the watcher dies you get the old behaviour,
 # never worse. `yadgar_tls_certificate_not_after_seconds` is the other half —
-# it reports the expiry of the certificate this process actually loaded, so a
+# it reports the expiry of the certificates this process actually loaded, so a
 # watcher that stopped working is still visible as a leaf ageing out.
+#
+# ONE SERIES PER CERTIFICATE, told apart by a `kind` label carrying `serving` or
+# `client`. Two values, forever, so D67's rule against an unbounded dimension on
+# a metric label is satisfied — and a dashboard watching only the serving leaf
+# would be blind to the material that fails harder.
 #
 # THE WATCHER RUNS ON A DEFAULT INSTALL EVEN WITH `tls.enabled: false`, and that
 # is worth reading twice. The watch set holds the enrolment CA as well as the
@@ -177,6 +189,54 @@ iamDb:
     # for the Service work across every pod behind it. Set it only for a
     # certificate issued for something else, such as a per-namespace FQDN.
     domain: ""
+
+    # WHO THIS SERVICE SAYS IT IS WHEN IT DIALS iam-db — mutual TLS (ADR-0516).
+    #
+    # A THIRD DIRECTION, and it is not either of the two above. `tls` at the top
+    # of this file is what iam SERVES; `caSecret` above is how iam VERIFIES
+    # iam-db. This is what iam PRESENTS to iam-db, so iam-db can authenticate the
+    # caller rather than accepting anything that reaches the port.
+    #
+    # WHY A CERTIFICATE RATHER THAN A NetworkPolicy: ADR-0516. A NetworkPolicy is
+    # enforced by the CNI, so the same manifest protects an EKS deployment and
+    # protects nothing on kind — a control that keeps working while it stops
+    # protecting, which is D80's second and worse failure. A certificate check is
+    # enforced by the services themselves and holds identically everywhere. The
+    # NetworkPolicy still ships, as a second layer rather than as the choice.
+    #
+    # EMPTY, AND THAT IS ITS OWN LEVER. Turning `enabled` on above encrypts the
+    # hop and presents NO identity, exactly as before. Naming a Secret here is a
+    # separate change that can be reverted on its own, which is the discipline
+    # this cut-over is being done under.
+    #
+    # A DIFFERENT CERTIFICATE FROM `tls.certSecret` ABOVE, and the difference is
+    # not cosmetic. A serving leaf is issued for `server auth` and this one for
+    # `client auth`; a peer that trusts the issuer perfectly well still refuses a
+    # leaf naming the wrong purpose. One authority issues both.
+    #
+    # IT ROTATES, AND IT IS WATCHED. The mount is a DIRECTORY, never subPath, and
+    # both files join the rotation watch set described under `tlsRotation` above.
+    # That matters MORE here than for the serving certificate: ADR-0516 records
+    # that an expired client leaf STOPS this hop rather than degrading it, so a
+    # process that read the file once and never again works perfectly until the
+    # expiry date and then fails hard.
+    #
+    # THE NAME IN THE CERTIFICATE IS `iam-caller`, WHICH IS NOT A SERVICE NAME
+    # and is not meant to resolve. Nothing checks it today: iam-db's
+    # `client_ca_root` authenticates the DEPLOYMENT that issued the leaf, not
+    # which service presented it. Distinguishing callers is a later change.
+    clientCertSecret: ""
+    # The key inside that Secret holding the certificate, mounted as
+    # `client.pem`. Named rather than assumed, for the reason `caSecretKey` gives.
+    clientCertSecretKey: tls.crt
+    # The key inside that Secret holding the private key, mounted as
+    # `client-key.pem`. Named for the same reason.
+    #
+    # A PRIVATE KEY DOES ENTER THIS POD HERE, unlike the CA mounts either side of
+    # it, and that is correct: it is this pod's own key, and a certificate cannot
+    # be presented without it. Both keys are selected by name, so nothing else in
+    # the Secret travels with them.
+    clientKeySecretKey: tls.key
 
 # Mounted at /var/run/secrets/iam-keys (D72): the AES-GCM and HMAC keys iam uses
 # to encrypt personal data at rest and to compute blind indexes, held in a
