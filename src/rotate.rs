@@ -15,14 +15,23 @@
 //!
 //! # The ruling: exit on change
 //!
-//! This module polls a digest of every TLS input the process read at boot — one
+//! This module polls a digest of every file the process read at boot — one
 //! per file, so a change can be reported by NAME. The set is the serving
 //! certificate, the private key belonging to it, the CA bundle `iam-db` is
 //! verified against, the client certificate and key this service PRESENTS to
-//! `iam-db` (ADR-0516), and the CA every D73 enrolment token carries. On a
-//! change it logs which file, and the old and new leaf fingerprints, waits out a
-//! per-pod splay, and ends — and the caller selects on that, drains, and returns
-//! `Ok(())`.
+//! `iam-db` (ADR-0516), the password this service presents to the BROKER, and
+//! the CA every D73 enrolment token carries. On a change it logs which file,
+//! and the old and new leaf fingerprints, waits out a per-pod splay, and ends —
+//! and the caller selects on that, drains, and returns `Ok(())`.
+//!
+//! **THE SET IS NOT "THE TLS FILES", AND TWO OF ITS SEVEN MEMBERS SAY SO.**
+//! ADR-0523's rule is about PROVENANCE, never payload: every file the process
+//! read at boot is watched, whatever the bytes inside it are for. The enrolment
+//! CA is token payload and the broker password is not a certificate at all;
+//! both are mounted as directories precisely so they can rotate, and both are
+//! read exactly once. A rule that admitted only transport material would let
+//! each of them go stale in silence, which is the failure this whole module
+//! exists to refuse.
 //!
 //! **THE CLIENT CERTIFICATE IS THE MEMBER WITH THE WORST FAILURE.** ADR-0516
 //! records that an expired CLIENT leaf STOPS a hop rather than degrading it, so
@@ -38,6 +47,51 @@
 //! ruling exists to refuse, so it is in scope by the ruling's own test.
 //! Kubelet restarts the container and the new process reads the fresh file. **A
 //! change is not an error, so the exit code is 0.**
+//!
+//! # THE BROKER PASSWORD IS IN THAT SET, and its failure is the worst of them
+//!
+//! `boot::nats_credentials` reads `NATS_PASSWORD_FILE` once, and
+//! [`crate::invalidate::Invalidator::connect`] builds one
+//! `async_nats::ConnectOptions` from it and caches the `Client` for the life of
+//! the process. NATS authenticates per CONNECTION, at handshake time, so a
+//! rotated Secret breaks NOTHING until the next reconnect — a broker restart or
+//! a TCP blip — and then re-authentication fails carrying the password the pod
+//! booted with.
+//!
+//! **AND THEN NOTHING FAILS LOUDLY, which is worse than the failing publish this
+//! paragraph used to claim.** `async-nats` retries a refused reconnect FOR EVER
+//! by default, so the handler task never ends, `Client::publish` keeps returning
+//! `Ok(())` out of a local buffer, and the error arm in `crate::invalidate` never
+//! runs — measured against a real broker rather than reasoned about. **A revoked
+//! credential stays usable for the whole of its D72 cache TTL, at every gateway,
+//! until somebody restarts the pod.** No exit, no gauge movement, and no publish
+//! error. The only trace is the `Disconnected` and `authorization violation`
+//! warnings that `crate::invalidate`'s event callback exists to emit; this watch
+//! set is what makes the pod restart instead of sitting in that state.
+//!
+//! **Exit-on-change rather than re-authentication, and the alternative is real.**
+//! `async_nats::ConnectOptions::with_auth_callback` is invoked from
+//! `Connector::try_connect_to` on EVERY dial, internal reconnects included, so a
+//! callback that re-read the file would genuinely pick up a rotated password
+//! without a restart. It is rejected on three grounds, none of them "it cannot
+//! be done": it OVERWRITES every other auth method, so the credential path stops
+//! being the one `tests/nats_auth.rs` asserts the bytes of; it would give this
+//! one member of the set a second, different rotation behaviour, and a watch set
+//! where membership does not imply a uniform consequence is one nobody can
+//! reason about; and it fixes only the reconnect, leaving a live process holding
+//! a credential the deployment has retired with no way for an operator to tell.
+//! Restarting onto the new file is the same answer the listener certificate gets,
+//! for the same reason, and it costs the same nothing against a splay measured in
+//! minutes.
+//!
+//! **NO GAUGE, and that is not an omission.** `Inputs::export_not_after`
+//! publishes the `notAfter` of a certificate; a password has no validity period
+//! to publish, and inventing one — or reusing the `kind` label for something
+//! that is not a presented leaf — would put a number on a dashboard that means
+//! nothing. The observability a rotation of it gets is the one that matters:
+//! `Inputs::differing` names the changed file in the WARN line the exit is
+//! logged with, exactly as it does for the private key and the CA bundle, which
+//! have no gauge either.
 //!
 //! In-process hot reload was rejected and is not available anyway, for the
 //! reason above. A reloader operator was rejected because it fails silent until
@@ -81,9 +135,11 @@
 //!
 //! The enrolment CA is in the set, and the chart ships `enrolment.caSecret` with
 //! a default — so a default install serving CLEARTEXT still has a non-empty
-//! watch set and still exits on a gateway CA rotation. The set is empty only
-//! when no listener certificate, no upstream material and no enrolment CA was
-//! read. If the watcher dies, that gauge still shows the loaded leaf ageing out
+//! watch set and still exits on a gateway CA rotation. The broker password
+//! widens that further: a cleartext deployment that authenticates to a broker
+//! watches it too. The set is empty only when no listener certificate, no
+//! upstream material, no broker password and no enrolment CA was read. If the
+//! watcher dies, that gauge still shows the loaded leaf ageing out
 //! — which is what a watcher whose own failure is silent would not give
 //! anybody.
 
@@ -378,6 +434,33 @@ impl Inputs {
         }
     }
 
+    /// The password this service presents to the broker.
+    ///
+    /// **NOT a certificate, and in the set by the ruling's own test.** ADR-0523
+    /// asks where a file came from, never what is inside it: this one is read
+    /// once by `boot::nats_credentials`, mounted as a DIRECTORY by the chart for
+    /// the propagation a rotation needs, and then baked into an
+    /// `async_nats::ConnectOptions` whose `Client` lives as long as the process.
+    /// Left out, a rotated Secret costs nothing until the next reconnect and then
+    /// silently stops every D72 invalidation this service publishes — see the
+    /// section on it in this module.
+    ///
+    /// Takes the RESOLVED credential rather than a path, like every method beside
+    /// it, so what is watched is the file the process actually opened. `None` is
+    /// the deployment whose broker asks for no password: nothing was read, so
+    /// there is nothing to watch.
+    ///
+    /// It adds no gauge. `also` is the right door for it for the same reason the
+    /// private key and the CA bundle come through it — the certificate-shaped
+    /// members are the two that a `notAfter` can be read from, and this is not
+    /// one of them.
+    pub fn broker(self, credentials: Option<&crate::invalidate::Credentials>) -> Self {
+        match credentials {
+            None => self,
+            Some(c) => self.also(c.password_file()),
+        }
+    }
+
     /// The CA every D73 enrolment token carries.
     ///
     /// **NOT a transport input, and watched anyway.** The chart mounts it as a
@@ -394,9 +477,10 @@ impl Inputs {
         }
     }
 
-    /// A TLS file read at boot that is not the serving certificate: the private
-    /// key belonging to it, the CA bundle each upstream is verified against, and
-    /// the CA every enrolment token carries.
+    /// A file read at boot that is not the serving certificate: the private key
+    /// belonging to it, the CA bundle each upstream is verified against, the
+    /// password presented to the broker, and the CA every enrolment token
+    /// carries.
     pub fn also(self, path: &Path) -> Self {
         if self.is_watching(path) {
             return self;

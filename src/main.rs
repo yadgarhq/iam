@@ -188,6 +188,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // See [`yadgar_iam::boot::nats_credentials`] for the four half-configured
     // states it refuses.
     let nats_credentials = yadgar_iam::boot::nats_credentials(|key| std::env::var(key).ok())?;
+    // WATCHED, BEFORE IT IS MOVED INTO THE CLIENT. The password is a file this
+    // process read at boot, mounted as a directory so it can rotate, and baked
+    // into a `Client` cached for the life of the process — so a rotated Secret
+    // is invisible until the next reconnect fails to authenticate and every D72
+    // invalidation stops. See `rotate`'s section on the broker password.
+    tls_inputs = tls_inputs.broker(nats_credentials.as_ref());
     let invalidator = yadgar_iam::invalidate::Invalidator::connect(
         std::env::var("NATS_URL").ok().as_deref(),
         nats_credentials,

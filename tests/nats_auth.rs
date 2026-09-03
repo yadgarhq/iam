@@ -45,6 +45,11 @@ fn credentials() -> Credentials {
     Credentials {
         user: USER.to_string(),
         password: PASSWORD.to_string(),
+        // WHERE it was read from, which the rotation watch set needs and this
+        // file does not exercise: nothing here rotates anything. It is carried
+        // because a credential without its provenance cannot be watched — see
+        // `Credentials`.
+        password_file: std::path::PathBuf::from("/var/run/secrets/nats/password"),
     }
 }
 
@@ -181,6 +186,7 @@ async fn a_wrong_password_is_refused_rather_than_silently_accepted() {
     let wrong = Credentials {
         user: USER.to_string(),
         password: "not-the-password".to_string(),
+        password_file: std::path::PathBuf::from("/var/run/secrets/nats/password"),
     };
     assert!(
         !connect(addr, Some(wrong)).await.is_publishing(),

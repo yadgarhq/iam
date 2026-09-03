@@ -24,6 +24,77 @@
 //! an error because the broker was unreachable would tell the caller to retry
 //! something already done. A failed publish is logged loudly and the TTL becomes
 //! the mechanism for that one event — which is exactly the case it exists for.
+//!
+//! # A refused publish is silent, and why this module has an event callback
+//!
+//! **The `Err` arm in `Invalidator::publish` is very nearly unreachable, and
+//! everything below follows from that.** It was written as the loud half of this
+//! module. It is not: `Client::publish` returns `Err` only when its command
+//! channel closes, that channel closes only when the connection handler task
+//! ends, and that task ends only when `Connector::connect` returns `Err` — which
+//! it does for exactly one reason, `MaxReconnects`.
+//!
+//! A wrong password on the BOOT dial is genuinely loud, and it is the one case
+//! that is: the broker answers `-ERR 'Authorization Violation'`, closes the
+//! connection, and `connect` returns
+//! [`async_nats::ConnectErrorKind::AuthorizationViolation`], which the arm below
+//! reports before any client exists. Neither of the two failures that happen to
+//! a RUNNING process reaches a log by itself:
+//!
+//! - **A refused publish.** The broker leaves the connection OPEN and answers
+//!   `-ERR 'Permissions Violation for Publish to "<subject>"'` asynchronously,
+//!   while [`async_nats::Client::publish`] has already returned `Ok(())` — it
+//!   resolves when the command is queued locally, and NATS acknowledges no `PUB`.
+//! - **A wrong password on a RECONNECT**, which is what a rotated Secret
+//!   produces. `max_reconnects` defaults to `None` (`options.rs:103`) and this
+//!   module never sets it, so `Connector::connect` matches the
+//!   `AuthorizationViolation` under its `other =>` arm and RETRIES FOR EVER
+//!   (`connector.rs:249-268`). Publishes keep queueing into the 2048-slot buffer
+//!   and keep returning `Ok(())`.
+//!
+//! So an operator told to grep for `invalidation NOT published` finds nothing in
+//! either case. **This callback is what surfaces both** — the ERROR below for a
+//! refusal, and a `Disconnected` warning followed by an `authorization violation`
+//! `ClientError` on every retry for a stale password. The rotation watch set in
+//! `crate::rotate` is what ends the second state; this is what makes it visible
+//! while it lasts.
+//!
+//! That gap was latent until it was not. This account published on `>` until
+//! `deploy#18` scoped it to publish-only on the two subjects above, and nothing
+//! that cannot be refused can be refused silently. Now one typo in the broker's
+//! `publish.allow` list produces an `iam` that logs "publishing cache
+//! invalidation" at INFO, reports success on every revocation, and invalidates
+//! nothing — for ever. **Every revoked credential then stays usable at every
+//! gateway for the whole of its D72 cache TTL**, which is precisely the state
+//! this module exists to prevent.
+//!
+//! `on_event` closes it. The `-ERR` arrives as an
+//! [`async_nats::Event::ServerError`]. `gateway` registered a callback for the
+//! SUBSCRIBE side of the same problem and this is its twin.
+//!
+//! **THE DISCRIMINATOR IS THE SUBJECT, never the wording.** A real
+//! `nats-server` says `Permissions Violation for Publish to "<subject>"` on this
+//! side and `... for Subscription to ...` on the gateway's, and neither phrase
+//! is a stable interface. `on_event` matches on the SUBJECT names this crate
+//! owns, which are, so a server that rewords its `-ERR` changes nothing here.
+//!
+//! **WHAT `async-nats` 0.50 PRINTS BY ITSELF, precisely, because `gateway`'s
+//! comment gets this wrong and the difference decides whether a callback is
+//! worth having.** It logs the frame twice: once at `debug!` in the connection
+//! handler, and once at `info!` for every event it dispatches (`lib.rs:1105`).
+//! So the claim "it vanishes below the level these pods run at" is not true
+//! here — the broker's words DO reach an `info` log. What does not reach it is
+//! anything an operator can act on: the line is a bare `event: server error:
+//! ...` at the same level as the ordinary connection chatter around it, with no
+//! statement that invalidation has stopped and no remedy. This callback supplies
+//! the level that makes it findable and the sentence that says what to fix.
+//!
+//! **IT LOGS AND DOES NOTHING ELSE, and that is the difference from `gateway`'s.**
+//! The gateway's callback drives a channel, because a forbidden subscription must
+//! END the subscription it holds and be redialled. There is no such object here:
+//! a publish is fire-and-forget, so there is nothing to tear down and nothing a
+//! later publish could usefully consult. A flag no code reads would be a second
+//! mechanism dressed as one.
 
 /// Subjects, namespaced so a wildcard subscription is possible later.
 pub mod subject {
@@ -59,10 +130,37 @@ pub mod subject {
 /// `Debug` is written by hand rather than derived. A derived one would print the
 /// password into any log line, panic message or test failure that formatted the
 /// struct, which is how a credential ends up in a place nobody meant to put it.
+///
+/// **THE PATH IS KEPT BESIDE THE VALUE, and it is not decoration.** ADR-0523's
+/// rule is that every file the process read at boot is watched, and the file
+/// this password came from is one — mounted as a DIRECTORY by the chart
+/// precisely so it can rotate. `crate::rotate::Inputs` is built from the
+/// configuration that was already resolved and NEVER by reading the environment
+/// a second time, because a second reading could name a different file from the
+/// one actually opened. So the resolved credential has to carry its own
+/// provenance, or the watch set cannot include it without breaking that rule.
+///
+/// A path is not a secret — the chart puts it in `NATS_PASSWORD_FILE`, which is
+/// visible in `kubectl describe pod` — so it is printed by `Debug` while the
+/// password stays redacted. That is the same split D80 draws everywhere: the
+/// location travels, the value does not.
 #[derive(Clone)]
 pub struct Credentials {
     pub user: String,
     pub password: String,
+    /// The file the password was read from, for the rotation watch set.
+    pub password_file: std::path::PathBuf,
+}
+
+impl Credentials {
+    /// The file this password was read from.
+    ///
+    /// The accessor `crate::rotate::Inputs::broker` reads, so the watch set is
+    /// built the same way as every other member: from the resolved
+    /// configuration, through a method on it.
+    pub fn password_file(&self) -> &std::path::Path {
+        &self.password_file
+    }
 }
 
 impl std::fmt::Debug for Credentials {
@@ -70,6 +168,7 @@ impl std::fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .field("password_file", &self.password_file)
             .finish()
     }
 }
@@ -140,6 +239,11 @@ impl Invalidator {
             ),
             None => async_nats::ConnectOptions::new(),
         };
+        // WITHOUT THIS THE WORST FAILURE IN THIS MODULE IS INVISIBLE. See the
+        // module comment: a refused PUBLISH leaves the connection open, is
+        // answered asynchronously after `publish` has already returned `Ok`, and
+        // is logged by `async-nats` itself at `debug!`.
+        let options = options.event_callback(|event| async move { on_event(event) });
         match options.connect(url).await {
             Ok(client) => {
                 tracing::info!(
@@ -246,6 +350,54 @@ impl Invalidator {
     }
 }
 
+/// Everything the broker says about a connection after it is established.
+///
+/// **`async-nats` logs these at `debug!` and these pods run at `info`**, so
+/// without this function they do not exist. The one that matters is
+/// [`async_nats::Event::ServerError`]: a publish permission violation arrives
+/// there, leaves the connection open, and is otherwise indistinguishable from a
+/// service whose invalidations are all landing.
+fn on_event(event: async_nats::Event) {
+    match event {
+        async_nats::Event::ServerError(e) => {
+            let error = e.to_string();
+            // NAMED SUBJECTS ONLY. A `-ERR` about anything else is still worth an
+            // operator's attention and still logged at ERROR, but it is not a
+            // statement that THIS service's invalidations are being dropped, and
+            // a remedy naming the publish allow-list would send somebody to the
+            // wrong file.
+            if error.contains(subject::CREDENTIAL_REVOKED) || error.contains(subject::TEAMS_CHANGED)
+            {
+                tracing::error!(
+                    error,
+                    "the broker REFUSED this service's publish, so NO invalidation is \
+                     delivered and a revoked credential is honoured until its cache entry \
+                     expires (D72). The connection stays OPEN, `publish` returned Ok, and \
+                     nothing else reports this. It is a deployment error rather than an \
+                     outage: check the publish permissions for this account against {} and \
+                     {}.",
+                    subject::CREDENTIAL_REVOKED,
+                    subject::TEAMS_CHANGED
+                );
+            } else {
+                tracing::error!(error, "the broker reported an error on this connection");
+            }
+        }
+        // LOUD, because the window it opens is the one this module exists to
+        // close: nothing published while it is open is delivered, and no caller
+        // is told. `async-nats` reconnects underneath this, so the `Connected`
+        // below is the end of the window.
+        async_nats::Event::Disconnected => tracing::warn!(
+            "disconnected from the broker; no invalidation is being published until it reconnects"
+        ),
+        async_nats::Event::Connected => tracing::info!("connected to the broker"),
+        async_nats::Event::ClientError(e) => {
+            tracing::warn!(error = %e, "the broker connection reported a client error");
+        }
+        other => tracing::info!(event = %other, "broker event"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +429,7 @@ mod tests {
         let c = Credentials {
             user: "iam".into(),
             password: "sentinel-of-the-nats-password".into(),
+            password_file: "/var/run/secrets/nats/password".into(),
         };
         let printed = format!("{c:?}");
         assert!(
