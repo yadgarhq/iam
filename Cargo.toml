@@ -44,7 +44,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 # because `serve` decodes a certificate and a key of its own.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.0" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.2" }
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a
 # correction is a new tag — and Cargo.lock records the revision it resolved to,
 # so the pin is as exact as the revision it replaces.
