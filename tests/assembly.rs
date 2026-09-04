@@ -39,7 +39,7 @@ use rcgen::{
 };
 
 use yadgar_iam::invalidate::Credentials;
-use yadgar_iam::rotate::{self, Presented, CERTIFICATE_NOT_AFTER};
+use yadgar_iam::rotate::{self, Presented, CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE};
 use yadgar_iam::serve::{self, ServerTls};
 use yadgar_iam::service::EnrolmentConfig;
 use yadgar_iam::upstream::{self, UpstreamTls};
@@ -455,6 +455,95 @@ fn the_gauge_names_this_service_and_each_certificate_it_holds() {
         "each gauge carries the expiry of the leaf it names, and the two are not \
          interchangeable: an expired CLIENT leaf STOPS this hop (ADR-0516)"
     );
+}
+
+/// THE UNREADABLE-FILES GAUGE COUNTS EVERY WATCHED FILE, NOT ONLY THE
+/// CERTIFICATES, AND A ZERO IS ONE OF ITS VALUES.
+///
+/// `yadgar-lifecycle` v0.1.2 added `yadgar_rotation_watched_files_unreadable`
+/// and the crate tests what it counts. What only this repository can say is that
+/// the series a dashboard would select — this service's name, on this service's
+/// own watch set — is the one that arrives, and that it arrives when NOTHING is
+/// wrong. A gauge appearing only on the bad day cannot be told apart from an
+/// exporter that is not running.
+///
+/// **THE FILE REMOVED HERE IS THE BROKER PASSWORD, DELIBERATELY.** The case
+/// above asserts that a password publishes no EXPIRY, because it has none. This
+/// one asserts the other half: it is still a watched file, so it still counts
+/// here — and the worst failure in this service's watch set is the one a
+/// certificate gauge can never speak for.
+///
+/// **NOTHING IS REGISTERED FOR IT AT THE SERVICE END, and this is the check that
+/// says so rather than an assumption.** `yadgar_telemetry::metrics::install_prometheus`
+/// installs `PrometheusBuilder::new()` with no allow-list and no idle timeout,
+/// and `metrics-exporter-prometheus`'s `render` walks the gauge snapshot and
+/// consults `descriptions` only for the `# HELP` line — so an undescribed gauge
+/// renders, and no `describe_gauge!` call is needed here.
+///
+/// A plain `#[test]`, for the reason the case above gives.
+#[test]
+fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
+    let mount = Mount::new(&generation("iam"));
+    let inputs = rotate::watch_set(
+        Some(&listener_tls(&mount)),
+        Some(&upstream_tls(&mount)),
+        Some(&broker_credentials(&mount)),
+        Some(&enrolment_config(&mount)),
+    );
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter: Snapshotter = recorder.snapshotter();
+    let gone = mount.path("nats-password");
+
+    let (nothing_wrong, at_zero, one_gone, at_one) =
+        metrics::with_local_recorder(&recorder, || {
+            let nothing_wrong = inputs.export_unreadable();
+            let at_zero = snapshotter.snapshot().into_vec();
+            std::fs::remove_file(&gone).expect("the mount is this test's own");
+            let one_gone = inputs.export_unreadable();
+            let at_one = snapshotter.snapshot().into_vec();
+            (nothing_wrong, at_zero, one_gone, at_one)
+        });
+
+    assert!(
+        nothing_wrong.is_empty(),
+        "every one of the seven files this mount names is readable: {nothing_wrong:?}"
+    );
+    assert_eq!(
+        one_gone,
+        vec![gone.display().to_string()],
+        "the broker password was removed, so it is the one unreadable file and the \
+         six beside it are not"
+    );
+
+    for (emitted, expected) in [(at_zero, 0.0_f64), (at_one, 1.0_f64)] {
+        // A metrics-util built against another `metrics` major links a SECOND
+        // facade: everything compiles, nothing is captured, and the assertions
+        // below would pass vacuously against an empty snapshot.
+        assert_eq!(
+            emitted.len(),
+            1,
+            "one series for the whole watch set, labelled by service and by nothing \
+             per-path — check for a duplicate `metrics` crate"
+        );
+        let (composite, _unit, _description, value) = &emitted[0];
+        let key = composite.key();
+        assert_eq!(key.name(), WATCHED_FILES_UNREADABLE);
+        let labels: Vec<(String, String)> = key
+            .labels()
+            .map(|l| (l.key().to_string(), l.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![("service".to_string(), "iam".to_string())],
+            "a path label would make this metric's cardinality a property of a \
+             deployment's configuration"
+        );
+        match value {
+            DebugValue::Gauge(count) => assert_eq!(count.into_inner(), expected),
+            other => panic!("expected a gauge, got {other:?}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
