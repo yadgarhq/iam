@@ -163,13 +163,43 @@ replicas client-side yet, the same gap `gateway`'s `upstream.rs` documents for
 
 ## It does not wait for `iam-db` to be ready — but it does wait for its keys
 
-The twin gates its own boot — probe, migrate, then listen (D69) — so an `iam-db`
-that is not ready has no endpoint behind the headless Service and
-`balance::connect` fails loudly. Blocking this service's startup on that would
-turn one module's slow migration into a cascading outage, and under D68 a pod
-stuck in startup is one the autoscaler cannot help. A request that cannot reach
-the store fails with `UNAVAILABLE`, which is recoverable; refusing to start is
-not.
+This heading was **false until `yadgar-dial` v0.2.0**, which is worth writing
+down rather than quietly correcting. The twin gates its own boot — probe,
+migrate, then listen (D69) — so an `iam-db` that is not ready has no endpoint
+behind the headless Service; `yadgar_dial::connect` returned
+`BalanceError::Dns` for that — CoreDNS answers NXDOMAIN for a headless Service
+with no ready endpoint, and the resolver's error was propagated before the
+empty-answer branch was ever reached — and `main` propagated it with `?`. This service therefore DID wait for
+`iam-db`, by exiting. ADR-0532 made the boot dial lazy: the name is seeded into
+the balancer and dialled until an address answers, so `connect` returns a channel
+and the failure moves to the request.
+
+Blocking this service's startup on the twin would turn one module's slow
+migration into a cascading outage, and under D68 a pod stuck in startup is one
+the autoscaler cannot help. A request that cannot reach the store fails with
+`UNAVAILABLE`, which is recoverable; refusing to start is not.
+
+**What it costs now that it is real, said plainly.** The readiness probe is a
+`tcpSocket` on the gRPC port, so this pod is Ready as soon as it is listening —
+and with `iam-db` absent it is Ready and answers `UNAVAILABLE` to everything
+touching a credential or an encrypted personal-data field. The probe is
+deliberately not changed to gate on the upstream, and the reason is D69's own
+scope rather than a preference: D69's boot-failure rule is about a capability of
+an engine the module OWNS, which is why the sequence it names is probe, migrate,
+then listen and why `iam-db` is where that sequence lives. This service owns no
+engine of its own to probe, so the only thing it could gate on is an RPC asking
+`iam-db` whether `iam-db` is up — inference by proxy, which D69's first rule
+refuses by name. The discriminator that generalises is whether a restart could
+change the outcome: a permanent gap (an unusable CA bundle, a missing client
+certificate, absent crypto keys) still fails boot, and a transient absence dials
+lazily.
+
+`yadgar-dial`'s re-resolution loop logs at ERROR on every tick while a host has
+NEVER resolved, distinctly from the warning a blip gets. **That line reaches
+`kubectl logs` and nothing else today** — `dial` exports no metric for the
+never-resolved state, this chart ships no `PrometheusRule`, and nothing ships
+logs off the node — so the signal exists and is not yet alertable. That is the
+part of the crash loop this change genuinely removes.
 
 The crypto keys are the opposite case, deliberately: their absence fails boot.
 A service that started without them would pass its readiness probe and then

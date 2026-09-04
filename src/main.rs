@@ -1,13 +1,52 @@
 //! Wiring, and one decision worth naming: this service does NOT wait for
 //! `iam-db` to be reachable before reporting ready.
 //!
-//! The twin's own boot is gated — probe, migrate, then listen (D69) — so a
-//! `-db` that is not ready has no DNS endpoint behind the headless Service, and
-//! `yadgar_dial::connect` fails loudly. Blocking this service's startup on that would
-//! turn one module's slow migration into a cascading outage across everything
-//! that depends on it, and under D68 a pod stuck in startup is one the autoscaler
-//! cannot help. Failing a request with UNAVAILABLE is recoverable; refusing to
-//! start is not.
+//! **THAT SENTENCE WAS FALSE UNTIL `dial` v0.2.0, and the pin move is what made
+//! it true.** The twin's own boot is gated — probe, migrate, then listen (D69) —
+//! so a `-db` that is not ready has no DNS endpoint behind the headless Service;
+//! `yadgar_dial::connect` returned `BalanceError::Dns` for that — CoreDNS
+//! answers NXDOMAIN for a headless Service with no ready endpoint, and
+//! `connect_with` propagated the resolver's error before it ever reached the
+//! empty-answer branch — and the `?` on the dial below turned it into a failed
+//! boot. So the cascading outage this
+//! paragraph exists to reject is exactly what a `iam-db` that had not finished
+//! migrating produced. ADR-0532 made the boot dial lazy: the name is seeded into
+//! the balancer and dialled until an address answers, `connect` returns a
+//! channel, and the failure moves to the request — which is what the rest of
+//! this paragraph always assumed. Blocking this service's startup on the twin
+//! would turn one module's slow migration into a cascading outage across
+//! everything that depends on it, and under D68 a pod stuck in startup is one
+//! the autoscaler cannot help. Failing a request with UNAVAILABLE is
+//! recoverable; refusing to start is not.
+//!
+//! **WHAT IT COSTS, stated rather than left to be found.** The readiness probe
+//! is a `tcpSocket` on the gRPC port, so this pod reports Ready as soon as it is
+//! listening. With `iam-db` absent that is a pod that is Ready and answers
+//! UNAVAILABLE to everything touching a credential or an encrypted
+//! personal-data field — which is every RPC this service serves, so the cost of
+//! the ruling above is total here too. The probe is deliberately NOT changed to
+//! gate on the upstream, and the reason is D69's own scope rather than a
+//! preference. **D69's boot-failure rule is about a capability of an engine the
+//! module OWNS** — it is why the sequence it names is probe, migrate, then
+//! listen, and why the twin is where that sequence lives. This service owns no
+//! engine and has nothing to migrate, so the only thing it COULD gate on is an
+//! RPC asking the twin whether the twin is up. That is inference by proxy, which
+//! D69's first rule refuses by name, and a readiness built on it is the cascade
+//! this paragraph rejects, moved one layer up.
+//!
+//! **The discriminator that generalises is whether a RESTART could change the
+//! outcome.** A CA bundle that is unreadable, a client certificate that is not
+//! mounted, a host that is not a URI authority: a permanent gap, identical after
+//! a restart, so fail boot. An upstream that has not appeared yet: transient,
+//! and a restart only costs backoff, so dial lazily and fail the request.
+//!
+//! What makes the absent state visible instead is `yadgar_dial`'s refresh loop,
+//! which logs at ERROR on every tick while a host has NEVER resolved —
+//! distinctly from the warning a blip gets. **That line reaches `kubectl logs`
+//! and nothing else today**: `dial` exports no metric for the never-resolved
+//! state, no chart here ships a `PrometheusRule`, and nothing shipping logs off
+//! the node. So the signal exists and is not yet alertable, which is the part of
+//! the crash loop this change genuinely removes.
 //!
 //! The crypto keys are a different story: they are NOT optional and their
 //! absence DOES block startup. A service that started without them would boot
