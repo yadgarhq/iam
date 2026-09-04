@@ -79,12 +79,14 @@
 //! which is why [`yadgar_iam::rotate`] watches the files this function opened
 //! and ends the serve when they change. That is the only mechanism by which
 //! this process ever picks up a renewed certificate — and it works only because
-//! [`yadgar_iam::serve::shutdown`] hears the signal Kubernetes actually sends.
+//! [`yadgar_lifecycle::shutdown`] hears the signal Kubernetes actually sends.
 //! This binary listened for SIGINT alone, which kubelet never sends, so the
 //! drain was reached on no rollout at all.
 
 use std::net::SocketAddr;
 use std::time::Duration;
+
+use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
@@ -131,15 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
     let mut server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
 
-    // THE WATCH SET IS BUILT AS EACH FILE IS READ, NOT AT THE END. Every method
-    // on `Inputs` hashes its file immediately, so the baseline is taken beside
-    // the code that loaded it. Collecting the paths here and reading them once
-    // the watcher first polls would put the whole of the rest of boot inside a
-    // window where a kubelet swap makes the NEW file the baseline — the real
-    // rotation then goes unnoticed for ever, and the gauge describes a
-    // certificate this listener is not serving.
-    let mut tls_inputs = rotate::Inputs::default().listener(listen_tls.as_ref());
-
     // Fails boot loudly if the keys are absent or unreadable — deliberately
     // before the listener binds. See the module doc above for why this one
     // dependency is NOT allowed to degrade gracefully the way iam-db is.
@@ -174,9 +167,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "connected to iam-db"
     );
 
-    // The CA bundle the dial above just read, hashed now for the same reason.
-    tls_inputs = tls_inputs.upstream(db_tls.as_ref());
-
     // How often those files are re-hashed, and how long THIS pod waits before
     // acting on a change. The splay is what stops both replicas exiting inside
     // the same kubelet sync window — a PDB constrains eviction and does not
@@ -197,12 +187,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
-
-    // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
-    // recorder is a value nobody ever sees. This is the half of the rotation
-    // work that makes a failure LOUD — if the watcher below dies, this gauge
-    // still shows the loaded leaf ageing out.
-    tls_inputs.export_not_after();
 
     // The broker, for D72's cache invalidation. Does NOT gate startup: a broker
     // outage must not become an authentication outage, and the TTL is the
@@ -227,12 +211,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // See [`yadgar_iam::boot::nats_credentials`] for the four half-configured
     // states it refuses.
     let nats_credentials = yadgar_iam::boot::nats_credentials(|key| std::env::var(key).ok())?;
-    // WATCHED, BEFORE IT IS MOVED INTO THE CLIENT. The password is a file this
-    // process read at boot, mounted as a directory so it can rotate, and baked
-    // into a `Client` cached for the life of the process — so a rotated Secret
-    // is invisible until the next reconnect fails to authenticate and every D72
-    // invalidation stops. See `rotate`'s section on the broker password.
-    tls_inputs = tls_inputs.broker(nats_credentials.as_ref());
+    // WARNS AND DEGRADES ONE RPC. It does NOT fail boot, and the difference
+    // matters more here than anywhere else in this file: `iam` is the
+    // authentication plane. A CrashLoopBackOff would stop `Login` at once and
+    // every dependent service's credential resolution as soon as the gateway's
+    // 300s cache expired — an estate-wide outage caused by a value that belongs
+    // to ONE administrative RPC.
+    //
+    // The contract's rule is about the TOKEN — never mint one carrying an empty
+    // gateway — and `IssueEnrolment` keeps it whole by refusing with
+    // FAILED_PRECONDITION. That is loud to the operator who calls it, and this
+    // warning is loud to the operator who deploys it; between them nothing is
+    // silent, and nothing else stops working.
+    //
+    // Contrast the crypto keys above, which DO fail boot: without them every
+    // request touching a credential fails, so there is no reduced service left
+    // to protect. Here there is.
+    let enrolment = match EnrolmentConfig::from_env() {
+        Ok(config) => {
+            tracing::info!("enrolment tokens carry this deployment's gateway and CA (D73)");
+            Some(config)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "IssueEnrolment is UNAVAILABLE on this deployment and will refuse \
+                 with FAILED_PRECONDITION; everything else, ResolveCredential and \
+                 Login included, is unaffected. Set ENROLMENT_GATEWAY to enable it."
+            );
+            None
+        }
+    };
+
+    // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION IN ONE PLACE AND
+    // BEFORE ANYTHING IT NAMES IS MOVED AWAY (ADR-0523). Every entry is hashed
+    // as `watch_set` folds it, and the fold happens INSIDE boot: deferring the
+    // first reading to the watcher's first poll would put the rest of boot
+    // inside a window where a kubelet swap quietly becomes the baseline, and the
+    // real rotation would never be noticed.
+    //
+    // FOUR MATERIALS, TWO OF WHICH ARE NOT TRANSPORT. The broker password is a
+    // file this process read at boot, mounted as a directory so it can rotate
+    // and about to be baked into a `Client` cached for the life of the process;
+    // the enrolment CA is token payload the chart mounts the same way. ADR-0523's
+    // rule is about provenance rather than payload, so both are watched exactly
+    // as the certificates are.
+    //
+    // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be four builder calls
+    // scattered across this function, up to a hundred and fifty lines apart,
+    // where nothing could reach them: no test spawns this binary, so deleting any
+    // one of them compiled and passed everything. The list lives in
+    // `rotate::watch_set` now and `tests/assembly.rs` calls it.
+    let tls_inputs = rotate::watch_set(
+        listen_tls.as_ref(),
+        db_tls.as_ref(),
+        nats_credentials.as_ref(),
+        enrolment.as_ref(),
+    );
+
+    // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
+    // recorder is a value nobody ever sees. This is the half of the rotation work
+    // that makes a failure LOUD — if the watcher below dies, this gauge still
+    // shows the loaded leaf ageing out.
+    tls_inputs.export_not_after();
+
     let invalidator = yadgar_iam::invalidate::Invalidator::connect(
         std::env::var("NATS_URL").ok().as_deref(),
         nats_credentials,
@@ -266,55 +308,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Login and RedeemEnrolment answer no sooner than their response-time floors"
     );
 
-    // WARNS AND DEGRADES ONE RPC. It does NOT fail boot, and the difference
-    // matters more here than anywhere else in this file: `iam` is the
-    // authentication plane. A CrashLoopBackOff would stop `Login` at once and
-    // every dependent service's credential resolution as soon as the gateway's
-    // 300s cache expired — an estate-wide outage caused by a value that belongs
-    // to ONE administrative RPC.
-    //
-    // The contract's rule is about the TOKEN — never mint one carrying an empty
-    // gateway — and `IssueEnrolment` keeps it whole by refusing with
-    // FAILED_PRECONDITION. That is loud to the operator who calls it, and this
-    // warning is loud to the operator who deploys it; between them nothing is
-    // silent, and nothing else stops working.
-    //
-    // Contrast the crypto keys above, which DO fail boot: without them every
-    // request touching a credential fails, so there is no reduced service left
-    // to protect. Here there is.
-    let enrolment = match EnrolmentConfig::from_env() {
-        Ok(config) => {
-            // WATCHED TOO, and it is not a transport input. The CA every D73
-            // enrolment token carries is read once from a file the chart mounts
-            // as a DIRECTORY — mounted that way precisely so that a rotation
-            // propagates into the pod. Left unwatched, a gateway CA rotation
-            // leaves this process minting tokens carrying a CA that no longer
-            // signs anything: no exit, no gauge movement, no log. That is the
-            // silently-stale material the exit-on-change ruling exists to
-            // refuse, so the ruling's own test puts it in scope.
-            tls_inputs = tls_inputs.enrolment(Some(&config));
-            tracing::info!("enrolment tokens carry this deployment's gateway and CA (D73)");
-            Some(config)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "IssueEnrolment is UNAVAILABLE on this deployment and will refuse \
-                 with FAILED_PRECONDITION; everything else, ResolveCredential and \
-                 Login included, is unaffected. Set ENROLMENT_GATEWAY to enable it."
-            );
-            None
-        }
-    };
-
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
 
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
-    // than an accident of where the line sits. `serve::shutdown` installs both
-    // signal handlers when it is CALLED — a SIGTERM arriving between here and
+    // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
+    // installs both signal handlers when it is CALLED — a SIGTERM arriving between here and
     // the first poll of the future would otherwise take the process's default
     // disposition and kill it outright.
-    let signals = serve::shutdown().map_err(|e| {
+    let signals = shutdown().map_err(|e| {
         format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
     })?;
     // `tls` is recorded because "is this listener encrypted?" must be answerable
@@ -326,16 +327,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watching = tls_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
-        drain_budget_secs = serve::DRAIN_BUDGET.as_secs(),
+        drain_budget_secs = DRAIN_BUDGET.as_secs(),
         "iam listening"
     );
 
     // THE SERVER IS SPAWNED WITH A ONESHOT AS ITS SHUTDOWN FUTURE, and the wait
-    // happens OUTSIDE it. `serve::drain_within` starts the budget's clock when
+    // happens OUTSIDE it. `drain_within` starts the budget's clock when
     // shutdown is REQUESTED; a `timeout` wrapped round the serving future itself
     // would fix its deadline at boot and end the process 25 seconds later on
     // every boot, having asked nothing to stop. That defect shipped on this
-    // branch — see `tests/drain.rs`.
+    // branch, and `yadgar-lifecycle`'s own `tests/drain.rs` is what keeps it
+    // dead.
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
     let serving = tokio::spawn(
         server
@@ -370,12 +372,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    match serve::drain_within(serving, ask_to_stop, stop, serve::DRAIN_BUDGET).await {
-        serve::Drain::Finished(result) => result?,
+    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
+        Drain::Finished(result) => result?,
         // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
         // an error in the log, not a CrashLoopBackOff on top of it.
-        serve::Drain::Overran => tracing::error!(
-            budget_secs = serve::DRAIN_BUDGET.as_secs(),
+        Drain::Overran => tracing::error!(
+            budget_secs = DRAIN_BUDGET.as_secs(),
             "the drain did not finish within its budget; ending anyway with calls still in \
              flight. A request blocked this long is the thing to look at"
         ),

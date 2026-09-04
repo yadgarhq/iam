@@ -155,7 +155,7 @@ pub struct Credentials {
 impl Credentials {
     /// The file this password was read from.
     ///
-    /// The accessor `crate::rotate::Inputs::broker` reads, so the watch set is
+    /// The accessor `Credentials`'s `Material` implementation reads, so the set is
     /// built the same way as every other member: from the resolved
     /// configuration, through a method on it.
     pub fn password_file(&self) -> &std::path::Path {
