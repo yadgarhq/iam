@@ -36,21 +36,15 @@ tonic-prost = "0.14"
 # WHICH of the two files an operator has to fix. It is the same reasoning, and
 # the same crate, that `yadgar_dial::TlsOptions::prepare` uses on a CA bundle.
 rustls-pki-types = { version = "1", features = ["std"] }
-# READ-ONLY, and for ONE FIELD: the `notAfter` of the certificate this process
-# actually loaded, which `rotate` publishes as a gauge (D67). Nothing here
-# verifies anything — rustls does all the verification there is — so this parses
-# a certificate that has already been accepted rather than deciding whether to
-# accept one. `rustls-pki-types` decodes PEM to DER and stops there; no crate
-# already in this tree exposes a validity period.
+# How this process starts, stops and restarts: ADR-0523's exit-on-change rotation
+# watcher, the SIGTERM drain, and the budget that bounds it. This repository held
+# the ORIGINAL of the watcher and `task` and `gateway` each carried a copy; the
+# X.509 parser that read a leaf's `notAfter` and the metrics facade that gauges it
+# are ITS dependencies now, so both are gone from here. `rustls-pki-types` stays,
+# because `serve` decodes a certificate and a key of its own.
 #
-# Pure Rust over `ring`, which `tls-ring` above already pulls in, so the musl
-# target (D63) is unaffected.
-x509-parser = "0.18"
-# THE FACADE ONLY, and the SAME major `yadgar-telemetry` links — a second
-# `metrics` in the tree is a second global recorder, and then the gauge silently
-# never appears while everything still compiles and passes. The exporter is
-# installed by this binary and by nothing else; see `main`.
-metrics = "0.24"
+# Pinned by a published tag per ADR-0526, like every other in-org crate.
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.0" }
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a
 # correction is a new tag — and Cargo.lock records the revision it resolved to,
 # so the pin is as exact as the revision it replaces.
@@ -132,6 +126,11 @@ tokio = { version = "1", features = [
 # the repository is a secret in the repository, and it expires on a date nobody
 # is watching.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# `with_local_recorder`, beside `metrics-util`'s `DebuggingRecorder`. The FACADE
+# only, and a dev-dependency now — the binary installs the exporter and
+# `yadgar-lifecycle` owns the gauge; what `tests/assembly.rs` asserts is the
+# `service` label a dashboard selects THIS service on.
+metrics = "0.24"
 # `DebuggingRecorder` + `with_local_recorder`: the only way to assert that the
 # metric NAME a dashboard queries, and the LABEL it carries, are what this crate
 # claims — a typo in either compiles, passes clippy, and produces a series

@@ -275,33 +275,43 @@ quietly becomes the baseline, and the real rotation is never noticed.
 **The drain is bounded.** Nothing outside the process ends a drain the process
 started: `terminationGracePeriodSeconds` never runs for a self-exit, and tokio
 keeps its signal handler installed after the rotation arm wins, so a later
-SIGTERM is swallowed rather than fatal. `serve::DRAIN_BUDGET` is 25s against the
-default 30s grace period; on expiry the process logs an error and ends anyway.
+SIGTERM is swallowed rather than fatal. `yadgar_lifecycle::DRAIN_BUDGET` is 25s
+against the default 30s grace period; on expiry the process logs an error and
+ends anyway. The budget must also outlast the slowest legitimate call, and
+`DEFAULT_REDEEM_RESPONSE_FLOOR` is the estate's only real lower bound for that —
+so the test comparing the two lives in this repository, where both numbers are.
 
 **The budget's clock starts when shutdown is REQUESTED, not when the server
-starts**, which is why `serve::drain_within` takes an already-spawned server and
-the sender that asks it to stop. Wrapping the serving future in
+starts**, which is why `yadgar_lifecycle::drain_within` takes an already-spawned
+server and the sender that asks it to stop. Wrapping the serving future in
 `tokio::time::timeout` instead bounds the server's whole life, and ends the
 process one budget after boot on every boot, with nothing having asked it to
-stop. That defect shipped on this branch and passed 123 tests; `tests/drain.rs`
-keeps it dead.
+stop. That defect shipped on this branch and passed 123 tests; the crate's
+`tests/drain.rs` keeps it dead.
 
 **That drain had to be fixed first.** `main` registered `tokio::signal::ctrl_c`
 alone, which is SIGINT — a signal Kubernetes never sends. It sends SIGTERM, waits
 out `terminationGracePeriodSeconds`, then SIGKILLs, so the drain was reached on
 no rollout at all and whatever was in flight died with the process.
-`serve::shutdown` now hears both, armed before the server is spawned so a signal
-arriving in that window cannot take SIGTERM's default disposition.
-`tests/shutdown.rs` sends a real SIGTERM to the test process and asserts the
-server RETURNED and released its port — a killed process reaches neither
-assertion. `task` fixed this first and the spelling here is a copy of its
-`serve::shutdown`; `iam-db` and `gateway` still need the same one.
+`yadgar_lifecycle::shutdown` now hears both, armed before the server is spawned
+so a signal arriving in that window cannot take SIGTERM's default disposition.
+
+**That last property is asserted by no test in this estate, and saying so is
+better than the sentence this replaces.** The crate's `tests/shutdown.rs` sends a
+real SIGTERM to the test process and proves the server RETURNED and released its
+port — which a killed process could not do — so the DRAIN is covered. The ARMING
+WINDOW is not: every rig waits for the port to accept before raising the signal,
+and a port that accepts belongs to a task the executor has already polled, so a
+mutant that armed the handlers lazily inside the returned future survives. The
+missing rig has to raise SIGTERM before the serving task is first polled, and it
+belongs in the crate once rather than in each adopter.
 
 **A hash, never a modification time.** Kubelet rotates a mounted Secret by
 renaming a new `..data` symlink over the old one, so every path resolves to a new
 inode with a fresh mtime on every resync, changed or not. An mtime check would
-restart both replicas for nothing. `tests/tls_rotation.rs` performs that exact
-swap, including the case where the new generation holds identical bytes.
+restart both replicas for nothing. `yadgar-lifecycle`'s `tests/rotation.rs`
+performs that exact swap, including the case where the new generation holds
+identical bytes.
 
 **The splay is the only thing separating the replicas.** They see the refreshed
 file inside the same kubelet sync window, and a PodDisruptionBudget constrains
