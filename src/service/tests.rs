@@ -3183,3 +3183,276 @@ fn the_outcome_of_a_name_refusal_is_one_the_shared_mapping_produces() {
          got {outcomes:?}, and UNRECORDED is what a missing call.fail looks like"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The rest of the bounded-column class: identifiers and idempotency keys.
+//
+// `MAX_LABEL_CHARS` and `MAX_ENCRYPTED_FIELD_BYTES` closed two instances of one
+// class — a caller-supplied string landing in a bounded column with nothing in
+// `iam` bounding it. The sweep behind these tests is written out on
+// `super::MAX_IDEMPOTENCY_KEY_CHARS` and `super::MAX_ENTITY_ID_CHARS`; what is
+// pinned here is both sides of each bound, in the column's own unit.
+// ---------------------------------------------------------------------------
+
+/// Drive `RedeemEnrolment` with `key`, on a twin that would redeem the secret.
+///
+/// The witness is `Recorded::redeem_enrolment`: the store answers `Ok` to
+/// everything, so an EMPTY vector is the only thing that says the refusal landed
+/// before the secret was spent rather than after.
+async fn redeem_with_key(key: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        redeem: redeemed("ada"),
+        password: known_user("chosen one"),
+        ..Default::default()
+    })
+    .await;
+    let answered = iam
+        .redeem_enrolment(redeem("s3cret", "chosen one", key))
+        .await
+        .map(|_| ());
+    (answered, rec)
+}
+
+/// Drive `SetInheritedSetting` with `key`, on a well-formed organisation write.
+async fn setting_write_with_key(key: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        setting_now: stated(SettingValue::On, true),
+        ..Default::default()
+    })
+    .await;
+    let answered = iam
+        .set_inherited_setting(Request::new(SetInheritedSettingRequest {
+            idempotency: Some(Idempotency { key: key.into() }),
+            ..org_write()
+        }))
+        .await
+        .map(|_| ());
+    (answered, rec)
+}
+
+/// Drive `SetInheritedSetting` with `team_id`, WITHDRAWING that team's override.
+///
+/// **THE CLEARING SHAPE DELIBERATELY, AND IT IS THE REACHABLE ONE.** On the
+/// setting arm `iam-db` consults `live_team` first, so an over-long team id is
+/// answered `NOT_FOUND` before any column sees it. A withdrawal is a `DELETE`
+/// that matches nothing, and the ledger `INSERT` after it is where the id
+/// actually meets `iam_inherited_setting_write.team_id VARCHAR(96)`.
+async fn setting_write_for_team(team_id: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        setting_now: stated(SettingValue::On, false),
+        ..Default::default()
+    })
+    .await;
+    let answered = iam
+        .set_inherited_setting(Request::new(SetInheritedSettingRequest {
+            team_id: Some(team_id.into()),
+            value: None,
+            clear: true,
+            ..team_write()
+        }))
+        .await
+        .map(|_| ());
+    (answered, rec)
+}
+
+/// Drive `IssueCredential` for `user_id`.
+async fn issue_credential_for_user(user_id: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+    let answered = iam
+        .issue_credential(Request::new(IssueCredentialRequest {
+            user_id: user_id.into(),
+            label: "laptop".into(),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ());
+    (answered, rec)
+}
+
+/// The longest idempotency key both ledgers store is a key both paths GRANT.
+///
+/// **255 IS A TYPED LITERAL AND NAMES NO CONSTANT** (ADR-0573). Measured against
+/// `mariadb:11.8.9` at its stock `sql_mode`, with the columns exactly as
+/// `iam-db/src/schema.rs` declares them — `idempotency_key VARCHAR(255) NOT NULL
+/// PRIMARY KEY` on `CHARSET=utf8mb4` — a 255-character key stores and a
+/// 256-character one is `ERROR 1406 Data too long for column 'idempotency_key'`.
+#[tokio::test]
+async fn the_last_idempotency_key_the_ledger_stores_is_one_both_paths_accept() {
+    let at_the_bound = "k".repeat(255);
+
+    let (answered, rec) = redeem_with_key(&at_the_bound).await;
+    answered.expect("RedeemEnrolment: the longest key the ledger stores is granted");
+    assert_eq!(
+        rec.lock().expect("recorded").redeem_enrolment.len(),
+        1,
+        "RedeemEnrolment: an accepted key must reach the store"
+    );
+
+    let (answered, rec) = setting_write_with_key(&at_the_bound).await;
+    answered.expect("SetInheritedSetting: the longest key the ledger stores is granted");
+    assert_eq!(
+        rec.lock().expect("recorded").set_inherited_setting.len(),
+        1,
+        "SetInheritedSetting: an accepted key must reach the store"
+    );
+}
+
+/// ONE CHARACTER PAST THE LEDGER IS `INVALID_ARGUMENT`, and nothing is spent.
+///
+/// **THIS IS THE SHARPEST INSTANCE IN THE CLASS.** On `RedeemEnrolment` the
+/// ledger `INSERT` is the LAST statement of the spend transaction, so an
+/// over-long key made the whole transaction roll back — the secret stayed
+/// unspent, the caller got `UNAVAILABLE "storage unavailable"`, and every retry
+/// under that same key repeated it. A permanent 503 no retry escapes, on an
+/// unauthenticated endpoint, for a request that was never well formed.
+///
+/// Pinning BOTH SIDES, per ADR-0565: 255 is granted above and 256 is the first
+/// value refused. A one-sided test passes for a bound set anywhere below it.
+#[tokio::test]
+async fn the_first_idempotency_key_the_ledger_refuses_is_refused_before_the_store_is_asked() {
+    let past_the_bound = "k".repeat(256);
+
+    let (answered, rec) = redeem_with_key(&past_the_bound).await;
+    assert_eq!(
+        answered
+            .expect_err("RedeemEnrolment: 256 characters cannot be stored")
+            .code(),
+        tonic::Code::InvalidArgument,
+        "the caller's own key is the caller's own mistake, and UNAVAILABLE \
+         blames a database that is working"
+    );
+    assert!(
+        rec.lock().expect("recorded").redeem_enrolment.is_empty(),
+        "RedeemEnrolment: a refused key must not reach the spend"
+    );
+
+    let (answered, rec) = setting_write_with_key(&past_the_bound).await;
+    assert_eq!(
+        answered
+            .expect_err("SetInheritedSetting: 256 characters cannot be stored")
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert!(
+        rec.lock()
+            .expect("recorded")
+            .set_inherited_setting
+            .is_empty(),
+        "SetInheritedSetting: a refused key must write nothing"
+    );
+}
+
+/// The bound is CHARACTERS, and this is the case a byte bound gets wrong.
+///
+/// `VARCHAR(255)` on utf8mb4 counts CHARACTERS, so 255 four-byte codepoints is
+/// 1020 bytes and the column holds it — measured, as a `PRIMARY KEY`, on
+/// `mariadb:11.8.9`. A byte bound of 255 would refuse it and hand the caller a
+/// refusal the store never makes. It is the MIRROR of
+/// [`super::MAX_ENCRYPTED_FIELD_BYTES`], which counts BYTES because
+/// `VARBINARY(512)` does, and the two must not be tidied into one unit.
+#[tokio::test]
+async fn a_multibyte_idempotency_key_the_ledger_stores_is_not_refused_for_its_byte_length() {
+    let fits = wide_label(255);
+    assert_eq!(fits.chars().count(), 255);
+    assert_eq!(fits.len(), 1020, "the fixture must be past any byte bound");
+
+    redeem_with_key(&fits)
+        .await
+        .0
+        .expect("RedeemEnrolment: 255 characters is 255 characters, whatever it spells");
+    setting_write_with_key(&fits)
+        .await
+        .0
+        .expect("SetInheritedSetting: 255 characters is 255 characters, whatever it spells");
+}
+
+/// The longest identifier the column stores is one both paths GRANT.
+///
+/// **96 IS A TYPED LITERAL AND NAMES NO CONSTANT** (ADR-0573). Measured against
+/// `mariadb:11.8.9` at its stock `sql_mode`, with the columns exactly as
+/// `iam-db/src/schema.rs` declares them — `iam_credential.user_id VARCHAR(96)`
+/// and `iam_inherited_setting_write.team_id VARCHAR(96)` on `CHARSET=utf8mb4` —
+/// a 96-character id stores and a 97-character one is `ERROR 1406 Data too long`.
+#[tokio::test]
+async fn the_last_identifier_the_column_stores_is_one_both_paths_accept() {
+    let at_the_bound = "u".repeat(96);
+
+    let (answered, rec) = issue_credential_for_user(&at_the_bound).await;
+    answered.expect("IssueCredential: the longest id the column stores is granted");
+    assert_eq!(
+        rec.lock().expect("recorded").create_credential.len(),
+        1,
+        "IssueCredential: an accepted id must reach the store"
+    );
+
+    let (answered, rec) = setting_write_for_team(&at_the_bound).await;
+    answered.expect("SetInheritedSetting: the longest id the column stores is granted");
+    assert_eq!(
+        rec.lock().expect("recorded").set_inherited_setting.len(),
+        1,
+        "SetInheritedSetting: an accepted id must reach the store"
+    );
+}
+
+/// ONE CHARACTER PAST THE COLUMN IS `INVALID_ARGUMENT`, and it reaches nothing.
+///
+/// **`create_credential` IS THE ONE WRITE IN `iam-db` WITH NO LIVENESS CHECK**,
+/// so `IssueCredential` bound `user_id` straight into `iam_credential.user_id`
+/// and MariaDB refused it — rendered as `UNAVAILABLE "storage unavailable"` like
+/// every other engine error. `SetInheritedSetting`'s withdrawal reaches the same
+/// ending through the ledger `INSERT`.
+///
+/// Pinning BOTH SIDES, per ADR-0565: 96 is granted above and 97 is the first
+/// value refused.
+#[tokio::test]
+async fn the_first_identifier_the_column_refuses_is_refused_before_the_store_is_asked() {
+    let past_the_bound = "u".repeat(97);
+
+    let (answered, rec) = issue_credential_for_user(&past_the_bound).await;
+    assert_eq!(
+        answered
+            .expect_err("IssueCredential: 97 characters cannot be stored")
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert!(
+        rec.lock().expect("recorded").create_credential.is_empty(),
+        "IssueCredential: a refused id must mint nothing and store nothing"
+    );
+
+    let (answered, rec) = setting_write_for_team(&past_the_bound).await;
+    assert_eq!(
+        answered
+            .expect_err("SetInheritedSetting: 97 characters cannot be stored")
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+    assert!(
+        rec.lock()
+            .expect("recorded")
+            .set_inherited_setting
+            .is_empty(),
+        "SetInheritedSetting: a refused id must write nothing"
+    );
+}
+
+/// The identifier bound is CHARACTERS too, for `VARCHAR(96)`'s own reason.
+///
+/// 96 four-byte codepoints is 384 bytes and the column holds it — measured. A
+/// byte bound of 96 would refuse a value the store accepts, which is the
+/// refusal-the-system-does-not-need this whole change exists not to add.
+#[tokio::test]
+async fn a_multibyte_identifier_the_column_stores_is_not_refused_for_its_byte_length() {
+    let fits = wide_label(96);
+    assert_eq!(fits.chars().count(), 96);
+    assert_eq!(fits.len(), 384, "the fixture must be past any byte bound");
+
+    issue_credential_for_user(&fits)
+        .await
+        .0
+        .expect("IssueCredential: 96 characters is 96 characters, whatever it spells");
+    setting_write_for_team(&fits)
+        .await
+        .0
+        .expect("SetInheritedSetting: 96 characters is 96 characters, whatever it spells");
+}
