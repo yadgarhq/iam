@@ -44,13 +44,47 @@ const ENROLMENT_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// policy, and this file is not it.
 const MAX_PASSWORD_BYTES: usize = 1024;
 
-/// The longest `label` accepted, on the same reasoning.
+/// The longest `label` accepted, IN CHARACTERS, because that is what stores it.
 ///
 /// A BOUND AND NOT A REQUIREMENT: an EMPTY label is accepted, because the
 /// contract says this field is `LoginRequest.label` exactly and `Login` requires
 /// nothing of it. Refusing an empty one here would be a refusal a caller written
 /// against `Login` newly meets.
-const MAX_LABEL_BYTES: usize = 256;
+///
+/// **255 AND NOT 256, AND CHARACTERS AND NOT BYTES.** This was
+/// `MAX_LABEL_BYTES = 256`, tested with `>`, and it was wrong twice over. The
+/// column is `label VARCHAR(255)` on `CHARSET=utf8mb4`
+/// (`iam-db/src/schema.rs`), and `VARCHAR(n)` in utf8mb4 bounds CHARACTERS.
+/// Measured against `mariadb:11.8.9` — the image `iam-db`'s README stands up —
+/// with that column declared exactly as the schema declares it, at the stock
+/// `sql_mode` (`STRICT_TRANS_TABLES,…`):
+///
+/// | label                     | characters | bytes | outcome                                        |
+/// | ------------------------- | ---------- | ----- | ---------------------------------------------- |
+/// | 255 × `l`                 | 255        | 255   | stored                                         |
+/// | 256 × `l`                 | 256        | 256   | `ERROR 1406 Data too long for column 'label'`  |
+/// | 255 × `U+1F600`           | 255        | 1020  | stored                                         |
+/// | 256 × `U+1F600`           | 256        | 1024  | `ERROR 1406 Data too long for column 'label'`  |
+/// | 100 × `U+1F600`           | 100        | 400   | stored                                         |
+///
+/// So the old bound was wrong in BOTH directions. It ADMITTED a 256-byte ASCII
+/// label the column refuses — and because `iam-db` renders every engine error as
+/// `UNAVAILABLE "storage unavailable"`, that refusal reached the caller as an
+/// outage of a database that was working. It also REFUSED a 100-character emoji
+/// label the column stores without complaint.
+///
+/// **THE NUMBER IS THE COLUMN'S AND THAT COUPLING IS DELIBERATE**, which is the
+/// one way this differs from [`MAX_EXPIRES_IN_SECONDS`] above. That bound is a
+/// judgement about what a field MEANS, and it deliberately refuses to import a
+/// storage ceiling that moved between engine minor versions. A `VARCHAR` width
+/// does not move on its own: it is a declaration in a migration, and changing it
+/// is a migration somebody writes. The alternatives to naming it here are worse
+/// — leaving the lockout, or accepting a silent truncation under a `sql_mode`
+/// nothing asserts (the same INSERTs above store a CLIPPED 255-character label
+/// and report success under `sql_mode = ''`). Refusing here makes the outcome
+/// this service's own, and independent of a `sql_mode` it neither sets nor
+/// checks. If the column widens, this constant is what has to move with it.
+const MAX_LABEL_CHARS: usize = 255;
 
 /// The longest life [`IamService::issue_credential`] will grant: ten years.
 ///
@@ -349,6 +383,34 @@ impl Iam {
         req: Request<LoginRequest>,
         call: Call,
     ) -> Result<Response<LoginResponse>, Status> {
+        // VALIDATION BEFORE LOOKUP, and this check was ABSENT ENTIRELY. `Login`
+        // stores a caller-supplied `label` in the same column `RedeemEnrolment`
+        // and `IssueCredential` do, and it was the only one of the three with no
+        // bound on it — so an over-long label verified the password, minted a
+        // token, and then failed the INSERT, which reaches the caller as
+        // `UNAVAILABLE "storage unavailable"`. A sign-in that reports an outage
+        // for a request that was never well-formed sends a person to an operator
+        // instead of to their own input.
+        //
+        // **INSIDE `login_inner` AND NOT IN THE HANDLER**, which is the same
+        // reason this function exists: the handler is what pays the
+        // response-time floor, so a refusal placed above the call to this one
+        // would be the fast path the floor exists to close. Here it is floored
+        // like every other answer.
+        //
+        // NO ORACLE. The check is answerable from the request alone and says
+        // nothing about whether the username exists — which is exactly the
+        // property `iam.proto` states as VALIDATION BEFORE LOOKUP for the
+        // sharper case, `RedeemEnrolment`.
+        if let Err(refusal) = check_label(&req.get_ref().label) {
+            // WITHOUT THIS THE REFUSAL IS RECORDED AS `UNRECORDED`. `Call::fail`
+            // takes `self` by value so the compiler holds it ahead of the `Err`,
+            // but a path that never calls it compiles fine and drops the `Call`
+            // — and this branch is brand new, so there was nothing to copy.
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
+
         // The username never leaves this process. What goes to the store is its
         // blind index, so the plaintext reaches no query log and no backup.
         let mut lookup = Request::new(db::GetPasswordHashRequest {
@@ -748,8 +810,38 @@ fn validate_redemption(r: &RedeemEnrolmentRequest) -> Result<(), Status> {
             "the password is longer than this service will hash",
         ));
     }
-    if r.label.len() > MAX_LABEL_BYTES {
-        return Err(Status::invalid_argument("the label is too long"));
+    check_label(&r.label)?;
+    Ok(())
+}
+
+/// The ONE bound on a caller-supplied `label`, shared by the three RPCs that
+/// store one.
+///
+/// **ONE FUNCTION FOR THREE FIELDS, AND THAT IS NOT THE SHORTCUT IT LOOKS
+/// LIKE.** ADR-0565 says a bound is re-argued per field rather than shared —
+/// but that is about the NUMBER, and `LoginRequest.label`,
+/// `RedeemEnrolmentRequest.label` and `IssueCredentialRequest.label` are the
+/// same field, described in `iam.proto` as the same free text, travelling to
+/// `iam-db` as the same `CreateCredentialRequest.label`, and landing in the same
+/// column. Three copies of one number is how two of them end up stale.
+///
+/// **THE SWEEP, BECAUSE FIXING AN INSTANCE IS NOT CLOSING A CLASS.**
+/// `iam.proto` carries exactly three caller-supplied labels and every one is
+/// checked here. `Credential.label` on `ListCredentials` is a READ of a stored
+/// value and not an input. `iam` builds no other `CreateCredentialRequest`.
+///
+/// **CHARACTERS COUNTED AS `char`s, WHICH IS THE COLUMN'S OWN UNIT.** A Rust
+/// `char` is a Unicode scalar value and utf8mb4 stores one per character, so the
+/// two counts agree exactly. Graphemes would NOT: a flag or a family emoji is
+/// several scalar values and one grapheme, so counting graphemes under-counts
+/// against the column and re-opens the refusal this exists to prevent — and it
+/// would need a crate to do it.
+fn check_label(label: &str) -> Result<(), Status> {
+    if label.chars().count() > MAX_LABEL_CHARS {
+        return Err(Status::invalid_argument(
+            "the label is longer than the store will hold: at most 255 \
+             characters, counted as characters and not as bytes",
+        ));
     }
     Ok(())
 }
@@ -961,6 +1053,12 @@ fn check_inherited_setting(r: &SetInheritedSettingRequest) -> Result<(), Status>
 /// that asked for the shortest one possible. That is the credential that
 /// authenticates forever, and it lives in this file rather than in the database.
 fn check_issue_credential(r: &IssueCredentialRequest) -> Result<(), Status> {
+    // HAD NO BOUND AT ALL, on the same handler that gained a validation function
+    // for `expires_in_seconds`. See `check_label`: an over-long one reached the
+    // column and came back as `UNAVAILABLE "storage unavailable"`, which
+    // implicates a database that is working for a request that was never
+    // well-formed — ADR-0512's misattribution, on the administrative path.
+    check_label(&r.label)?;
     if r.expires_in_seconds < 0 {
         return Err(Status::invalid_argument(
             "expires_in_seconds cannot be negative: a deadline already past is \
