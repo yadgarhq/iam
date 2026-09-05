@@ -295,7 +295,20 @@ impl EnrolmentConfig {
     /// again — loud at boot AND at the call, rather than loud once and then
     /// silent.
     pub fn from_env() -> Result<Self, EnrolmentConfigError> {
-        let gateway = std::env::var(GATEWAY_ENV).unwrap_or_default();
+        // **THE ONE ARGUED EXCEPTION TO ADR-0569 IN THIS BINARY**, and the
+        // argument is the paragraph above rather than convenience. Every other
+        // knob here reads through `main`'s `env_required` and refuses the boot
+        // when absent; this one keeps its fallback because `iam` is the
+        // authentication plane, so a CrashLoopBackOff would halt every dependent
+        // service's credential resolution over a value belonging to one
+        // administrative RPC. Unset means `IssueEnrolment` refuses with
+        // `FAILED_PRECONDITION` naming the variable while the process keeps
+        // serving — loud at the call rather than fatal at the boot. The chart
+        // says the same thing at its `ENROLMENT_GATEWAY` block.
+        //
+        // The marker sits on the READ ITSELF, so `git grep ADR-0569-EXCEPTION`
+        // lands on the line that takes the fallback rather than on prose near it.
+        let gateway = std::env::var(GATEWAY_ENV).unwrap_or_default(); // ADR-0569-EXCEPTION
         let ca_path = std::env::var(CA_PEM_ENV).ok();
         Self::load(&gateway, ca_path.as_deref())
     }
