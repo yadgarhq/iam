@@ -47,6 +47,14 @@ struct Recorded {
     /// status code cannot tell a refusal made here from one the store made. An
     /// EMPTY vector is what says the store was never asked.
     set_inherited_setting: Vec<db::SetInheritedSettingRequest>,
+    /// THE ADMINISTRATIVE WRITES, recorded for one reason: what this service
+    /// forwards on them was invisible. Every one of these was built with
+    /// `..Default::default()`, so no test could see a field that never left —
+    /// and the fake did not even keep the request to look at.
+    revoke_credential: Vec<db::RevokeCredentialRequest>,
+    create_user: Vec<db::CreateUserRequest>,
+    add_team_member: Vec<db::AddTeamMemberRequest>,
+    remove_team_member: Vec<db::RemoveTeamMemberRequest>,
 }
 
 /// A stand-in for `iam-db`: answers from a fixed script and records the asking.
@@ -209,8 +217,13 @@ impl IamDbService for FakeDb {
 
     async fn revoke_credential(
         &self,
-        _req: Request<db::RevokeCredentialRequest>,
+        req: Request<db::RevokeCredentialRequest>,
     ) -> Result<Response<db::RevokeCredentialResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .revoke_credential
+            .push(req.into_inner());
         Ok(Response::new(db::RevokeCredentialResponse {
             user_id: "yadgar:user:1".into(),
         }))
@@ -218,8 +231,13 @@ impl IamDbService for FakeDb {
 
     async fn create_user(
         &self,
-        _req: Request<db::CreateUserRequest>,
+        req: Request<db::CreateUserRequest>,
     ) -> Result<Response<db::CreateUserResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .create_user
+            .push(req.into_inner());
         if let Some((code, message)) = self.create_user_fails {
             return Err(Status::new(code, message));
         }
@@ -228,15 +246,25 @@ impl IamDbService for FakeDb {
 
     async fn add_team_member(
         &self,
-        _req: Request<db::AddTeamMemberRequest>,
+        req: Request<db::AddTeamMemberRequest>,
     ) -> Result<Response<db::AddTeamMemberResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .add_team_member
+            .push(req.into_inner());
         Ok(Response::new(db::AddTeamMemberResponse {}))
     }
 
     async fn remove_team_member(
         &self,
-        _req: Request<db::RemoveTeamMemberRequest>,
+        req: Request<db::RemoveTeamMemberRequest>,
     ) -> Result<Response<db::RemoveTeamMemberResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .remove_team_member
+            .push(req.into_inner());
         Ok(Response::new(db::RemoveTeamMemberResponse {}))
     }
 }
@@ -2380,5 +2408,298 @@ async fn a_setting_write_publishes_no_invalidation() {
         inv.published().is_empty(),
         "a setting write must publish nothing: there is no user to key an \
          invalidation on, and a wrong key is worse than none"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WHAT THE ADMINISTRATIVE WRITES ACTUALLY CARRY TO THE STORE.
+//
+// Every request below was built with `..Default::default()`, which supplies a
+// field the caller DID send and reads, at the call site, as though there were
+// nothing to send. The rest pattern is why no compiler and no test in this
+// repository could see the difference. These tests are the ones that can.
+//
+// AND THE TESTS THEMSELVES STILL USE THE REST PATTERN, which is not a
+// contradiction. What made the rest pattern dangerous in `service.rs` is that
+// the value it supplied was SENT — it stood in for a field on a real wire
+// message and no reader could tell. Here it supplies fields the assertion does
+// not read, in a request under this test's own control, and the cost it avoids
+// is editing every literal below on every additive proto bump.
+// ---------------------------------------------------------------------------
+
+/// D9's key, on the four administrative writes that forward one.
+///
+/// **NOT `IssueCredential`, and its absence here is the point.** That RPC's
+/// idempotency classification is explicitly UNDECIDED on the contract — see the
+/// `yadgar.common.v1.Idempotency` comment, which names it as the case ADR-0519's
+/// rule "would reach" and says the move "is its own decision and its own contract
+/// release". Forwarding its key would make that decision silently, from here.
+///
+/// **AND THE ABSENCE COSTS SOMETHING, which the handler's comment now states.**
+/// The same contract text enumerates the carve-out's members and today the list
+/// is one, `IssueEnrolment`, so `IssueCredential` is governed by D9's ordinary
+/// rule and `iam` accepts a key it discards. A caller retrying a lost response
+/// mints a second live credential and orphans the first. That is a contract
+/// release to resolve, not a line in this file, which is why no test here pins
+/// the behaviour either way.
+#[tokio::test]
+async fn d9s_key_travels_on_every_administrative_write() {
+    let key = || {
+        Some(Idempotency {
+            key: "01J0000000000000000000000K".into(),
+        })
+    };
+
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.revoke_credential(Request::new(RevokeCredentialRequest {
+        idempotency: key(),
+        credential_id: "yadgar:credential:1".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("a revocation");
+
+    iam.create_user(Request::new(CreateUserRequest {
+        idempotency: key(),
+        external_id: "someone".into(),
+        display_name: "Some One".into(),
+        is_admin: false,
+        ..Default::default()
+    }))
+    .await
+    .expect("a user");
+
+    iam.add_team_member(Request::new(AddTeamMemberRequest {
+        idempotency: key(),
+        team_id: "yadgar:team:a".into(),
+        user_id: "yadgar:user:1".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("a grant");
+
+    iam.remove_team_member(Request::new(RemoveTeamMemberRequest {
+        idempotency: key(),
+        team_id: "yadgar:team:a".into(),
+        user_id: "yadgar:user:1".into(),
+        ..Default::default()
+    }))
+    .await
+    .expect("a removal");
+
+    let seen = rec.lock().expect("recorded");
+    assert_eq!(
+        seen.revoke_credential[0].idempotency,
+        key(),
+        "D9's key travels"
+    );
+    assert_eq!(seen.create_user[0].idempotency, key(), "D9's key travels");
+    assert_eq!(
+        seen.add_team_member[0].idempotency,
+        key(),
+        "D9's key travels"
+    );
+    assert_eq!(
+        seen.remove_team_member[0].idempotency,
+        key(),
+        "D9's key travels"
+    );
+}
+
+/// D73's admin flag reaches the store, or the first admin cannot be created.
+///
+/// The flag is settable at creation for exactly one reason, and the contract
+/// says it: the FIRST admin has to exist before anyone can log in to promote
+/// one. A `CreateUser` that drops it answers `OK` and writes an ordinary user,
+/// so the bootstrap appears to succeed and the deployment has no administrator.
+#[tokio::test]
+async fn create_user_carries_d73s_admin_flag() {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.create_user(Request::new(CreateUserRequest {
+        idempotency: None,
+        external_id: "the-first-admin".into(),
+        display_name: "The First Admin".into(),
+        is_admin: true,
+        ..Default::default()
+    }))
+    .await
+    .expect("an administrator");
+
+    assert!(
+        rec.lock().expect("recorded").create_user[0].is_admin,
+        "the store must be told this user is an administrator; a dropped flag \
+         reports success and leaves the deployment with nobody who can promote \
+         anyone"
+    );
+}
+
+/// The expiry the caller asked for reaches the store.
+///
+/// `expires_in_seconds` is the only way a caller of `IssueCredential` can bound
+/// a token's life, and the store's field is an absolute deadline. A request that
+/// drops it mints a credential that NEVER EXPIRES while answering as though the
+/// bound had been applied.
+#[tokio::test]
+async fn issue_credential_carries_the_expiry_the_caller_asked_for() {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    let before = SystemTime::now();
+    iam.issue_credential(Request::new(IssueCredentialRequest {
+        idempotency: None,
+        user_id: "yadgar:user:1".into(),
+        label: "a laptop".into(),
+        expires_in_seconds: 3600,
+        ..Default::default()
+    }))
+    .await
+    .expect("a credential");
+
+    let deadline = rec.lock().expect("recorded").create_credential[0]
+        .expires_at
+        .expect(
+            "the deadline the caller asked for; absent means this credential \
+             never expires",
+        )
+        .seconds;
+
+    // A WINDOW RATHER THAN AN EQUALITY, because the deadline is computed from
+    // the clock inside the call. The window is 60 seconds wide and FORWARD
+    // ONLY: `before` is read outside the call, so the handler's own clock is at
+    // or after it and a deadline earlier than `asked` is wrong rather than
+    // merely early. Sixty seconds is slack for a slow machine and nothing more —
+    // it still excludes a zero, a reading in milliseconds, and the hour applied
+    // twice, which are the three ways this arithmetic goes wrong.
+    let asked = before
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+        + 3600;
+    assert!(
+        (asked..asked + 60).contains(&deadline),
+        "the store was told {deadline} and the caller asked for about {asked}"
+    );
+}
+
+/// Zero seconds means no expiry, which the contract states in as many words.
+///
+/// The pair matters: without it, `expires_at: Some(now)` would satisfy the test
+/// above and silently expire every credential minted without a bound.
+#[tokio::test]
+async fn issue_credential_with_zero_seconds_carries_no_expiry() {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.issue_credential(Request::new(IssueCredentialRequest {
+        idempotency: None,
+        user_id: "yadgar:user:1".into(),
+        label: "a laptop".into(),
+        expires_in_seconds: 0,
+        ..Default::default()
+    }))
+    .await
+    .expect("a credential");
+
+    assert_eq!(
+        rec.lock().expect("recorded").create_credential[0].expires_at,
+        None,
+        "zero means no expiry, so the store must be given no deadline at all"
+    );
+}
+
+/// The `expires_in_seconds` values this service refuses, and it refuses them
+/// HERE rather than letting the store answer for them.
+///
+/// **THE TWO ENDS FAIL DIFFERENTLY, AND ONLY ONE OF THEM EVER REACHED THE
+/// STORE.** Measured against `mariadb:11.8.9` — the image `iam-db`'s README
+/// stands up — at its stock `sql_mode`, which is strict:
+/// `FROM_UNIXTIME(4294967296)` is NULL, and the INSERT is REFUSED with
+/// `ERROR 1292 Truncated incorrect unixtime value` rather than storing that
+/// NULL. So an absurd expiry already failed CLOSED. What it did instead was
+/// reach `iam-db`, which renders every engine error as "storage unavailable",
+/// so a request that was never well-formed came back reading as an outage.
+///
+/// **A NEGATIVE never involved the store at all, and it failed OPEN.**
+/// `expires_in_seconds > 0` sent `expires_at: None`, so a caller asking for a
+/// deadline already PAST received the credential that never expires — the
+/// unlimited life `0` asks for, handed to the request that asked for the
+/// shortest one.
+///
+/// Both are values `IssueCredentialRequest` gives no meaning to: the contract
+/// says "Zero means no expiry" and nothing else, so no caller written against it
+/// sends either, and refusing them is not a refusal such a caller newly meets.
+#[tokio::test]
+async fn issue_credential_refuses_an_expiry_the_contract_gives_no_meaning_to() {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    for asked in [-1, i64::MIN, MAX_EXPIRES_IN_SECONDS + 1, i64::MAX] {
+        let err = iam
+            .issue_credential(Request::new(IssueCredentialRequest {
+                user_id: "yadgar:user:1".into(),
+                expires_in_seconds: asked,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an expiry the contract gives no meaning to is refused");
+
+        // THE CODE, because it is what tells the caller whose mistake this is.
+        // `UNAVAILABLE` or `INTERNAL` says the service is broken and invites a
+        // retry that cannot succeed; `INVALID_ARGUMENT` says the request is, and
+        // is the answer ADR-0512 asks a boundary to document.
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "expires_in_seconds = {asked}"
+        );
+        // AND THE FIELD BY NAME. `IssueCredentialRequest` has four fields a
+        // caller fills; a refusal that does not say which one is wrong leaves
+        // the caller to guess, and this is the only place that knows.
+        assert!(
+            err.message().contains("expires_in_seconds"),
+            "the refusal must name the field: expires_in_seconds = {asked} gave \
+             {:?}",
+            err.message()
+        );
+    }
+
+    assert!(
+        rec.lock().expect("recorded").create_credential.is_empty(),
+        "a refused request must mint nothing: the check runs before the token is \
+         minted, so no credential row exists for a call that answered an error"
+    );
+}
+
+/// The other side of the same bound, because a refusal alone pins nothing.
+///
+/// `MAX_EXPIRES_IN_SECONDS + 1` refused while `MAX_EXPIRES_IN_SECONDS` is
+/// granted is what makes the constant the actual bound. Without this case an
+/// off-by-one, or a check that refused every non-zero expiry, passes the test
+/// above.
+#[tokio::test]
+async fn issue_credential_grants_the_longest_life_the_bound_allows() {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    let before = SystemTime::now();
+    iam.issue_credential(Request::new(IssueCredentialRequest {
+        user_id: "yadgar:user:1".into(),
+        expires_in_seconds: MAX_EXPIRES_IN_SECONDS,
+        ..Default::default()
+    }))
+    .await
+    .expect("the longest life this service grants is a life it grants");
+
+    let deadline = rec.lock().expect("recorded").create_credential[0]
+        .expires_at
+        .expect("the deadline the caller asked for")
+        .seconds;
+
+    let asked = before
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+        + MAX_EXPIRES_IN_SECONDS;
+    assert!(
+        (asked..asked + 60).contains(&deadline),
+        "the store was told {deadline} and the caller asked for about {asked}"
     );
 }

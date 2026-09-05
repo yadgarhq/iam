@@ -52,6 +52,29 @@ const MAX_PASSWORD_BYTES: usize = 1024;
 /// against `Login` newly meets.
 const MAX_LABEL_BYTES: usize = 256;
 
+/// The longest life [`IamService::issue_credential`] will grant: ten years.
+///
+/// A BOUND ON THE DURATION ASKED FOR, NOT ON THE INSTANT IT PRODUCES, and that
+/// distinction is the whole reason the number is this one. The store writes the
+/// deadline into a MariaDB `TIMESTAMP` through `FROM_UNIXTIME`, and that
+/// column's ceiling MOVES BETWEEN MINOR VERSIONS of the engine. Measured against
+/// `mariadb:11.8.9`, the image `iam-db`'s README stands up, at its stock
+/// `sql_mode`: `FROM_UNIXTIME(2147483648)` stores `2038-01-19 03:14:08` without
+/// complaint — the classic 32-bit bound is NOT where 11.8 refuses, because 11.5
+/// widened the column — while `FROM_UNIXTIME(4294967296)` is NULL and the INSERT
+/// is refused outright with `ERROR 1292`. A ceiling copied from that measurement
+/// into this file would be `iam` hardcoding a number owned by a version of a
+/// database it does not talk to directly and does not deploy.
+///
+/// SO THE REFUSAL IS ABOUT WHAT THE FIELD MEANS INSTEAD. `expires_in_seconds`
+/// asks for a bearer credential's life, and the expiry exists to bound what a
+/// leaked token is worth. A token asked to live longer than a decade is asking
+/// for no bound at all — which this contract already offers, spelled `0`, and
+/// which a caller that wants it should say rather than approximate. Ten years
+/// stays under the measured store ceiling until roughly 2096, so the refusal a
+/// caller meets here is this service's own and never the store's.
+const MAX_EXPIRES_IN_SECONDS: i64 = 315_360_000;
+
 /// The default response-time floor for [`IamService::login`].
 ///
 /// A FLOOR, NOT A TARGET. It is the shortest time `Login` is allowed to answer
@@ -329,8 +352,24 @@ impl Iam {
         // The username never leaves this process. What goes to the store is its
         // blind index, so the plaintext reaches no query log and no backup.
         let mut lookup = Request::new(db::GetPasswordHashRequest {
+            // DEAD FIELD, AND EMPTY IS THE SECURITY PROPERTY RATHER THAN AN
+            // OMISSION. The plaintext username never crosses this boundary — it
+            // would otherwise reach a query log and a database backup — so the
+            // superseded field is written out empty rather than left to a rest
+            // pattern that would say the same thing silently.
+            //
+            // THE EXPECTATION IS ON THIS FIELD AND NOT ON THE STATEMENT, which
+            // is the same distinction the rest of this change is about. On the
+            // statement it is satisfied by ANY deprecated field in the literal,
+            // so a `#[deprecated]` later landing on `username_blind_index` would
+            // be absorbed silently and `unfulfilled_lint_expectations` would
+            // never fire. One field, one expectation.
+            #[expect(
+                deprecated,
+                reason = "the dead field is written out rather than defaulted: see above"
+            )]
+            username: String::new(),
             username_blind_index: self.keys.blind_index(&req.get_ref().username),
-            ..Default::default()
         });
         forward_request_id(&req, &mut lookup);
 
@@ -357,10 +396,21 @@ impl Iam {
 
         let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
         let mut create = Request::new(db::CreateCredentialRequest {
+            // NOTHING TO SUPPLY: `LoginRequest` carries no idempotency key. D9's
+            // key covers mutating RPCs a caller can retry, and a sign-in is not
+            // one this contract gives a key to.
+            idempotency: None,
             user_id: found.user_id.clone(),
             token_hash: Keys::token_hash(&token),
             label: req.get_ref().label.clone(),
-            ..Default::default()
+            // NOTHING TO SUPPLY: `LoginRequest` has no field to ask for an
+            // expiry, so there is no deadline to carry.
+            expires_at: None,
+            // NOTHING TO SUPPLY, AND NOT MERELY UNWIRED. `Login` is the person
+            // themselves signing in, not an administrator acting on someone —
+            // `LoginRequest` carries no actor and ADR-0534's field is for
+            // administrative requests.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -586,8 +636,15 @@ impl Iam {
         // 4. THE REPLAY CHECK. The blind index is computed here from the name
         // just decrypted; the plaintext still crosses no boundary.
         let mut lookup = Request::new(db::GetPasswordHashRequest {
+            // DEAD FIELD, EMPTY FOR THE REASON GIVEN IN `login`: the plaintext
+            // name just decrypted must not cross this boundary either. The
+            // expectation is per-field for the reason given there too.
+            #[expect(
+                deprecated,
+                reason = "the dead field is written out rather than defaulted: see above"
+            )]
+            username: String::new(),
             username_blind_index: self.keys.blind_index(&username),
-            ..Default::default()
         });
         forward_request_id(&req, &mut lookup);
         let held = self
@@ -874,6 +931,49 @@ fn check_inherited_setting(r: &SetInheritedSettingRequest) -> Result<(), Status>
         ));
     }
 
+    Ok(())
+}
+
+/// The two `expires_in_seconds` values `IssueCredential` refuses, and why the
+/// refusal belongs on this boundary rather than at the store.
+///
+/// The contract says of this field exactly one thing — "Zero means no expiry" —
+/// so neither value below is one a caller written against it sends, and refusing
+/// them is not a refusal such a caller newly meets. What each one did before is
+/// different, and only one of them ever reached the database.
+///
+/// **ABOVE THE BOUND ALREADY FAILED CLOSED, and the fix is the message rather
+/// than the outcome.** Measured against `mariadb:11.8.9` — the image `iam-db`'s
+/// README stands up — at its stock `sql_mode`, which is strict:
+/// `FROM_UNIXTIME(4294967296)` is NULL, and the INSERT is REFUSED with `ERROR
+/// 1292 Truncated incorrect unixtime value` rather than storing that NULL. So no
+/// credential was ever written with a swallowed deadline. But `iam-db` renders
+/// every engine error as "storage unavailable", so a malformed request came back
+/// to its caller reading as an outage, implicating a database that was working.
+/// Refusing here is ADR-0512's shape: the negative outcome is documented on the
+/// boundary the caller compiles against. It also makes the outcome independent
+/// of the store's `sql_mode` — the same INSERT stores the NULL under `sql_mode
+/// = ''`, which nothing here deploys and nothing here asserts either.
+///
+/// **A NEGATIVE FAILED OPEN, and never involved the store at all.** The deadline
+/// is only sent when the request asks for a positive one, so a negative sent
+/// `expires_at: None` — the unlimited life `0` asks for, handed to the request
+/// that asked for the shortest one possible. That is the credential that
+/// authenticates forever, and it lives in this file rather than in the database.
+fn check_issue_credential(r: &IssueCredentialRequest) -> Result<(), Status> {
+    if r.expires_in_seconds < 0 {
+        return Err(Status::invalid_argument(
+            "expires_in_seconds cannot be negative: a deadline already past is \
+             not a shorter life, and it will not be read as the unlimited one \
+             that 0 asks for",
+        ));
+    }
+    if r.expires_in_seconds > MAX_EXPIRES_IN_SECONDS {
+        return Err(Status::invalid_argument(
+            "expires_in_seconds is longer than this service will grant a \
+             credential; send 0 to ask for no expiry at all",
+        ));
+    }
     Ok(())
 }
 
@@ -1333,12 +1433,77 @@ impl IamService for Iam {
             tel(rid, &req.get_ref().user_id),
         );
 
+        let r = req.get_ref();
+        // BEFORE THE MINT, so a refused request leaves no token in existence.
+        if let Err(refusal) = check_issue_credential(r) {
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
+
         let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
         let mut create = Request::new(db::CreateCredentialRequest {
-            user_id: req.get_ref().user_id.clone(),
+            // NOT FORWARDED, AND THIS IS THE ONE PLACE THAT SILENCE WAS A
+            // DECISION RATHER THAN AN OVERSIGHT. `yadgar.common.v1.Idempotency`
+            // names `IssueCredential` as the case ADR-0519's single-use-secret
+            // carve-out "would reach", and says moving it "is its own decision
+            // and its own contract release, and it is not made here". Handing
+            // the caller's key to the store would decide it from this file: the
+            // store would replay the key and answer with a credential whose
+            // token was minted in the first call and kept only as a hash, so the
+            // second caller receives a token that authenticates nobody — the
+            // dead-token failure ADR-0519 exists to name. `RedeemEnrolment` puts
+            // its own mint outside the caller's key for exactly this reason.
+            //
+            // **AND THE OTHER HALF, BECAUSE NOT FORWARDING IT IS NOT FREE.**
+            // That same comment enumerates the carve-out's members and says "AN
+            // RPC NOT NAMED HERE IS NOT A MEMBER, however well it fits the
+            // description" — and today the list is one, `IssueEnrolment`. So as
+            // published, `IssueCredential` is governed by D9's ORDINARY rule,
+            // under which a retry of the same key returns the first answer. It
+            // does not: `iam` accepts a key it then discards, so a caller
+            // retrying a lost response mints a SECOND live credential and the
+            // first is orphaned — a token nobody holds, revocable by nobody who
+            // knows it exists, live until its expiry. Forwarding the key here
+            // would trade that for the dead-token failure above, which is worse
+            // and is not this file's to choose. The resolution is a contract
+            // release that classifies this RPC, not a change on this line.
+            idempotency: None,
+            user_id: r.user_id.clone(),
             token_hash: Keys::token_hash(&token),
-            label: req.get_ref().label.clone(),
-            ..Default::default()
+            label: r.label.clone(),
+            // THE DEADLINE THE CALLER ASKED FOR. Zero means no expiry, which the
+            // contract states in as many words, and it is the ONLY remaining way
+            // to reach `None` here: a negative and an absurd value are both
+            // refused above, by `check_issue_credential`, which carries the
+            // measurement that argues for each refusal.
+            //
+            // ADDED IN SECONDS ON THE WIRE TYPE. Kept SATURATING although the
+            // bound makes the saturation unreachable — a ten-year offset cannot
+            // carry an epoch second past `i64::MAX` — because `SystemTime +
+            // Duration` aborts the process on overflow and nothing about this
+            // handler should depend on a bound staying where it is today.
+            expires_at: (r.expires_in_seconds > 0).then(|| {
+                let now = prost_types::Timestamp::from(SystemTime::now());
+                prost_types::Timestamp {
+                    seconds: now.seconds.saturating_add(r.expires_in_seconds),
+                    nanos: now.nanos,
+                }
+            }),
+            // NOT FORWARDED, AND THE FIELD IS ON BOTH SIDES OF THIS HOP.
+            // `IssueCredentialRequest` grew ADR-0534's actor in proto v1.10.0 and
+            // nothing populates it: the gateway reaches three RPCs and this is
+            // not one of them, so there is no administrative path for an actor to
+            // arrive on. Relaying `r.unverified_actor` today would move `None`
+            // and READ AS A RELAY THAT WORKS.
+            //
+            // **THE RELAY HAS SEVEN SITES AND THIS IS ONE**: here,
+            // `revoke_credential`, `create_user`, `add_team_member`,
+            // `remove_team_member`, and the two that already said so before this
+            // change — `issue_enrolment` and `set_inherited_setting`. Five of the
+            // seven were invisible until this file stopped using a rest pattern,
+            // so whoever wires the path by grepping for the field would have
+            // found two.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -1376,8 +1541,15 @@ impl IamService for Iam {
         let call = Call::start(SERVICE, "RevokeCredential", Kind::Write, tel(rid, ""));
 
         let mut upstream = Request::new(db::RevokeCredentialRequest {
+            // D9's key travels. A revocation is a mutating RPC a retrying load
+            // balancer will deliver twice, and the key is what makes the second
+            // delivery a replay rather than a second write.
+            idempotency: req.get_ref().idempotency.clone(),
             credential_id: req.get_ref().credential_id.clone(),
-            ..Default::default()
+            // NOT FORWARDED, for the reason given at `issue_credential`: nothing
+            // populates the field, so a relay would move `None` and read as one
+            // that works. One of that comment's seven relay sites.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
 
@@ -1415,10 +1587,39 @@ impl IamService for Iam {
         };
 
         let mut upstream = Request::new(db::CreateUserRequest {
+            // D9's key travels, on `revoke_credential`'s reasoning.
+            idempotency: r.idempotency.clone(),
+            // DEAD FIELDS, AND EMPTY IS THE SECURITY PROPERTY. The plaintext name
+            // and display name never cross this boundary; the ciphertexts and the
+            // blind index below are what the store receives. Written out empty
+            // rather than defaulted, so the boundary's own rule is legible here.
+            //
+            // TWO FIELDS, TWO EXPECTATIONS, for the reason given in `login`: one
+            // attribute covering both is satisfied by either, so the day one of
+            // them stops being deprecated the lint stays quiet about the other.
+            #[expect(
+                deprecated,
+                reason = "the dead field is written out rather than defaulted: see above"
+            )]
+            external_id: String::new(),
+            #[expect(
+                deprecated,
+                reason = "the dead field is written out rather than defaulted: see above"
+            )]
+            display_name: String::new(),
             external_id_ciphertext: enc(&r.external_id)?,
             display_name_ciphertext: enc(&r.display_name)?,
             external_id_blind_index: self.keys.blind_index(&r.external_id),
-            ..Default::default()
+            // D73'S ADMIN FLAG, AND IT HAS TO ARRIVE. It is settable at creation
+            // for exactly one reason the contract states: the FIRST administrator
+            // must exist before anyone can log in to promote one. This service
+            // does not decide the value and does not authorise on it — it carries
+            // what the caller sent, which is what `SetUserAdmin` exists to change
+            // afterwards.
+            is_admin: r.is_admin,
+            // NOT FORWARDED, for the reason given at `issue_credential`. One of
+            // that comment's seven relay sites.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
 
@@ -1449,9 +1650,13 @@ impl IamService for Iam {
         );
 
         let mut upstream = Request::new(db::AddTeamMemberRequest {
+            // D9's key travels, on `revoke_credential`'s reasoning.
+            idempotency: req.get_ref().idempotency.clone(),
             team_id: req.get_ref().team_id.clone(),
             user_id: req.get_ref().user_id.clone(),
-            ..Default::default()
+            // NOT FORWARDED, for the reason given at `issue_credential`. One of
+            // that comment's seven relay sites.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
 
@@ -1490,9 +1695,13 @@ impl IamService for Iam {
         );
 
         let mut upstream = Request::new(db::RemoveTeamMemberRequest {
+            // D9's key travels, on `revoke_credential`'s reasoning.
+            idempotency: req.get_ref().idempotency.clone(),
             team_id: req.get_ref().team_id.clone(),
             user_id: req.get_ref().user_id.clone(),
-            ..Default::default()
+            // NOT FORWARDED, for the reason given at `issue_credential`. One of
+            // that comment's seven relay sites.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
 
