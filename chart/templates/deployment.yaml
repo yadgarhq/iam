@@ -314,6 +314,44 @@ spec:
             - name: keys
               mountPath: /var/run/secrets/iam-keys
               readOnly: true
+            # THE CONFIGURATION REPOSITORY'S TWO CONFIGMAPS (ADR-0569, ADR-0570,
+            # step 2a): the knobs every service reads, and this service's own —
+            # empty today, mounted anyway so it is ready the day it is not.
+            #
+            # DIRECTORIES, NEVER `subPath`. A subPath mount is copied once at
+            # container start and kubelet never updates it, so the file would be
+            # frozen for the life of the pod while the ConfigMap moved underneath
+            # it — the rotation watcher would see nothing and an edited knob
+            # would silently never take effect.
+            #
+            # NO `optional: true`, unlike every Secret mount below. The default,
+            # `false`, is what makes kubelet refuse to start this pod at all
+            # while `shared` or `iam` is absent — `ContainerCreating` naming the
+            # missing ConfigMap — rather than starting it with an empty
+            # directory the binary would then refuse to read from anyway
+            # (`ScheduleError::Absent`).
+            #
+            # **`iam` IS MOUNTED, AND TODAY IT IS NEITHER READ NOR WATCHED.**
+            # `yadgar-lifecycle`'s `Configuration::under(root)` yields exactly one
+            # path, `root/shared/shared.yaml`; the crate has no API for a
+            # per-service document, so `config-iam` is in no process's ADR-0523
+            # watch set. Two things follow and both are deliberate. The
+            # `optional: false` reasoning above is true of `shared` and NOT of
+            # this one — an absent `iam` ConfigMap blocks the pod for no
+            # functional benefit, which is accepted so that both mounts are
+            # governed by one rule rather than two. And the day this file gains
+            # its first knob, Argo will sync it and kubelet will swap it and NO
+            # POD WILL RESTART, so the new value never takes effect and nothing
+            # reports that — the exact failure ADR-0570 names for `envFrom`,
+            # reproduced through a file mount. THE MOUNT IS READY; JOINING THIS
+            # DOCUMENT TO THE WATCH SET IS A FURTHER CHANGE, and it belongs in
+            # the same pull request as the first `iam`-only knob.
+            - name: config-shared
+              mountPath: /etc/yadgar/config/shared
+              readOnly: true
+            - name: config-iam
+              mountPath: /etc/yadgar/config/iam
+              readOnly: true
             {{- if .Values.nats.passwordSecret }}
             # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
             # the enrolment CA below: a subPath mount is a one-time copy kubelet
@@ -367,6 +405,14 @@ spec:
         - name: keys
           secret:
             secretName: {{ .Values.keysSecret }}
+        # The two ConfigMaps `yadgarhq/config` renders, same reasoning as the
+        # mounts above: unconditional, a directory each, never optional.
+        - name: config-shared
+          configMap:
+            name: shared
+        - name: config-iam
+          configMap:
+            name: iam
         {{- if .Values.nats.passwordSecret }}
         - name: nats-password
           secret:

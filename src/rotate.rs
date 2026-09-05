@@ -111,8 +111,8 @@
 //! crate holds that property and the tests for it.
 
 pub use yadgar_lifecycle::rotate::{
-    watch, File, Inputs, Material, Presented, Schedule, ScheduleError, CERTIFICATE_NOT_AFTER,
-    WATCHED_FILES_UNREADABLE,
+    watch, Configuration, File, Inputs, Material, Presented, Schedule, ScheduleError,
+    CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
 use crate::invalidate::Credentials;
@@ -183,14 +183,27 @@ impl Material for EnrolmentConfig {
 /// Everything this deployment read at boot, hashed as it was read.
 ///
 /// **THE LIST IS THE ASSERTION, and this service's list is the longest in the
-/// estate.** Four materials, up to seven files. Each is opt-in and
-/// `Option<M>: Material` folds an absent one to nothing, so no argument needs a
-/// branch at the call site — which is what let the four per-role builder methods
-/// this module used to carry collapse into one trait.
+/// estate.** Five materials, up to eight files. Each of the first four is
+/// opt-in and `Option<M>: Material` folds an absent one to nothing, so no
+/// argument needs a branch at the call site — which is what let the four
+/// per-role builder methods this module used to carry collapse into one trait.
 ///
-/// **A cleartext `iam` still watches something**, unlike `task` and `gateway`:
-/// the chart ships a default enrolment CA, so the set is non-empty with TLS off
-/// at both ends.
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE FIFTH MEMBER, AND THE ONLY ONE
+/// THAT IS NEVER ABSENT (step 2a).** `config` is `shared/shared.yaml`, mounted
+/// from `yadgarhq/config`'s `shared` ConfigMap, and it is a [`Material`] like
+/// the other four: `Configuration` implements the trait by returning the one
+/// file it read its schedule from, so folding it in here joins the document to
+/// the ADR-0523 watch set through the exact same `Inputs::of` path the
+/// certificates, the broker password and the enrolment CA already take. An
+/// operator editing `shared.yaml` restarts this pod exactly as editing a CA
+/// bundle would. It is `&Configuration`, not `Option<&Configuration>` —
+/// unlike the other four, there is no deployment shape in which this service
+/// has none.
+///
+/// **A cleartext `iam` already watched something before this**, unlike `task`
+/// and `gateway`: the chart ships a default enrolment CA, so the set was
+/// non-empty with TLS off at both ends. Now every `iam`, cleartext or not,
+/// watches the mounted document too.
 ///
 /// Called from `main.rs` INSIDE boot, beside the code that read these files:
 /// every entry is hashed as it is added, so the baseline is the bytes the process
@@ -202,6 +215,10 @@ pub fn watch_set(
     upstream: Option<&UpstreamTls>,
     broker: Option<&Credentials>,
     enrolment: Option<&EnrolmentConfig>,
+    config: &Configuration,
 ) -> Inputs {
-    Inputs::of(SERVICE, &[&listener, &upstream, &broker, &enrolment])
+    Inputs::of(
+        SERVICE,
+        &[&listener, &upstream, &broker, &enrolment, config],
+    )
 }

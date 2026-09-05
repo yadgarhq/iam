@@ -6,8 +6,8 @@
 //! watch, that an identical-bytes swap does not, that an unreadable mount is
 //! survived, that the leaf rather than the issuer is what the gauge reports.
 //! None of that is repeated here. What is here is the claim only this repository
-//! can make: **an `iam` configured this way reads exactly these seven files, so
-//! exactly these seven files are watched.**
+//! can make: **an `iam` configured this way reads exactly these eight files, so
+//! exactly these eight files are watched.**
 //!
 //! **THE MUTANT THIS FILE EXISTS TO KILL.** The watch set used to be FOUR builder
 //! calls scattered across `main.rs`, up to a hundred and fifty lines apart, and
@@ -19,18 +19,19 @@
 //! below goes through [`yadgar_iam::rotate::watch_set`] — the SAME function
 //! `main.rs` calls — so a member deleted from that list turns this red.
 //!
-//! **TWO OF THE SEVEN ARE NOT TRANSPORT MATERIAL.** The broker password is not a
-//! certificate and the enrolment CA is token payload; both are read once at boot
-//! out of directory mounts that rotate, and ADR-0523's rule is about provenance
-//! rather than payload. A watch set that admitted only TLS files would let each
-//! of them go stale in silence.
+//! **THREE OF THE EIGHT ARE NOT TRANSPORT MATERIAL.** The broker password is not
+//! a certificate and the enrolment CA is token payload; both are read once at
+//! boot out of directory mounts that rotate, and ADR-0523's rule is about
+//! provenance rather than payload. The mounted configuration document (step 2a)
+//! is the third — `yadgarhq/config`'s `shared.yaml`, read for the rotation
+//! schedule itself rather than for any transport role. A watch set that admitted
+//! only TLS files would let each of them go stale in silence.
 //!
 //! CERTIFICATES ARE MINTED PER RUN, for the reason `tests/serve_tls.rs` gives: a
 //! fixture key in the repository is a secret in the repository, and it expires on
 //! a date nobody is watching.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rcgen::{
@@ -39,7 +40,9 @@ use rcgen::{
 };
 
 use yadgar_iam::invalidate::Credentials;
-use yadgar_iam::rotate::{self, Presented, CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE};
+use yadgar_iam::rotate::{
+    self, Configuration, Presented, CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
+};
 use yadgar_iam::serve::{self, ServerTls};
 use yadgar_iam::service::EnrolmentConfig;
 use yadgar_iam::upstream::{self, UpstreamTls};
@@ -265,17 +268,33 @@ fn enrolment_config(mount: &Mount) -> EnrolmentConfig {
     .expect("a gateway and a readable CA")
 }
 
+/// The mounted document `yadgarhq/config` renders into the `shared` ConfigMap
+/// (step 2a) — under its OWN root, never [`Mount`]'s, because the two
+/// ConfigMaps land in separate directories in the real deployment and nothing
+/// here should suggest otherwise.
+fn configuration(body: &str) -> Configuration {
+    let root = std::env::temp_dir().join(format!("yadgar-iam-assembly-config-{}", unique()));
+    std::fs::create_dir_all(root.join("shared")).unwrap();
+    std::fs::write(root.join("shared").join("shared.yaml"), body).unwrap();
+    Configuration::under(root)
+}
+
 /// EVERY FILE THE CONFIGURATION NAMED IS IN THE WATCH SET, IN ORDER, AND NOTHING
 /// ELSE.
 ///
-/// This is the assertion the whole lift was for. Delete any of the four
+/// This is the assertion the whole lift was for. Delete any of the five
 /// materials from the list in `rotate::watch_set` and this case goes red; before
 /// the lift the equivalent edit in `main.rs` was a mutant nothing killed — and
 /// dropping the enrolment CA in particular used to pass every rotation case this
 /// repository had.
+///
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS LAST**, which is what one client leaf
+/// presented to `iam-db`, plus the broker password and the enrolment CA, plus the
+/// shared document every service now mounts (step 2a), looks like once folded.
 #[test]
 fn the_watch_set_holds_every_file_this_deployment_configured() {
     let mount = Mount::new(&generation("iam"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     assert_eq!(
         rotate::watch_set(
@@ -283,6 +302,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             Some(&upstream_tls(&mount)),
             Some(&broker_credentials(&mount)),
             Some(&enrolment_config(&mount)),
+            &config,
         )
         .watched(),
         vec![
@@ -293,10 +313,12 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             mount.path("client-key.pem").as_path(),
             mount.path("nats-password").as_path(),
             mount.path("enrolment-ca.pem").as_path(),
+            config.path(),
         ],
-        "a fully configured `iam` reads seven files at boot: the listener's leaf and its \
+        "a fully configured `iam` reads eight files at boot: the listener's leaf and its \
          key, the bundle `iam-db` is verified against, the client identity presented on \
-         that hop (ADR-0516), the broker password, and the CA every D73 token carries"
+         that hop (ADR-0516), the broker password, the CA every D73 token carries, and the \
+         mounted configuration document every service now watches (step 2a)"
     );
 }
 
@@ -309,11 +331,13 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
 #[test]
 fn each_certificate_is_reported_as_the_one_it_is() {
     let mount = Mount::new(&generation("iam"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
     let inputs = rotate::watch_set(
         Some(&listener_tls(&mount)),
         Some(&upstream_tls(&mount)),
         Some(&broker_credentials(&mount)),
         Some(&enrolment_config(&mount)),
+        &config,
     );
 
     assert_eq!(
@@ -327,53 +351,71 @@ fn each_certificate_is_reported_as_the_one_it_is() {
 /// EACH MATERIAL CONTRIBUTES ON ITS OWN, so a deployment running cleartext with
 /// an enrolment CA still has something to watch — which is what a default install
 /// of this chart actually is, and where `iam` differs from `task` and `gateway`.
+///
+/// **NOTHING CONFIGURED IS NO LONGER NOTHING TO WATCH (step 2a).** The mounted
+/// configuration document is unconditional — `&Configuration`, not
+/// `Option<&Configuration>` — so even the emptiest `iam` now watches
+/// `shared.yaml` and restarts when an operator edits it.
 #[test]
 fn each_configured_material_contributes_on_its_own() {
     let mount = Mount::new(&generation("iam"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
-    assert!(
-        rotate::watch_set(None, None, None, None).is_empty(),
-        "nothing configured is nothing to watch"
+    assert_eq!(
+        rotate::watch_set(None, None, None, None, &config).watched(),
+        vec![config.path()],
+        "with nothing else configured, the mounted configuration document is the only \
+         thing watched — it is unconditional, unlike the four materials beside it"
     );
 
     assert_eq!(
-        rotate::watch_set(Some(&listener_tls(&mount)), None, None, None).watched(),
+        rotate::watch_set(Some(&listener_tls(&mount)), None, None, None, &config).watched(),
         vec![
             mount.path("tls.pem").as_path(),
             mount.path("tls-key.pem").as_path(),
+            config.path(),
         ],
-        "a listener reads its certificate and the key belonging to it"
+        "a listener reads its certificate and the key belonging to it, plus the mounted \
+         document"
     );
 
     assert_eq!(
-        rotate::watch_set(None, Some(&upstream_tls(&mount)), None, None).watched(),
+        rotate::watch_set(None, Some(&upstream_tls(&mount)), None, None, &config).watched(),
         vec![
             mount.path("ca.pem").as_path(),
             mount.path("client.pem").as_path(),
             mount.path("client-key.pem").as_path(),
+            config.path(),
         ],
-        "the client certificate and its key both join the set beside the bundle"
+        "the client certificate and its key both join the set beside the bundle, and the \
+         mounted document beside both"
     );
 
     assert_eq!(
-        rotate::watch_set(None, None, Some(&broker_credentials(&mount)), None).watched(),
-        vec![mount.path("nats-password").as_path()],
+        rotate::watch_set(None, None, Some(&broker_credentials(&mount)), None, &config).watched(),
+        vec![mount.path("nats-password").as_path(), config.path()],
         "the broker password is watched on the same ground as a certificate: the process \
          read it at boot"
     );
 
     // TLS OFF, enrolment CA set: the chart's DEFAULT shape.
     assert_eq!(
-        rotate::watch_set(None, None, None, Some(&enrolment_config(&mount))).watched(),
-        vec![mount.path("enrolment-ca.pem").as_path()],
-        "a cleartext deployment with an enrolment CA still watches it"
+        rotate::watch_set(None, None, None, Some(&enrolment_config(&mount)), &config).watched(),
+        vec![mount.path("enrolment-ca.pem").as_path(), config.path()],
+        "a cleartext deployment with an enrolment CA still watches it, plus the mounted \
+         document"
     );
 
     // A gateway with a publicly-trusted certificate reads no CA at all, so there
-    // is no path to watch even though the configuration exists.
+    // is no path to watch beyond the mounted document even though the
+    // configuration exists.
     let no_ca = EnrolmentConfig::load("https://gateway.invalid:18443", None)
         .expect("no CA is a deployment, not an error");
-    assert!(rotate::watch_set(None, None, None, Some(&no_ca)).is_empty());
+    assert_eq!(
+        rotate::watch_set(None, None, None, Some(&no_ca), &config).watched(),
+        vec![config.path()],
+        "no CA configured leaves only the mounted document, which is never absent"
+    );
 }
 
 /// THE GAUGE THIS PROCESS PUBLISHES SAYS `service = "iam"`.
@@ -383,16 +425,18 @@ fn each_configured_material_contributes_on_its_own() {
 /// `crate::service::SERVICE`, and a value that drifted would blank a panel with
 /// nothing failing.
 ///
-/// **AND THE BROKER PASSWORD PUBLISHES NOTHING.** A password has no validity
-/// period; inventing one, or reusing the `kind` label for something that is not a
-/// presented leaf, would put a number on a dashboard that means nothing. Two
-/// series from seven watched files is the assertion that says so.
+/// **AND THE BROKER PASSWORD PUBLISHES NOTHING, NOR DOES THE MOUNTED
+/// CONFIGURATION DOCUMENT.** A password has no validity period, and neither
+/// does a YAML file; inventing one, or reusing the `kind` label for something
+/// that is not a presented leaf, would put a number on a dashboard that means
+/// nothing. Two series from eight watched files is the assertion that says so.
 ///
 /// A plain `#[test]`: `with_local_recorder` is thread-local and
 /// `export_not_after` is synchronous, so there is no runtime to involve.
 #[test]
 fn the_gauge_names_this_service_and_each_certificate_it_holds() {
     let mount = Mount::new(&generation("iam"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
@@ -401,6 +445,7 @@ fn the_gauge_names_this_service_and_each_certificate_it_holds() {
             Some(&upstream_tls(&mount)),
             Some(&broker_credentials(&mount)),
             Some(&enrolment_config(&mount)),
+            &config,
         )
         .export_not_after()
     });
@@ -484,11 +529,13 @@ fn the_gauge_names_this_service_and_each_certificate_it_holds() {
 #[test]
 fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
     let mount = Mount::new(&generation("iam"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
     let inputs = rotate::watch_set(
         Some(&listener_tls(&mount)),
         Some(&upstream_tls(&mount)),
         Some(&broker_credentials(&mount)),
         Some(&enrolment_config(&mount)),
+        &config,
     );
 
     let recorder = DebuggingRecorder::new();
@@ -507,13 +554,14 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
 
     assert!(
         nothing_wrong.is_empty(),
-        "every one of the seven files this mount names is readable: {nothing_wrong:?}"
+        "every one of the seven files this mount names, plus the mounted configuration \
+         document, is readable: {nothing_wrong:?}"
     );
     assert_eq!(
         one_gone,
         vec![gone.display().to_string()],
         "the broker password was removed, so it is the one unreadable file and the \
-         six beside it are not"
+         seven beside it — including the mounted configuration document — are not"
     );
 
     for (emitted, expected) in [(at_zero, 0.0_f64), (at_one, 1.0_f64)] {
@@ -547,23 +595,28 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
 }
 
 // ---------------------------------------------------------------------------
-// THE TWO NAMES THE CHART RENDERS, AND THE TWO NAMES THIS BINARY READS.
+// THE CHART STILL SPEAKS TWO LANGUAGES TO THE ROTATION WATCHER (STEP 2A).
 //
-// `Schedule::from_lookup` answers an unmatched key with a DEFAULT rather than an
-// error, so a variable nobody reads is silent in both directions: the chart goes
-// on rendering it and the process goes on polling every 60s. `yadgar-lifecycle`
-// pins both spellings in its own unit tests, so a rename inside the crate breaks
-// the crate loudly — what is left uncovered is narrower and lives HERE: a
-// spelling in THIS chart that no longer matches the one the crate reads.
+// Before v0.2.0, `Schedule::from_lookup` answered an unmatched key with a
+// DEFAULT rather than an error, so a variable nobody read was silent in both
+// directions — and this file used to derive the chart's env-var spelling from
+// the TEMPLATE and feed it straight to that reader, a real coupling test. Both
+// `from_lookup` and `from_env` are deleted from `yadgar-lifecycle` now, and
+// this binary reads `rotate::Configuration::mounted()` instead (`main.rs`), so
+// that particular coupling has nothing left to assert.
 //
-// The names are taken OUT OF THE TEMPLATE rather than written down again,
-// anchored on the `values.yaml` key, because the variable's spelling is the
-// thing under test and a copy of it here would agree with itself for ever.
+// TWO THINGS STILL HAVE TO HOLD, ONE PER SOURCE. The chart must keep rendering
+// the two environment variables the OLD binary reads — asserted below as
+// literal strings, which is the honest form now that no reader in THIS binary
+// exists to derive them from. And the chart's `mountPath` must keep agreeing
+// with the path the NEW binary reads, asserted below by deriving the expected
+// path from `Configuration::mounted()` itself, so a rename in
+// `yadgar-lifecycle` turns this red rather than agreeing with a copy of itself.
 //
-// WHAT THIS DOES NOT COVER, stated rather than implied: the anchor is the
-// `.Values` key as the TEMPLATE spells it. A `values.yaml` renamed out from
-// under an unchanged template is a different defect, and `helm` catches that one
-// itself — `required` fails the render.
+// WHAT NEITHER COVERS, stated rather than implied: the anchor for the first is
+// the `.Values` key as the TEMPLATE spells it, and a `values.yaml` renamed out
+// from under an unchanged template is a different defect that `helm` itself
+// catches — `required` fails the render.
 // ---------------------------------------------------------------------------
 
 /// The template this service is deployed from, read at COMPILE TIME so this can
@@ -602,33 +655,58 @@ fn rendered_env_name(values_key: &str) -> String {
         })
 }
 
-/// The schedule an operator sets through this chart is the schedule this process
-/// runs on.
+/// STEP 2A KEEPS BOTH SOURCES LIVE (MIGRATION_NOTES.md, ADR-0569/ADR-0570).
+///
+/// `rotate::Schedule::from_env` and `from_lookup` are gone from
+/// `yadgar-lifecycle` v0.2.0, and this binary now reads its schedule from
+/// `rotate::Configuration::mounted()` instead — so the coupling this test used
+/// to assert (the chart's rendered variable feeds `Schedule::from_lookup`) no
+/// longer exists to test. What still has to hold, and what this asserts
+/// instead, is that the chart goes on rendering BOTH variables under their
+/// established names: Argo takes this chart from HEAD the moment this pull
+/// request merges, while the image is pinned by digest minutes later from a
+/// separate pipeline, so a pod can roll onto the OLD binary — which still
+/// reads these two variables and has no other source. Deleting either is step
+/// 2b, and only after that digest has landed in `yadgarhq/argocd`.
 #[test]
-fn the_chart_renders_the_schedule_variables_this_binary_reads() {
-    let poll_key = rendered_env_name(".Values.tlsRotation.pollSeconds");
-    let splay_key = rendered_env_name(".Values.tlsRotation.splayMaxSeconds");
-
-    // NEITHER SENTINEL IS A DEFAULT — `from_lookup` falls back to 60s and 300s,
-    // so a sentinel equal to either would pass against a name nothing reads.
-    let schedule = rotate::Schedule::from_lookup(|key| match key {
-        _ if key == poll_key => Some("17".to_owned()),
-        _ if key == splay_key => Some("941".to_owned()),
-        _ => None,
-    })
-    .expect("a schedule of two whole numbers of seconds");
-
+fn the_chart_still_renders_the_tls_rotation_variables_for_the_old_binary() {
     assert_eq!(
-        schedule.poll(),
-        Duration::from_secs(17),
-        "the chart renders {poll_key} and the watcher reads something else, so the poll interval \
-         an operator sets through this chart never reaches the process"
+        rendered_env_name(".Values.tlsRotation.pollSeconds"),
+        "TLS_ROTATION_POLL_SECS",
+        "a pod that rolls onto the old binary before this release's digest reaches \
+         yadgarhq/argocd reads its poll interval from this variable and no other source"
     );
     assert_eq!(
-        schedule.splay_max(),
-        Duration::from_secs(941),
-        "the chart renders {splay_key} and the watcher reads something else, so every pod would \
-         exit on a rotated certificate inside the default window rather than the one this \
-         deployment states"
+        rendered_env_name(".Values.tlsRotation.splayMaxSeconds"),
+        "TLS_ROTATION_SPLAY_MAX_SECS",
+        "a pod that rolls onto the old binary before this release's digest reaches \
+         yadgarhq/argocd reads its splay ceiling from this variable and no other source"
+    );
+}
+
+/// THE CHART'S `mountPath` AND THE PATH THIS BINARY ACTUALLY READS MUST AGREE.
+///
+/// Naming the expected path a second time here would agree with itself for
+/// ever, so it is derived from `Configuration::mounted()` — the exact call
+/// `main.rs` makes — and a rename inside `yadgar-lifecycle` turns this red
+/// instead.
+#[test]
+fn the_chart_mounts_the_shared_configmap_where_this_binary_looks_for_it() {
+    let mounted = Configuration::mounted();
+    let shared_dir = mounted
+        .path()
+        .parent()
+        .expect("the mounted document has a parent directory")
+        .display()
+        .to_string();
+
+    assert!(
+        DEPLOYMENT
+            .lines()
+            .any(|line| line.trim() == format!("mountPath: {shared_dir}")),
+        "yadgar_lifecycle::rotate::Configuration::mounted() reads {}, but no volumeMount in \
+         this chart's deployment.yaml names {shared_dir} as its mountPath — a pod would exit \
+         at boot naming a path this chart never mounts",
+        mounted.path().display()
     );
 }
