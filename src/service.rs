@@ -167,18 +167,29 @@ const MAX_ENCRYPTED_FIELD_BYTES: usize = 484;
 /// none. If either column widens, this constant is what has to move with it.
 ///
 /// **THE SWEEP, BECAUSE FIXING AN INSTANCE IS NOT CLOSING A CLASS — AND THE
-/// SWEEP IS WHY THIS IS CHECKED ON TWO RPCs AND NOT ON SEVEN.** Seven RPCs on
-/// this contract carry an `Idempotency`. Only two hand a key to a store that
-/// PERSISTS it: [`IamService::redeem_enrolment`] and
-/// [`IamService::set_inherited_setting`]. `iam-db` reads the field on exactly
-/// those two handlers; `CreateUser`, `CreateEnrolment`, `AddTeamMember`,
-/// `RemoveTeamMember` and `RevokeCredential` accept a key and DISCARD it, so
-/// there is no column for a bound to be protecting and refusing there would be
-/// a refusal the store does not make. **THAT IS A COUPLING TO ANOTHER MODULE'S
-/// PRESENT BEHAVIOUR, and it is stated rather than left to be discovered: the
-/// five discarded keys are a D9 defect of their own, and whoever gives one of
-/// them a ledger must extend this check to that RPC in the same change.** They
-/// will not find this comment by grepping for the column they add.
+/// SWEEP IS WHY THIS IS CHECKED ON TWO RPCs AND NOT ON TEN.** TEN messages on
+/// `yadgar.iam.v1` carry an `Idempotency`, and they fall in four groups:
+///
+/// - **TWO hand the key to a store that PERSISTS it** —
+///   [`IamService::redeem_enrolment`] and [`IamService::set_inherited_setting`].
+///   `iam-db` reads `r.idempotency` on exactly those two handlers, and those two
+///   ledgers are the only columns in that schema a caller's key reaches. They
+///   are what this bound is for.
+/// - **FIVE forward a key `iam-db` then DISCARDS** — `CreateUser`,
+///   `IssueEnrolment`, `AddTeamMember`, `RemoveTeamMember` and
+///   `RevokeCredential`. No column receives one, so a bound here would be a
+///   refusal the store does not make.
+/// - **ONE forwards no key at all**, deliberately:
+///   [`IamService::issue_credential`] sets `idempotency: None` on the hop, and
+///   the comment there carries ADR-0519's argument for that silence.
+/// - **TWO reach no store** — `SetUserAdmin` and `SetRateLimitOverride` answer
+///   `UNIMPLEMENTED` before anything is forwarded.
+///
+/// **THE SECOND GROUP IS A COUPLING TO ANOTHER MODULE'S PRESENT BEHAVIOUR, and
+/// it is stated rather than left to be discovered: the five discarded keys are a
+/// D9 defect of their own, and whoever gives one of them a ledger must extend
+/// this check to that RPC in the same change.** They will not find this comment
+/// by grepping for the column they add.
 ///
 /// **A BOUND AND NOT A REQUIREMENT.** An EMPTY key still means "no
 /// deduplication" wherever the contract allows one — `set_inherited_setting`
@@ -221,13 +232,22 @@ const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
 /// two names for one shape — an identifier this schema minted, in a column of
 /// one declared width — so the derivation has no per-field term.
 ///
-/// **THE SWEEP.** Four RPCs carry a caller-supplied id that reaches a `VARCHAR`
-/// column, and only these two reach it UNGUARDED. `IssueEnrolment.user_id` is
-/// consulted through `live_user` before any write, so an over-long one is
-/// `NOT_FOUND` and never meets a column. `AddTeamMember` and `RemoveTeamMember`
-/// reach `INSERT IGNORE` and `DELETE`, neither of which the engine refuses on
-/// width — measured: `INSERT IGNORE` downgrades `1406` to warning `1265` and
-/// skips the row — so a bound there would refuse what the store accepts.
+/// **THE SWEEP.** FIVE implemented RPCs hand a caller-supplied id to a statement
+/// `iam-db` runs, and only these TWO hand one to a column UNGUARDED. The other
+/// three each already answer without an engine error:
+///
+/// - `IssueEnrolment.user_id` is consulted through `live_user` before any write,
+///   so an over-long one is `NOT_FOUND` and never meets a column.
+/// - `AddTeamMember` reaches `INSERT IGNORE`, which downgrades `1406` to warning
+///   `1265` and skips the row — measured — so the engine refuses nothing.
+/// - `RemoveTeamMember` reaches a `DELETE`, which matches nothing and refuses
+///   nothing.
+///
+/// A bound on the last two would refuse what the store accepts. Three further
+/// RPCs are outside the sweep rather than inside it and passing:
+/// `RevokeCredential.credential_id` reaches a `WHERE` clause and never a column,
+/// and `SetUserAdmin` and `SetRateLimitOverride` answer `UNIMPLEMENTED` before
+/// any store call.
 ///
 /// **WHAT THIS DOES NOT CLOSE, SAID PLAINLY.** `iam-db`'s `create_credential` is
 /// the one write in that service with NO liveness check, so a user id that is
