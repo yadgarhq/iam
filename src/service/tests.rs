@@ -3015,3 +3015,171 @@ fn the_outcome_of_a_label_refusal_is_one_the_shared_mapping_produces() {
         );
     }
 }
+
+/// One `CreateUser`, with `external_id` and `display_name` chosen by the caller.
+///
+/// Both fields in one helper because both are bounded by the same constant for
+/// the same reason — see [`super::MAX_ENCRYPTED_FIELD_BYTES`] — and a bound test
+/// that could only reach one of them would leave the other's arm unpinned.
+async fn create_user_named(
+    external_id: &str,
+    display_name: &str,
+) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+    let answered = iam
+        .create_user(Request::new(CreateUserRequest {
+            external_id: external_id.into(),
+            display_name: display_name.into(),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ());
+    (answered, rec)
+}
+
+/// The longest name the column holds is ACCEPTED, on both fields.
+///
+/// **484 IS A TYPED LITERAL AND NAMES NO CONSTANT** (ADR-0573). Written as
+/// `MAX_ENCRYPTED_FIELD_BYTES` this test would agree with the constant whatever
+/// the constant said — which is the failure it exists to catch, and the one the
+/// label suite's own comment records having measured. The derivation behind 484
+/// is checked separately and empirically by
+/// `crypto::tests::the_longest_plaintext_the_column_holds_encrypts_to_exactly_the_column_width`.
+#[tokio::test]
+async fn create_user_accepts_the_longest_name_the_column_holds() {
+    for (field, (answered, rec)) in [
+        (
+            "external_id",
+            create_user_named(&"a".repeat(484), "ok").await,
+        ),
+        (
+            "display_name",
+            create_user_named("ok", &"a".repeat(484)).await,
+        ),
+    ] {
+        answered.unwrap_or_else(|e| {
+            panic!("{field}: 484 bytes encrypts to exactly the column's 512: {e:?}")
+        });
+        assert_eq!(
+            rec.lock().expect("recorded").create_user.len(),
+            1,
+            "{field}: an accepted name must reach the store"
+        );
+    }
+}
+
+/// ONE BYTE PAST THE COLUMN IS `INVALID_ARGUMENT`, and it never reaches the store.
+///
+/// **THIS IS THE DEFECT.** `create_user` ran NO validation whatever: the name was
+/// encrypted and sent, `iam-db` handed the over-long `VARBINARY(512)` to MariaDB,
+/// and every engine error there is rendered as `UNAVAILABLE "storage
+/// unavailable"` — so an operator who typed a long name was told the database was
+/// down. Refusing here makes the answer this service's own.
+///
+/// Pinning BOTH SIDES, per ADR-0565: 484 is granted above and 485 is the first
+/// value refused. A one-sided test passes for a bound set anywhere below it.
+#[tokio::test]
+async fn create_user_refuses_a_name_one_byte_past_the_column() {
+    for (field, (answered, rec)) in [
+        (
+            "external_id",
+            create_user_named(&"a".repeat(485), "ok").await,
+        ),
+        (
+            "display_name",
+            create_user_named("ok", &"a".repeat(485)).await,
+        ),
+    ] {
+        let refusal = answered.expect_err("485 bytes cannot be stored");
+        assert_eq!(
+            refusal.code(),
+            tonic::Code::InvalidArgument,
+            "{field}: the caller's own input is the caller's own fault, and \
+             UNAVAILABLE blames a database that is working"
+        );
+        assert!(
+            rec.lock().expect("recorded").create_user.is_empty(),
+            "{field}: a refused request must write nothing"
+        );
+    }
+}
+
+/// The bound is BYTES, and this is the case a character bound gets wrong.
+///
+/// `VARBINARY` counts bytes and `Keys::encrypt` enciphers `as_bytes()`, so 122
+/// four-byte codepoints is 488 bytes, encrypts to 516, and the column refuses it
+/// — while a character bound of 484 would wave it through and hand the caller the
+/// storage error this change exists to delete. It is the MIRROR of
+/// `MAX_LABEL_CHARS`, which counts CHARACTERS because `VARCHAR(255)` on utf8mb4
+/// does, and the two must not be tidied into one unit.
+#[tokio::test]
+async fn the_name_bound_counts_bytes_and_not_characters() {
+    // 121 × 4 = 484 bytes: the last one that fits.
+    let fits = "\u{1F600}".repeat(121);
+    assert_eq!(fits.len(), 484, "the fixture must fill the column exactly");
+    create_user_named(&fits, "ok")
+        .await
+        .0
+        .expect("484 bytes is 484 bytes, whatever it spells");
+
+    // 122 × 4 = 488 bytes, and only 122 characters — well under any plausible
+    // character bound, and past the column all the same.
+    let does_not = "\u{1F600}".repeat(122);
+    assert_eq!(does_not.chars().count(), 122);
+    assert_eq!(does_not.len(), 488);
+    assert_eq!(
+        create_user_named(&does_not, "ok")
+            .await
+            .0
+            .expect_err("488 bytes is past the column")
+            .code(),
+        tonic::Code::InvalidArgument,
+    );
+}
+
+/// The `outcome` a name refusal records is one the SHARED MAPPING produces.
+///
+/// The same argument as `the_outcome_of_a_label_refusal_is_one_the_shared_mapping_produces`,
+/// applied to the arm this change adds: `Call::fail` takes `self` by value so the
+/// compiler holds it ahead of the `Err`, but a branch that never calls it
+/// compiles fine and records `UNRECORDED`. This branch is brand new, so there was
+/// nothing to copy and nothing to notice its absence.
+#[test]
+fn the_outcome_of_a_name_refusal_is_one_the_shared_mapping_produces() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            create_user_named(&"a".repeat(485), "ok")
+                .await
+                .0
+                .expect_err("485 bytes cannot be stored");
+        });
+    });
+
+    let outcomes: Vec<String> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, _)| key.key().name() == "yadgar_calls_total")
+        .flat_map(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .filter(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    assert!(
+        outcomes.iter().any(|o| o == "INVALID_ARGUMENT"),
+        "the refusal must be recorded as INVALID_ARGUMENT, which is what \
+         telemetry::grpc::status_name produces for tonic::Code::InvalidArgument; \
+         got {outcomes:?}, and UNRECORDED is what a missing call.fail looks like"
+    );
+}

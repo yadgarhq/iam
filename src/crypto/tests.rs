@@ -576,3 +576,49 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
         );
     }
 }
+
+/// THE OVERHEAD [`super::Keys::encrypt`] ADDS, MEASURED RATHER THAN ASSUMED.
+///
+/// `iam_user.external_id_ciphertext` and `iam_user.display_name_ciphertext` are
+/// `VARBINARY(512)` (`iam-db/src/schema.rs`), and what lands in them is what this
+/// function returns. So the longest plaintext the column can hold is 512 minus
+/// whatever this adds, and `service::MAX_ENCRYPTED_FIELD_BYTES` is that
+/// subtraction. This test is where the subtraction is CHECKED against the cipher
+/// rather than recited from memory.
+///
+/// The overhead is 28 bytes and it is two things, neither of them a choice this
+/// file makes: a 12-byte nonce prefixed by `encrypt` itself, and AES-256-GCM's
+/// 16-byte authentication tag appended by the cipher. AES-GCM is CTR mode
+/// underneath, so the enciphered bytes are exactly as many as the plaintext's —
+/// that is why a byte of plaintext costs exactly a byte of column and the
+/// relationship is a subtraction rather than a ratio.
+///
+/// **THE NUMBERS ARE LITERALS AND NAME NO CONSTANT** (ADR-0573). A test that
+/// wrote `MAX_ENCRYPTED_FIELD_BYTES` here would agree with the constant whatever
+/// the constant said, including when it is wrong — which is the whole failure
+/// this test exists to catch. 484 and 512 are written out, and if the cipher or
+/// the framing ever changes, this is what goes red.
+#[test]
+fn the_longest_plaintext_the_column_holds_encrypts_to_exactly_the_column_width() {
+    let k = keys();
+    assert_eq!(k.encrypt(&"a".repeat(484)).unwrap().len(), 512);
+    // ONE BYTE OVER, and it is the first value the column refuses. Pinning the
+    // last accepted value alone would pass for a bound set anywhere below it.
+    assert_eq!(k.encrypt(&"a".repeat(485)).unwrap().len(), 513);
+}
+
+/// The same subtraction over MULTI-BYTE plaintext, because the unit is BYTES.
+///
+/// `VARBINARY` counts bytes and `encrypt` enciphers `plaintext.as_bytes()`, so a
+/// character-counted bound would be wrong here in the direction that reopens the
+/// storage refusal: 484 `U+1F600` is 1936 bytes and encrypts to 1964, four times
+/// the column. This is the mirror of `MAX_LABEL_CHARS`'s argument, which counts
+/// CHARACTERS because `VARCHAR(255)` on utf8mb4 does.
+#[test]
+fn the_bound_is_bytes_and_not_characters() {
+    let k = keys();
+    // 121 four-byte characters is 484 bytes, so it fills the column exactly.
+    assert_eq!(k.encrypt(&"\u{1F600}".repeat(121)).unwrap().len(), 512);
+    // 484 of them is 1936 bytes, which is far past it.
+    assert_eq!(k.encrypt(&"\u{1F600}".repeat(484)).unwrap().len(), 1964);
+}

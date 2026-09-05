@@ -86,6 +86,61 @@ const MAX_PASSWORD_BYTES: usize = 1024;
 /// checks. If the column widens, this constant is what has to move with it.
 const MAX_LABEL_CHARS: usize = 255;
 
+/// The longest `external_id` or `display_name` accepted, IN BYTES, because that
+/// is what stores them once they are encrypted.
+///
+/// **484 = 512 − 12 − 16, AND EVERY TERM IS SOMETHING A READER CAN CHECK.** A
+/// magic number nobody can re-derive is how a bound like this rots, so the
+/// derivation is written out:
+///
+/// - **512** is the column. `iam_user.external_id_ciphertext` and
+///   `iam_user.display_name_ciphertext` are both `VARBINARY(512)`
+///   (`iam-db/src/schema.rs`), and `VARBINARY(n)` bounds BYTES.
+/// - **12** is the nonce [`crate::crypto::Keys::encrypt`] prefixes to what it
+///   returns (`crypto.rs`, `[0u8; 12]`). It is stored alongside the ciphertext
+///   because decryption needs it and there is no second column for it.
+/// - **16** is AES-256-GCM's authentication tag, appended by the cipher.
+///
+/// AES-GCM is CTR mode underneath, so the enciphered bytes number exactly as
+/// many as the plaintext's: a byte of name costs a byte of column, which is why
+/// this is a subtraction and not a ratio. **THE SUBTRACTION IS CHECKED BY
+/// MEASUREMENT rather than by this comment** —
+/// `crypto::tests::the_longest_plaintext_the_column_holds_encrypts_to_exactly_the_column_width`
+/// encrypts 484 bytes and asserts the result is 512, and encrypts 485 and
+/// asserts 513. If the cipher or the framing changes, that test goes red before
+/// this number does.
+///
+/// **BYTES AND NOT CHARACTERS, WHICH IS THE OPPOSITE OF [`MAX_LABEL_CHARS`] AND
+/// FOR THE SAME REASON.** That bound counts characters because `VARCHAR(255)` on
+/// utf8mb4 does; this one counts bytes because `VARBINARY(512)` does, and
+/// because `encrypt` enciphers `plaintext.as_bytes()`. Counting characters here
+/// would admit 484 four-byte codepoints — 1936 bytes, 1964 encrypted, nearly
+/// four times the column — and hand the caller back the storage error this bound
+/// exists to delete.
+///
+/// **ONE CONSTANT FOR TWO FIELDS, and unlike [`MAX_EXPIRES_IN_SECONDS`] that is
+/// not a judgement being shared.** ADR-0565 requires a bound to be re-argued per
+/// field, and the argument here comes out identical twice over because it is not
+/// an opinion about what a field MEANS: `external_id` and `display_name` are
+/// encrypted by the same call in the same RPC and land in two columns declared
+/// with the same width. The derivation has no per-field term in it. Two copies
+/// of one subtraction is how one of them ends up stale.
+///
+/// **THE SWEEP, BECAUSE FIXING AN INSTANCE IS NOT CLOSING A CLASS.** `iam`
+/// encrypts caller-supplied text in exactly two places and both are checked
+/// here: `create_user`'s two `enc(...)` calls are the only uses of
+/// `Keys::encrypt` in this binary. Every other ciphertext `iam` handles is READ
+/// and decrypted, never written from an input.
+///
+/// Refusing here makes the outcome this service's own, and independent of a
+/// `sql_mode` it neither sets nor checks — the same argument [`MAX_LABEL_CHARS`]
+/// makes. Measured against the deployed instance on 2026-09-05, `sql_mode` is
+/// `STRICT_TRANS_TABLES`, so an over-long value ERRORS rather than truncating;
+/// under `sql_mode = ''` the same write would store a CLIPPED name and report
+/// success, and a clipped `external_id` is a username nobody can log in with. If
+/// either column widens, this constant is what has to move with it.
+const MAX_ENCRYPTED_FIELD_BYTES: usize = 484;
+
 /// The longest life [`IamService::issue_credential`] will grant: ten years.
 ///
 /// A BOUND ON THE DURATION ASKED FOR, NOT ON THE INSTANT IT PRODUCES, and that
@@ -855,6 +910,47 @@ fn check_label(label: &str) -> Result<(), Status> {
             "the label is longer than the store will hold: at most 255 \
              characters, counted as characters and not as bytes",
         ));
+    }
+    Ok(())
+}
+
+/// Everything [`IamService::create_user`] can refuse WITHOUT reaching the store.
+///
+/// **THE RPC HAD NO VALIDATION AT ALL, and that is what this closes.** An
+/// `external_id` longer than the column encrypted cleanly, travelled to `iam-db`
+/// as an over-wide `VARBINARY(512)`, and was refused by MariaDB — which `iam-db`
+/// renders as `UNAVAILABLE "storage unavailable"` like every other engine error.
+/// So an administrator who typed a long name was told the database was down, and
+/// through the gateway that arrives as a 503. A request that was never
+/// well-formed reported an outage.
+///
+/// **NO ORACLE, AND THIS PATH IS NOT WHERE ONE WOULD LIVE ANYWAY.** Both checks
+/// are answerable from the request alone: they say nothing about who already
+/// exists, and in particular they are decided before the unique blind index is
+/// consulted. `CreateUser` is an administrative verb rather than one a stranger
+/// can reach, but the request-only rule is what makes the refusal safe to state
+/// SHARPLY, and stating it sharply is the whole point.
+///
+/// **BOUNDS, NOT REQUIREMENTS.** An empty `external_id` and an empty
+/// `display_name` are left alone here. They are their own question — an empty
+/// `external_id` is a username nobody can type, and a SECOND one collides on
+/// `uq_iam_user_blind_index` because `HMAC("")` is a single value — and answering
+/// it is a contract decision rather than a length check.
+fn check_stored_names(r: &CreateUserRequest) -> Result<(), Status> {
+    for (field, value) in [
+        ("external_id", &r.external_id),
+        ("display_name", &r.display_name),
+    ] {
+        if value.len() > MAX_ENCRYPTED_FIELD_BYTES {
+            // NAMING THE FIELD, because two fields share this refusal and a
+            // message that named neither would send an administrator to check
+            // both. ADR-0565 requires the field to be named for exactly this.
+            return Err(Status::invalid_argument(format!(
+                "`{field}` is longer than the store will hold: at most 484 \
+                 bytes, counted as bytes and not as characters, because it is \
+                 encrypted before it is stored"
+            )));
+        }
     }
     Ok(())
 }
@@ -1690,6 +1786,19 @@ impl IamService for Iam {
         let rid = request_id_of(&req);
         let call = Call::start(SERVICE, "CreateUser", Kind::Write, tel(rid, ""));
         let r = req.get_ref();
+
+        // VALIDATION BEFORE ENCRYPTION, and the order is what makes the refusal
+        // legible. Encrypting first would spend the work and then refuse on a
+        // length nothing in the ciphertext explains; refusing first means the
+        // number in the message is the number the caller sent.
+        if let Err(refusal) = check_stored_names(r) {
+            // WITHOUT THIS THE REFUSAL IS RECORDED AS `UNRECORDED`. `Call::fail`
+            // takes `self` by value so the compiler holds it ahead of the `Err`,
+            // but a path that never calls it compiles fine and drops the `Call`
+            // — and this branch is brand new, so there was nothing to copy.
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
 
         let enc = |s: &str| {
             self.keys
