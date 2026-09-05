@@ -92,14 +92,37 @@ use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 use yadgar_iam::rotate;
 use yadgar_iam::serve;
-use yadgar_iam::service::{
-    EnrolmentConfig, Iam, ResponseFloors, DEFAULT_LOGIN_RESPONSE_FLOOR,
-    DEFAULT_REDEEM_RESPONSE_FLOOR,
-};
+use yadgar_iam::service::{EnrolmentConfig, Iam, ResponseFloors};
 use yadgar_iam::upstream;
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// One configuration knob, read from its ONE source, with no compiled-in
+/// default behind it (ADR-0569).
+///
+/// This replaced `env_or(key, default)`, and the deletion is the point rather
+/// than the rename: while the helper took a `default` argument, every knob in
+/// this binary had somewhere for a fallback to live, and a fallback is invisible
+/// at the point of use, survives an upgrade unnoticed, and makes the effective
+/// setting depend on which layer a reader happens to inspect.
+///
+/// AN EMPTY VALUE REFUSES TOO, and with its own message. A set-but-empty
+/// variable and an absent one collapsing into a single branch is a defect this
+/// estate found three separate times in one week: Helm renders an unset value as
+/// `""`, so the empty case is what a nulled chart value actually produces, and it
+/// is the one an operator is most likely to hit.
+fn env_required(key: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(format!(
+            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
+             nothing to fall back to. The chart renders it; a values override that nulls it \
+             produces exactly this."
+        )),
+        Err(_) => Err(format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
+             it from the environment alone and refuses to start rather than invent a value. \
+             The chart renders it."
+        )),
+    }
 }
 
 #[tokio::main]
@@ -141,8 +164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
-    let db_host = env_or("IAM_DB_HOST", "iam-db");
-    let db_port: u16 = env_or("IAM_DB_PORT", "50051").parse()?;
+    let db_host = env_required("IAM_DB_HOST")?;
+    let db_port: u16 = env_required("IAM_DB_PORT")?.parse()?;
 
     // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
     // the cleartext dial this service has always done. `iam-db` can now serve
@@ -192,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
     // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090").parse()?;
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
@@ -301,29 +324,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // at parameters other than this build's makes the response time report which
     // usernames exist — see `crypto::Keys::verify_password`.
     //
-    // PARSED, NOT SALVAGED: a mistyped value fails boot rather than falling back
-    // to the default. Silently substituting one would leave an operator who
-    // believes they raised the floor running the old one, and a security control
-    // nobody can tell is misconfigured is the failure this floor's own warning
-    // exists to prevent.
-    let default_floor_ms = DEFAULT_LOGIN_RESPONSE_FLOOR.as_millis().to_string();
+    // PARSED, NOT SALVAGED, AND NOT INVENTED EITHER: the chart is the one source
+    // of this number (ADR-0569), so an absent, empty or mistyped value fails the
+    // boot naming the variable. There is no longer a compiled-in floor to fall
+    // back to. Substituting one silently would leave an operator who believes
+    // they raised the floor running the old one, and a security control nobody
+    // can tell is misconfigured is the failure this floor's own warning exists
+    // to prevent. `service::DEFAULT_LOGIN_RESPONSE_FLOOR` survives as the
+    // MEASUREMENT the chart's value was calibrated from — documentation, read by
+    // no knob path.
     let login_response_floor =
-        Duration::from_millis(env_or("LOGIN_RESPONSE_FLOOR_MS", &default_floor_ms).parse()?);
+        Duration::from_millis(env_required("LOGIN_RESPONSE_FLOOR_MS")?.parse()?);
 
     // ITS OWN VALUE, because `RedeemEnrolment` legitimately does more work — two
     // Argon2id operations and a further round trip — and a floor sized for
     // `Login` would be exceeded by every successful redemption, turning the
     // warning that says "raise this" into one that fires on every call.
-    let default_redeem_ms = DEFAULT_REDEEM_RESPONSE_FLOOR.as_millis().to_string();
     let redeem_response_floor =
-        Duration::from_millis(env_or("REDEEM_RESPONSE_FLOOR_MS", &default_redeem_ms).parse()?);
+        Duration::from_millis(env_required("REDEEM_RESPONSE_FLOOR_MS")?.parse()?);
     tracing::info!(
         login_floor_ms = login_response_floor.as_millis() as u64,
         redeem_floor_ms = redeem_response_floor.as_millis() as u64,
         "Login and RedeemEnrolment answer no sooner than their response-time floors"
     );
 
-    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:50052").parse()?;
+    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
 
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
     // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
@@ -399,4 +424,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_required;
+
+    // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
+    // runs these on threads of one process, so tests sharing a variable name
+    // would pass or fail depending on scheduling.
+
+    /// The case a naive test omits, and the only one that proves the value is
+    /// USED. A test that merely asserts "boot succeeds" passes just as happily
+    /// with a compiled-in default still in place behind the read.
+    #[test]
+    fn a_set_value_is_returned_verbatim() {
+        std::env::set_var("YADGAR_TEST_IAM_REQUIRED_PRESENT", "0.0.0.0:50052");
+        assert_eq!(
+            env_required("YADGAR_TEST_IAM_REQUIRED_PRESENT").as_deref(),
+            Ok("0.0.0.0:50052")
+        );
+    }
+
+    #[test]
+    fn an_absent_knob_refuses_and_names_itself() {
+        std::env::remove_var("YADGAR_TEST_IAM_REQUIRED_ABSENT");
+        let err = env_required("YADGAR_TEST_IAM_REQUIRED_ABSENT").unwrap_err();
+        assert!(
+            err.contains("YADGAR_TEST_IAM_REQUIRED_ABSENT"),
+            "the refusal must name the knob, got: {err}"
+        );
+        assert!(err.contains("NOT SET"), "got: {err}");
+    }
+
+    /// **THE CASE THAT DISCRIMINATES.** Helm renders an unset value as `""`, so
+    /// a nulled chart value arrives here as set-but-empty rather than as absent.
+    /// An implementation that collapses the two into one branch is the defect
+    /// this estate found three separate times in one week, so the messages are
+    /// asserted to DIFFER rather than merely to exist.
+    #[test]
+    fn an_empty_knob_refuses_with_its_own_message() {
+        std::env::set_var("YADGAR_TEST_IAM_REQUIRED_EMPTY", "");
+        std::env::remove_var("YADGAR_TEST_IAM_REQUIRED_EMPTY_ABSENT");
+        let empty = env_required("YADGAR_TEST_IAM_REQUIRED_EMPTY").unwrap_err();
+        let absent = env_required("YADGAR_TEST_IAM_REQUIRED_EMPTY_ABSENT").unwrap_err();
+        assert!(empty.contains("set but EMPTY"), "got: {empty}");
+        assert!(
+            empty.replace("YADGAR_TEST_IAM_REQUIRED_EMPTY", "K")
+                != absent.replace("YADGAR_TEST_IAM_REQUIRED_EMPTY_ABSENT", "K"),
+            "empty and absent must not share one message"
+        );
+    }
 }

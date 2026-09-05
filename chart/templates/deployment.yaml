@@ -83,6 +83,21 @@ spec:
             - name: grpc
               containerPort: 50052
           env:
+            # THE TWO LISTENERS, STATED HERE because the binary no longer holds a
+            # default for either (ADR-0569): a knob has one source, and an absent
+            # or empty value refuses the boot naming the variable. These were the
+            # last two compiled-in defaults in iam, so rendering them is what
+            # keeps the pod bootable rather than what makes the ports tunable.
+            #
+            # LITERALS, not values.yaml keys. There is no operator question these
+            # answer — the grpc port is fixed by `containerPort: 50052` a few
+            # lines above and by the Service that targets it, and the metrics port
+            # by what the scrape config expects. A values key would invite the two
+            # to disagree.
+            - name: LISTEN
+              value: "0.0.0.0:50052"
+            - name: METRICS_LISTEN
+              value: "0.0.0.0:9090"
             {{- if .Values.tls.enabled }}
             # THE CERTIFICATE THIS SERVICE PRESENTS, not one it verifies —
             # `IAM_DB_TLS_*` below is the other direction, and the two share a
@@ -203,13 +218,13 @@ spec:
             # warns when a login exceeds it, which is the signal to raise it.
             #
             # `required` rather than a bare lookup or a `| default 250`. A values
-            # override that nulls `login` renders an EMPTY string here, `env_or`
-            # returns it for a set-but-empty variable, and the parse then fails
-            # at boot — a CrashLoop whose cause is three layers from its message.
-            # `required` turns that into a template-time error naming the value.
-            # NOT `| default`, which would hand back a floor nobody chose, and a
-            # security control configured by accident is the failure this whole
-            # change is about.
+            # override that nulls `login` renders an EMPTY string here, and the
+            # binary refuses that boot naming the variable (ADR-0569). `required`
+            # catches it one layer earlier still, as a TEMPLATE-time error naming
+            # the value, so nobody has to read a CrashLoop to learn which values
+            # key was nulled. NOT `| default`, which would hand back a floor
+            # nobody chose, and a security control configured by accident is the
+            # failure this whole change is about.
             - name: LOGIN_RESPONSE_FLOOR_MS
               value: {{ required "login.responseFloorMs is the Login response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.login.responseFloorMs | quote }}
             # The same control for RedeemEnrolment, and its own number. That RPC
