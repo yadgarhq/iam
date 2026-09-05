@@ -115,26 +115,6 @@ tls:
 # document (step 2a) joined it unconditionally — every `iam`, cleartext or not
 # and even without an enrolment CA, watches `shared.yaml` and restarts when an
 # operator edits it. That is ADR-0523 working as designed, not a fault.
-#
-# THE TWO VALUES BELOW ARE NO LONGER READ BY THIS BINARY. It reads its schedule
-# from `rotate::Configuration::mounted()` instead. They are rendered so that a
-# rollout landing this chart before this binary's digest still resolves a
-# schedule on the old one, and step 2b deletes them once that digest has
-# landed — see `yadgarhq/deploy`'s MIGRATION_NOTES.md.
-tlsRotation:
-  # How often the files are re-hashed. Reading four small files a minute costs
-  # nothing, and the deadline this protects is 30 days wide.
-  pollSeconds: 60
-  # THE LONGEST A POD WAITS BEFORE EXITING, drawn per pod inside that range.
-  #
-  # Both replicas see the refreshed file inside the same kubelet sync window, so
-  # an unsplayed exit can drop both at once — and the PodDisruptionBudget does
-  # NOT govern a self-exit, it constrains eviction. This is the only control
-  # there is. Five minutes against 30 days of slack is free.
-  #
-  # `0` exits immediately, which is what a single-replica or a development
-  # deployment wants.
-  splayMaxSeconds: 300
 
 # The HEADLESS Service of the -db twin (D23). Resolving this name yields every
 # ready pod address rather than one virtual IP, which is what makes client-side
@@ -223,7 +203,7 @@ iamDb:
     # leaf naming the wrong purpose. One authority issues both.
     #
     # IT ROTATES, AND IT IS WATCHED. The mount is a DIRECTORY, never subPath, and
-    # both files join the rotation watch set described under `tlsRotation` above.
+    # both files join the rotation watch set this binary assembles at boot (ADR-0523).
     # That matters MORE here than for the serving certificate: ADR-0516 records
     # that an expired client leaf STOPS this hop rather than degrading it, so a
     # process that read the file once and never again works perfectly until the
