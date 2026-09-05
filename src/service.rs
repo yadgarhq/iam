@@ -238,8 +238,15 @@ const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
 ///
 /// - `IssueEnrolment.user_id` is consulted through `live_user` before any write,
 ///   so an over-long one is `NOT_FOUND` and never meets a column.
-/// - `AddTeamMember` reaches `INSERT IGNORE`, which downgrades `1406` to warning
-///   `1265` and skips the row — measured — so the engine refuses nothing.
+/// - `AddTeamMember` reaches `INSERT IGNORE`, and the row is skipped — but by
+///   the FOREIGN KEY, not by `IGNORE`. Both measured on mariadb 11.8:
+///   `INSERT IGNORE` downgrades `1406` to warning `1265`, and separately
+///   downgrades the resulting FK violation `1452` to a warning too, so nothing
+///   lands and the engine refuses nothing. Against a table with NO foreign key
+///   the same statement reports `rows_affected 1` and STORES the value
+///   TRUNCATED to the column width. So this exclusion rests on `fk_t`/`fk_u`
+///   existing: delete them and the failure mode becomes silent truncation of a
+///   caller-supplied primary key, at which point this bound has to come back.
 /// - `RemoveTeamMember` reaches a `DELETE`, which matches nothing and refuses
 ///   nothing.
 ///
