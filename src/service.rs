@@ -141,6 +141,102 @@ const MAX_LABEL_CHARS: usize = 255;
 /// either column widens, this constant is what has to move with it.
 const MAX_ENCRYPTED_FIELD_BYTES: usize = 484;
 
+/// The longest `Idempotency.key` accepted, IN CHARACTERS, because that is what
+/// the two ledgers that store one are declared in.
+///
+/// **THE NUMBER IS THE COLUMN'S**, the same coupling [`MAX_LABEL_CHARS`] argues
+/// for and against the same alternative. `iam_enrolment_redemption` and
+/// `iam_inherited_setting_write` both declare `idempotency_key VARCHAR(255) NOT
+/// NULL PRIMARY KEY` on `CHARSET=utf8mb4` (`iam-db/src/schema.rs`), and
+/// `VARCHAR(n)` in utf8mb4 bounds CHARACTERS. Measured against `mariadb:11.8.9`
+/// — the image `iam-db`'s README stands up — with the column exactly as the
+/// schema declares it, at the stock `sql_mode` (`STRICT_TRANS_TABLES,…`):
+///
+/// | key             | characters | bytes | outcome                                                  |
+/// | --------------- | ---------- | ----- | -------------------------------------------------------- |
+/// | 255 × `k`       | 255        | 255   | stored                                                   |
+/// | 256 × `k`       | 256        | 256   | `ERROR 1406 Data too long for column 'idempotency_key'`  |
+/// | 255 × `U+1F600` | 255        | 1020  | stored, as a `PRIMARY KEY`                               |
+/// | 256 × `U+1F600` | 256        | 1024  | `ERROR 1406 Data too long for column 'idempotency_key'`  |
+///
+/// **ONE CONSTANT FOR TWO FIELDS, AND IT IS A DERIVATION RATHER THAN A SHARED
+/// JUDGEMENT.** ADR-0565 requires a bound to be re-argued per field; the
+/// argument here comes out identical twice because it is not an opinion about
+/// what a key MEANS. Two columns, one declared width, one unit. The derivation
+/// has no per-field term in it, exactly as [`MAX_ENCRYPTED_FIELD_BYTES`] has
+/// none. If either column widens, this constant is what has to move with it.
+///
+/// **THE SWEEP, BECAUSE FIXING AN INSTANCE IS NOT CLOSING A CLASS — AND THE
+/// SWEEP IS WHY THIS IS CHECKED ON TWO RPCs AND NOT ON SEVEN.** Seven RPCs on
+/// this contract carry an `Idempotency`. Only two hand a key to a store that
+/// PERSISTS it: [`IamService::redeem_enrolment`] and
+/// [`IamService::set_inherited_setting`]. `iam-db` reads the field on exactly
+/// those two handlers; `CreateUser`, `CreateEnrolment`, `AddTeamMember`,
+/// `RemoveTeamMember` and `RevokeCredential` accept a key and DISCARD it, so
+/// there is no column for a bound to be protecting and refusing there would be
+/// a refusal the store does not make. **THAT IS A COUPLING TO ANOTHER MODULE'S
+/// PRESENT BEHAVIOUR, and it is stated rather than left to be discovered: the
+/// five discarded keys are a D9 defect of their own, and whoever gives one of
+/// them a ledger must extend this check to that RPC in the same change.** They
+/// will not find this comment by grepping for the column they add.
+///
+/// **A BOUND AND NOT A REQUIREMENT.** An EMPTY key still means "no
+/// deduplication" wherever the contract allows one — `set_inherited_setting`
+/// skips the ledger entirely on an empty key. `RedeemEnrolment` requires a
+/// non-empty one, and that requirement is its own and predates this bound; see
+/// [`validate_redemption`].
+const MAX_IDEMPOTENCY_KEY_CHARS: usize = 255;
+
+/// The longest caller-supplied ENTITY ID accepted, IN CHARACTERS: the width of
+/// the `VARCHAR(96)` columns this schema keys its rows on.
+///
+/// **NAMED FOR THE WIDTH'S MEANING RATHER THAN FOR "AN ID", BECAUSE THIS SCHEMA
+/// HAS TWO ID WIDTHS AND 96 IS THE WRONG ANSWER FOR ONE OF THEM.** The 96-wide
+/// columns hold a `yadgar:<kind>:<uuid7>` primary key or a foreign key to one —
+/// `iam_user.id`, `iam_team.id`, `iam_credential.user_id`,
+/// `iam_enrolment.user_id`, `iam_team_member.{team_id,user_id}`,
+/// `iam_team_setting_override.team_id`, `iam_inherited_setting_write.team_id`.
+/// The ACTOR columns beside them are `VARCHAR(64)` —
+/// `iam_user.{created_by,updated_by,owner_user_id,team_id}`,
+/// `iam_team.{created_by,updated_by}`, `iam_team_member.added_by` — and none is
+/// in this class: every one is written as the literal `'system'` by `iam-db` or
+/// is never written at all. **A future caller-supplied value landing in a
+/// 64-wide column needs its own constant, not this one.**
+///
+/// Measured against `mariadb:11.8.9` at the stock `sql_mode`, with the columns
+/// exactly as `iam-db/src/schema.rs` declares them:
+///
+/// | id             | characters | bytes | outcome                                          |
+/// | -------------- | ---------- | ----- | ------------------------------------------------ |
+/// | 96 × `u`       | 96         | 96    | stored                                           |
+/// | 97 × `u`       | 97         | 97    | `ERROR 1406 Data too long for column 'user_id'`  |
+/// | 96 × `U+1F600` | 96         | 384   | stored                                           |
+///
+/// CHARACTERS for [`MAX_LABEL_CHARS`]'s reason and counted as `char`s for its
+/// reason too: a Rust `char` is a Unicode scalar and utf8mb4 stores one per
+/// character, so the two counts agree exactly.
+///
+/// **ONE CONSTANT FOR TWO FIELDS, ON [`MAX_IDEMPOTENCY_KEY_CHARS`]'s ARGUMENT.**
+/// `IssueCredentialRequest.user_id` and `SetInheritedSettingRequest.team_id` are
+/// two names for one shape — an identifier this schema minted, in a column of
+/// one declared width — so the derivation has no per-field term.
+///
+/// **THE SWEEP.** Four RPCs carry a caller-supplied id that reaches a `VARCHAR`
+/// column, and only these two reach it UNGUARDED. `IssueEnrolment.user_id` is
+/// consulted through `live_user` before any write, so an over-long one is
+/// `NOT_FOUND` and never meets a column. `AddTeamMember` and `RemoveTeamMember`
+/// reach `INSERT IGNORE` and `DELETE`, neither of which the engine refuses on
+/// width — measured: `INSERT IGNORE` downgrades `1406` to warning `1265` and
+/// skips the row — so a bound there would refuse what the store accepts.
+///
+/// **WHAT THIS DOES NOT CLOSE, SAID PLAINLY.** `iam-db`'s `create_credential` is
+/// the one write in that service with NO liveness check, so a user id that is
+/// SHORT but names nobody still fails the foreign key and still returns
+/// `UNAVAILABLE`. This constant refuses exactly what the COLUMN refuses and no
+/// more; the remaining half is a `live_user` call in `iam-db` and is filed
+/// rather than reached from here.
+const MAX_ENTITY_ID_CHARS: usize = 96;
+
 /// The longest life [`IamService::issue_credential`] will grant: ten years.
 ///
 /// A BOUND ON THE DURATION ASKED FOR, NOT ON THE INSTANT IT PRODUCES, and that
@@ -868,6 +964,18 @@ fn validate_redemption(r: &RedeemEnrolmentRequest) -> Result<(), Status> {
              lost response locks the person out",
         ));
     }
+    // **THE SHARPEST INSTANCE OF THE BOUNDED-COLUMN CLASS, AND IT IS ON THIS
+    // PATH.** The ledger INSERT is the LAST statement of the store's spend
+    // transaction, so an over-long key made the whole transaction roll back:
+    // `UNAVAILABLE "storage unavailable"` to the caller, the secret still
+    // unspent, and every retry under that same key repeating it for ever. A
+    // permanent 503 no retry escapes, on an unauthenticated endpoint, for a
+    // request that was never well formed.
+    //
+    // ANSWERABLE FROM THE REQUEST ALONE, which is what this function's own
+    // header requires of anything added to it. The key's length says nothing
+    // about whether the secret exists or has been spent, so it opens no oracle.
+    check_idempotency_key(r.idempotency.as_ref().map_or("", |i| i.key.as_str()))?;
     // A password nobody typed is not a password. The only strength rule stated
     // here, deliberately — see MAX_PASSWORD_BYTES.
     if r.password.is_empty() {
@@ -910,6 +1018,39 @@ fn check_label(label: &str) -> Result<(), Status> {
             "the label is longer than the store will hold: at most 255 \
              characters, counted as characters and not as bytes",
         ));
+    }
+    Ok(())
+}
+
+/// The ONE bound on a caller-supplied idempotency key, shared by the two RPCs
+/// whose keys are STORED.
+///
+/// One function for the same reason [`check_label`] is one: the two fields are
+/// the same field — `yadgar.common.v1.Idempotency.key`, described once, landing
+/// in two columns of one declared width. The membership argument, and the
+/// coupling it rests on, are on [`MAX_IDEMPOTENCY_KEY_CHARS`].
+fn check_idempotency_key(key: &str) -> Result<(), Status> {
+    if key.chars().count() > MAX_IDEMPOTENCY_KEY_CHARS {
+        return Err(Status::invalid_argument(
+            "the idempotency key is longer than the store will hold: at most \
+             255 characters, counted as characters and not as bytes",
+        ));
+    }
+    Ok(())
+}
+
+/// The ONE bound on a caller-supplied entity id, shared by the two RPCs that
+/// hand one to a column unguarded.
+///
+/// The field is NAMED in the refusal, as ADR-0565 requires and as
+/// [`check_stored_names`] already does: two fields share this message, and one
+/// that named neither would send an operator to check both.
+fn check_entity_id(field: &str, id: &str) -> Result<(), Status> {
+    if id.chars().count() > MAX_ENTITY_ID_CHARS {
+        return Err(Status::invalid_argument(format!(
+            "`{field}` is longer than any identifier this store holds: at most \
+             96 characters, counted as characters and not as bytes"
+        )));
     }
     Ok(())
 }
@@ -1132,6 +1273,26 @@ fn check_inherited_setting(r: &SetInheritedSettingRequest) -> Result<(), Status>
         ));
     }
 
+    // THE STORE'S WIDTHS, AND DELIBERATELY LAST. Everything above is a clause
+    // `yadgar.common.v1.SettingScope` states and this service applies; the two
+    // below are neither the contract's nor this scope's, they are what
+    // `iam_inherited_setting_write` is declared to hold. Keeping them apart is
+    // what stops a reader from taking a column width for a contract rule.
+    //
+    // `name` NEEDS NO SUCH CHECK: the closed vocabulary above already pins it to
+    // one 22-character value, well inside its `VARCHAR(64)`.
+    check_idempotency_key(r.idempotency.as_ref().map_or("", |i| i.key.as_str()))?;
+    // THE WITHDRAWAL IS THE REACHABLE ARM, and both arms are checked anyway. On
+    // the SETTING arm `iam-db` consults `live_team` first, so an over-long id is
+    // already `NOT_FOUND`; a WITHDRAWAL is a `DELETE` that matches nothing, and
+    // the ledger INSERT after it is where the id meets `team_id VARCHAR(96)` and
+    // the call comes back as a storage outage. Refusing both makes the answer
+    // independent of `clear`, and `INVALID_ARGUMENT` is the truer of the two: a
+    // 97-character string is not a team that is missing, it is not a team id.
+    if let Some(team_id) = r.team_id.as_deref() {
+        check_entity_id("team_id", team_id)?;
+    }
+
     Ok(())
 }
 
@@ -1168,6 +1329,14 @@ fn check_issue_credential(r: &IssueCredentialRequest) -> Result<(), Status> {
     // implicates a database that is working for a request that was never
     // well-formed — ADR-0512's misattribution, on the administrative path.
     check_label(&r.label)?;
+    // HAD NO BOUND EITHER, and this handler is the only one that hands a
+    // caller's id to a column with nothing between. `iam-db`'s
+    // `create_credential` is the one write in that service with no `live_user`
+    // check, so `user_id` was bound straight into `iam_credential.user_id
+    // VARCHAR(96)` — and `ERROR 1406` came back as `UNAVAILABLE "storage
+    // unavailable"`. See [`MAX_ENTITY_ID_CHARS`] for the half this does not
+    // close: a SHORT id naming nobody still fails the foreign key.
+    check_entity_id("user_id", &r.user_id)?;
     if r.expires_in_seconds < 0 {
         return Err(Status::invalid_argument(
             "expires_in_seconds cannot be negative: a deadline already past is \
