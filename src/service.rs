@@ -627,6 +627,12 @@ impl Iam {
             label: req.get_ref().label.clone(),
             // NO EXPIRY, because this request has no field to ask for one.
             expires_at: None,
+            // NOT STAMPED. This credential is minted by RedeemEnrolment, whose
+            // request carries no actor to record — the holder of the enrolment
+            // secret is the subject, not an administrator acting on one. The
+            // field exists on the boundary from v1.10.0 and is left absent
+            // rather than filled with a value nothing supplied.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -1109,6 +1115,12 @@ impl IamService for Iam {
             // redemption looks an enrolment up by exactly this value.
             secret_hash: Keys::token_hash(&secret),
             expires_at: Some(expires_at),
+            // NOT FORWARDED, DELIBERATELY. `IssueEnrolmentRequest` grew this
+            // field in proto v1.10.0 and nothing in the estate populates it
+            // yet, so copying it across would carry `None` under a different
+            // name and read as a relay that works. Wiring the relay is
+            // ADR-0534's own change, not this pin bump.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -1281,6 +1293,11 @@ impl IamService for Iam {
             value: r.value,
             locked: r.locked,
             clear: r.clear,
+            // NOT FORWARDED, for the reason given at IssueEnrolment above: the
+            // field is new in proto v1.10.0, no caller sets it, and the
+            // upstream this forwards to still vendors v1.8.0 and has no field
+            // to receive it. See the follow-up task on ADR-0534's relay.
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
 

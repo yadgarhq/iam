@@ -1074,6 +1074,7 @@ fn issue(key: &str) -> Request<IssueEnrolmentRequest> {
     Request::new(IssueEnrolmentRequest {
         idempotency: Some(Idempotency { key: key.into() }),
         user_id: "yadgar:user:1".into(),
+        unverified_actor: None,
     })
 }
 
@@ -2120,6 +2121,7 @@ fn org_write() -> SetInheritedSettingRequest {
         value: Some(SettingValue::On as i32),
         locked: Some(true),
         clear: false,
+        unverified_actor: None,
     }
 }
 
