@@ -109,10 +109,18 @@ tls:
 # THE WATCHER RUNS ON A DEFAULT INSTALL EVEN WITH `tls.enabled: false`, and that
 # is worth reading twice. The watch set holds the enrolment CA as well as the
 # serving certificate, and `enrolment.caSecret` below ships with a default — so
-# a cleartext pod watches that CA and restarts when the gateway rotates it. The
-# set is empty only when `tls.enabled` is false AND `enrolment.caSecret` is
-# unset. The schedule is parsed at boot in every case, so a value the binary
-# cannot read fails a pod that uses no TLS at all.
+# a cleartext pod watches that CA and restarts when the gateway rotates it.
+#
+# THE WATCH SET IS NEVER EMPTY NOW, EITHER, since the mounted configuration
+# document (step 2a) joined it unconditionally — every `iam`, cleartext or not
+# and even without an enrolment CA, watches `shared.yaml` and restarts when an
+# operator edits it. That is ADR-0523 working as designed, not a fault.
+#
+# THE TWO VALUES BELOW ARE NO LONGER READ BY THIS BINARY. It reads its schedule
+# from `rotate::Configuration::mounted()` instead. They are rendered so that a
+# rollout landing this chart before this binary's digest still resolves a
+# schedule on the old one, and step 2b deletes them once that digest has
+# landed — see `yadgarhq/deploy`'s MIGRATION_NOTES.md.
 tlsRotation:
   # How often the files are re-hashed. Reading four small files a minute costs
   # nothing, and the deadline this protects is 30 days wide.

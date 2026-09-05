@@ -172,12 +172,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the same kubelet sync window — a PDB constrains eviction and does not
     // govern a self-exit.
     //
-    // THE DECISION LIVES IN `rotate`, not here, for the reason `boot` gives:
-    // nothing in a binary entry point is reachable from a test, and one of the
-    // ways to get this wrong — a poll interval of 0 — is a hot loop nobody would
-    // see. `.to_string()` on the way out because `Box<dyn Error>` prints with
-    // DEBUG and these messages are sentences.
-    let schedule = rotate::Schedule::from_env().map_err(|e| e.to_string())?;
+    // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
+    // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
+    // `/etc/yadgar/config/shared/shared.yaml`. There is no compiled-in default
+    // behind it any more: an absent, empty, or half-written document refuses
+    // the boot and names the file. The chart still sets TLS_ROTATION_POLL_SECS
+    // and TLS_ROTATION_SPLAY_MAX_SECS — this binary no longer reads either, but
+    // they stay so a rollout that lands this chart before this binary's digest
+    // still resolves a schedule on the old one. The runbook is
+    // `yadgarhq/deploy`'s MIGRATION_NOTES.md, steps 2a and 2b — NOT this
+    // repository's, which has no such section.
+    //
+    // `.to_string()` on the way out because `Box<dyn Error>` prints with DEBUG
+    // and these messages are sentences.
+    let config = rotate::Configuration::mounted();
+    let schedule = config.schedule().map_err(|e| e.to_string())?;
 
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure here
@@ -250,30 +259,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // inside a window where a kubelet swap quietly becomes the baseline, and the
     // real rotation would never be noticed.
     //
-    // FOUR MATERIALS, TWO OF WHICH ARE NOT TRANSPORT. The broker password is a
+    // FIVE MATERIALS, THREE OF WHICH ARE NOT TRANSPORT. The broker password is a
     // file this process read at boot, mounted as a directory so it can rotate
     // and about to be baked into a `Client` cached for the life of the process;
     // the enrolment CA is token payload the chart mounts the same way. ADR-0523's
     // rule is about provenance rather than payload, so both are watched exactly
     // as the certificates are.
     //
+    // THE MOUNTED CONFIGURATION DOCUMENT JOINS THE SAME SET, as a fifth
+    // `Material` and the only one that is never absent (step 2a) — `config` is
+    // `&Configuration`, not `Option<&Configuration>`. An operator editing
+    // `shared.yaml` now restarts this pod exactly as editing a CA bundle would.
+    //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be four builder calls
     // scattered across this function, up to a hundred and fifty lines apart,
     // where nothing could reach them: no test spawns this binary, so deleting any
     // one of them compiled and passed everything. The list lives in
     // `rotate::watch_set` now and `tests/assembly.rs` calls it.
-    let tls_inputs = rotate::watch_set(
+    let watch_inputs = rotate::watch_set(
         listen_tls.as_ref(),
         db_tls.as_ref(),
         nats_credentials.as_ref(),
         enrolment.as_ref(),
+        &config,
     );
 
     // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
     // recorder is a value nobody ever sees. This is the half of the rotation work
     // that makes a failure LOUD — if the watcher below dies, this gauge still
     // shows the loaded leaf ageing out.
-    tls_inputs.export_not_after();
+    watch_inputs.export_not_after();
 
     let invalidator = yadgar_iam::invalidate::Invalidator::connect(
         std::env::var("NATS_URL").ok().as_deref(),
@@ -324,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         %addr,
         tls = listen_tls.is_some(),
-        watching = tls_inputs.watched().len(),
+        watching = watch_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
         drain_budget_secs = DRAIN_BUDGET.as_secs(),
@@ -368,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             () = signals => {}
             // `rotate::watch` resolves ONLY when it has read a change, and never
             // at all when there is nothing to watch.
-            () = rotate::watch(tls_inputs, schedule) => {}
+            () = rotate::watch(watch_inputs, schedule) => {}
         }
     };
 
