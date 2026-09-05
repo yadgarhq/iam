@@ -48,7 +48,7 @@ yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a
 # correction is a new tag — and Cargo.lock records the revision it resolved to,
 # so the pin is as exact as the revision it replaces.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.0" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.1" }
 
 # The shared instrumentation seam (D67). Pinned by release tag, like every other
 # in-org crate — a branch is a moving target, a published tag is not.
