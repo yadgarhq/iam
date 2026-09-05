@@ -1487,9 +1487,15 @@ async fn validation_runs_before_the_secret_is_looked_up() {
 
     // THE POSITIVE CONTROL, and without it every assertion above is satisfied by
     // a validator that refuses everything. A label AT the bound is accepted, so
-    // MAX_LABEL_BYTES is a bound on an oversized label rather than a refusal of
+    // MAX_LABEL_CHARS is a bound on an oversized label rather than a refusal of
     // ordinary ones — and the loop above is discriminating rather than
     // universal.
+    //
+    // **THIS LINE SAID `256`, AND IT WAS PINNING THE DEFECT.** The column stores
+    // 255 characters and refuses 256, measured; the old constant was `256`
+    // tested with `>`, so exactly 256 passed here and was then refused by the
+    // store — after the enrolment secret had been spent. A test asserting the
+    // wrong bound is part of why review did not find it.
     let (iam, _rec, _inv) = iam_with(FakeDb {
         redeem: redeemed("ada"),
         password: known_user("chosen one"),
@@ -1498,7 +1504,7 @@ async fn validation_runs_before_the_secret_is_looked_up() {
     .await;
 
     let mut at_the_bound = redeem("s3cret", "chosen one", "k1");
-    at_the_bound.get_mut().label = "l".repeat(256);
+    at_the_bound.get_mut().label = "l".repeat(255);
     iam.redeem_enrolment(at_the_bound)
         .await
         .expect("a label at the bound is accepted, not refused");
@@ -2702,4 +2708,310 @@ async fn issue_credential_grants_the_longest_life_the_bound_allows() {
         (asked..asked + 60).contains(&deadline),
         "the store was told {deadline} and the caller asked for about {asked}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The `label`: one bound, in the unit the column measures, on all three paths.
+// ---------------------------------------------------------------------------
+
+/// 255 of a codepoint utf8mb4 encodes in FOUR bytes.
+///
+/// 1020 bytes and 255 characters, which is the pair that separates a byte bound
+/// from a character one. `iam_credential.label` accepts this row, and the
+/// `MAX_LABEL_BYTES = 256` this change deletes refused the request that would
+/// write it.
+fn wide_label(chars: usize) -> String {
+    "\u{1F600}".repeat(chars)
+}
+
+/// Drive `Login` with `label`, on a twin that would issue the credential.
+async fn login_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        password: known_user("pw"),
+        ..Default::default()
+    })
+    .await;
+    let mut req = login("ada", "pw");
+    req.get_mut().label = label.into();
+    let answered = iam.login(req).await.map(|_| ());
+    (answered, rec)
+}
+
+/// Drive `RedeemEnrolment` with `label`, on a twin that would redeem the secret.
+async fn redeem_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb {
+        redeem: redeemed("ada"),
+        password: known_user("chosen one"),
+        ..Default::default()
+    })
+    .await;
+    let mut req = redeem("s3cret", "chosen one", "k1");
+    req.get_mut().label = label.into();
+    let answered = iam.redeem_enrolment(req).await.map(|_| ());
+    (answered, rec)
+}
+
+/// Drive `IssueCredential` with `label`.
+async fn issue_credential_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+    let answered = iam
+        .issue_credential(Request::new(IssueCredentialRequest {
+            user_id: "yadgar:user:1".into(),
+            label: label.into(),
+            ..Default::default()
+        }))
+        .await
+        .map(|_| ());
+    (answered, rec)
+}
+
+/// The last label `iam_credential.label` accepts is a label this service grants.
+///
+/// **MEASURED, NOT ASSUMED.** Against `mariadb:11.8.9` at its stock `sql_mode`,
+/// with the column exactly as `iam-db/src/schema.rs` declares it — `label
+/// VARCHAR(255) NOT NULL DEFAULT ''` on `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+/// — a 255-character label stores and a 256-character one is refused with `ERROR
+/// 1406 Data too long for column 'label'`. That holds for ASCII and for a
+/// four-byte codepoint alike: `VARCHAR(255)` in utf8mb4 bounds CHARACTERS.
+#[tokio::test]
+async fn the_last_label_the_column_stores_is_one_every_path_accepts() {
+    let at_the_bound = "l".repeat(255);
+
+    for (rpc, (answered, rec)) in [
+        ("Login", login_with_label(&at_the_bound).await),
+        ("RedeemEnrolment", redeem_with_label(&at_the_bound).await),
+        (
+            "IssueCredential",
+            issue_credential_with_label(&at_the_bound).await,
+        ),
+    ] {
+        answered.unwrap_or_else(|e| {
+            panic!("{rpc}: the longest label the column stores must be granted, got {e:?}")
+        });
+        // AND IT REACHED THE STORE UNCHANGED. A bound that silently TRUNCATED
+        // would satisfy the line above while writing a label nobody named.
+        let stored = rec.lock().expect("recorded").create_credential[0]
+            .label
+            .clone();
+        assert_eq!(
+            stored, at_the_bound,
+            "{rpc}: the label must reach the store whole, never clipped to fit"
+        );
+    }
+}
+
+/// The first label the column refuses is one every path refuses FIRST.
+///
+/// **THIS IS THE LOCKOUT, and only on `RedeemEnrolment` is it permanent.** That
+/// handler SPENDS the enrolment secret at the store before it builds the
+/// credential, so a label the column will not take passed validation, spent the
+/// secret, and then failed the INSERT — which `iam-db` renders as `UNAVAILABLE
+/// "storage unavailable"` for every engine error. The person holds no
+/// credential, the answer blames a database that is working, and the retry
+/// presents a spent secret. Refusing here is what makes the request never reach
+/// the point of no return.
+#[tokio::test]
+async fn the_first_label_the_column_refuses_is_refused_before_anything_is_spent() {
+    let past_the_bound = "l".repeat(256);
+
+    for (rpc, (answered, rec)) in [
+        ("Login", login_with_label(&past_the_bound).await),
+        ("RedeemEnrolment", redeem_with_label(&past_the_bound).await),
+        (
+            "IssueCredential",
+            issue_credential_with_label(&past_the_bound).await,
+        ),
+    ] {
+        let err = answered.expect_err(rpc);
+
+        // THE CODE, because it is what tells the caller whose mistake this is.
+        // `UNAVAILABLE` — which is what the store's refusal arrives as — says
+        // the service is broken and invites a retry that cannot succeed.
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{rpc}");
+        // AND THE FIELD BY NAME (ADR-0512). A refusal that does not say which
+        // field is wrong leaves the caller to guess, and this is the only place
+        // that knows.
+        assert!(
+            err.message().contains("label"),
+            "{rpc}: the refusal must name the field, got {:?}",
+            err.message()
+        );
+
+        let seen = rec.lock().expect("recorded");
+        assert!(
+            seen.create_credential.is_empty(),
+            "{rpc}: a refused request must mint nothing"
+        );
+        assert!(
+            seen.redeem_enrolment.is_empty(),
+            "{rpc}: the refusal must precede the spend — a check answerable from \
+             the request alone that runs after the secret is gone is the lockout \
+             itself"
+        );
+    }
+}
+
+/// A label the column accepts is not refused for the bytes it happens to occupy.
+///
+/// **THIS IS THE CASE A BYTE BOUND GETS WRONG, and it is the reason the fix is
+/// not a smaller number in the same unit.** 255 four-byte codepoints is 1020
+/// bytes; the column stores it, measured, and `MAX_LABEL_BYTES = 256` refused
+/// it. So did every shorter multibyte label past 64 characters: 100 of the same
+/// codepoint is 400 bytes, stores fine, and was refused.
+///
+/// **EVERY LABEL FIXTURE IN THIS FILE IS A TYPED LITERAL, never
+/// `MAX_LABEL_CHARS`, and that is deliberate.** A bound test written against its
+/// own constant pins the relationship and never the number. Measured on this
+/// branch: with the fixtures written as `repeat(MAX_LABEL_CHARS)`, the whole
+/// label suite passes green with the constant set to 254, to 300, and to **256**
+/// — which is the exact defect this change exists to close, and the number every
+/// historical doc comment here still carries. The literal is the only evidence
+/// in the suite that the implementation could not supply. Re-measure the column
+/// before changing it. Do not tidy it back into the constant.
+#[tokio::test]
+async fn a_multibyte_label_the_column_stores_is_not_refused_for_its_byte_length() {
+    for label in [wide_label(255), wide_label(100)] {
+        assert!(
+            label.len() > 256,
+            "the fixture must exceed the old byte bound or it proves nothing: \
+             {} bytes",
+            label.len()
+        );
+
+        for (rpc, (answered, rec)) in [
+            ("Login", login_with_label(&label).await),
+            ("RedeemEnrolment", redeem_with_label(&label).await),
+            ("IssueCredential", issue_credential_with_label(&label).await),
+        ] {
+            answered.unwrap_or_else(|e| {
+                panic!(
+                    "{rpc}: {} characters is {} bytes, and the column stores it: {e:?}",
+                    label.chars().count(),
+                    label.len()
+                )
+            });
+            assert_eq!(
+                rec.lock().expect("recorded").create_credential[0].label,
+                label,
+                "{rpc}: the label must reach the store whole"
+            );
+        }
+    }
+}
+
+/// An EMPTY label stays accepted, on every path.
+///
+/// **THE DOCUMENTED SENTINEL, pinned so a future editor's `is_empty()` guard
+/// fails a test rather than the contract.** `iam.proto` describes this field as
+/// free text and requires nothing of it, and the column's `DEFAULT ''` says the
+/// same. A bound is not a requirement.
+#[tokio::test]
+async fn an_empty_label_is_accepted_because_the_contract_requires_nothing_of_it() {
+    for (rpc, (answered, rec)) in [
+        ("Login", login_with_label("").await),
+        ("RedeemEnrolment", redeem_with_label("").await),
+        ("IssueCredential", issue_credential_with_label("").await),
+    ] {
+        answered.unwrap_or_else(|e| panic!("{rpc}: an empty label is legal, not a refusal: {e:?}"));
+        assert_eq!(
+            rec.lock().expect("recorded").create_credential[0].label,
+            "",
+            "{rpc}: the empty label travels rather than being substituted"
+        );
+    }
+}
+
+/// The `outcome` a label refusal records is one the SHARED MAPPING produces.
+///
+/// **ADR-0558: `yadgar_calls_total` has ONE `outcome` label space and this
+/// binary writes into it by hand.** The assertion is membership in
+/// `telemetry::grpc::status_name`'s range COMPUTED over every `tonic::Code`,
+/// plus the literal — a test comparing only against `"INVALID_ARGUMENT"` goes
+/// green for any invented value somebody also typed into the test.
+///
+/// **AND IT IS WHAT CATCHES A REFUSAL PATH WITH NO `call.fail` AT ALL.**
+/// `Call::fail` takes `self` by value, so the compiler enforces that it precedes
+/// the `Err` — but a path that never calls it compiles, and the dropped `Call`
+/// records `UNRECORDED`. `Login` had no validation and therefore no `call.fail`
+/// on this branch before this change, which is exactly the shape this test
+/// exists to see.
+#[test]
+fn the_outcome_of_a_label_refusal_is_one_the_shared_mapping_produces() {
+    // A LOCAL recorder rather than `metrics::set_global_recorder`: a global one
+    // is process-wide and this crate runs its tests in parallel.
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // CURRENT-THREAD, and that is load-bearing: `with_local_recorder` installs a
+    // THREAD-LOCAL, so work that resumed on another thread would record into
+    // nothing and every assertion below would pass vacuously.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let past_the_bound = "l".repeat(256);
+            for (rpc, (answered, _rec)) in [
+                ("Login", login_with_label(&past_the_bound).await),
+                ("RedeemEnrolment", redeem_with_label(&past_the_bound).await),
+                (
+                    "IssueCredential",
+                    issue_credential_with_label(&past_the_bound).await,
+                ),
+            ] {
+                answered.expect_err(rpc);
+            }
+        });
+    });
+
+    let emitted = snapshotter.snapshot().into_vec();
+    // LENGTH FIRST. A `metrics-util` resolving against another `metrics` major
+    // links a SECOND facade; then this snapshot is empty and every assertion
+    // built on it passes vacuously.
+    assert!(
+        !emitted.is_empty(),
+        "the recorder saw no metric at all, which is what a second metrics \
+         facade in the tree looks like"
+    );
+
+    let outcomes: Vec<String> = emitted
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == yadgar_telemetry::metrics::CALLS)
+        .flat_map(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .filter(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "three refused calls, three series — one per path that stores a label: \
+         {emitted:?}"
+    );
+
+    // The mapping's whole range, derived rather than retyped. `Code::from_i32`
+    // saturates to `Unknown` above the enum, so the sweep covers every code
+    // tonic defines and the catch-all arm besides.
+    let mapped: std::collections::BTreeSet<&'static str> = (0..32)
+        .map(|i| {
+            yadgar_telemetry::grpc::status_name(&tonic::Status::new(tonic::Code::from_i32(i), ""))
+        })
+        .collect();
+    for outcome in &outcomes {
+        assert!(
+            mapped.contains(outcome.as_str()),
+            "the outcome {outcome:?} is not a value \
+             telemetry::grpc::status_name can produce; its range is {mapped:?}"
+        );
+        assert_eq!(
+            outcome, "INVALID_ARGUMENT",
+            "a label the caller sent that the column cannot store is the \
+             caller's mistake, and UNRECORDED is what a missing call.fail looks \
+             like"
+        );
+    }
 }
