@@ -444,4 +444,23 @@ mod tests {
         assert!(subject::CREDENTIAL_REVOKED.starts_with("yadgar.iam."));
         assert!(subject::TEAMS_CHANGED.starts_with("yadgar.iam."));
     }
+
+    #[test]
+    fn the_subjects_are_pinned_as_literals_because_three_parties_must_agree() {
+        // AS LITERALS, never through `subject::*`. An assertion that reads the
+        // constant renames both sides at once, so it cannot see a rename — the
+        // namespace check above is exactly that shape, and both subjects can be
+        // renamed under it with the whole suite still green.
+        //
+        // Three parties carry these strings and only one of them is this file.
+        // `gateway/src/invalidate.rs` keeps its own copy, pinned there the same
+        // way, and `deploy/infra/nats.yaml` names both in the broker's publish
+        // and subscribe allow-lists. A rename no test can see leaves publisher,
+        // subscriber and broker disagreeing while three suites stay green: the
+        // broker refuses the publish, nothing subscribes to what is published,
+        // and a revoked credential keeps working until the gateway's cache TTL
+        // expires. That is a security bound, so the literal is the assertion.
+        assert_eq!(subject::CREDENTIAL_REVOKED, "yadgar.iam.credential.revoked");
+        assert_eq!(subject::TEAMS_CHANGED, "yadgar.iam.user.teams-changed");
+    }
 }
