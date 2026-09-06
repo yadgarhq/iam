@@ -435,6 +435,7 @@ impl EnrolmentConfig {
         let ca_path = ca_path.filter(|p| !p.is_empty());
         let ca_pem = match ca_path {
             None => None,
+            // ADR-0523-WATCHED: EnrolmentConfig
             Some(path) => Some(
                 std::fs::read_to_string(path)
                     .map_err(|e| EnrolmentConfigError::UnreadableCa(path.to_string(), e))?,

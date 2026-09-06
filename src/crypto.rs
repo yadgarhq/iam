@@ -89,6 +89,27 @@ pub enum CryptoError {
 
 fn read_key(dir: &str, name: &str) -> Result<Zeroizing<[u8; 32]>, KeyError> {
     let path = format!("{dir}/{name}");
+    // THE ONE BOOT READ IN THIS SERVICE THAT IS NOT WATCHED, and the marker
+    // below says so rather than leaving a reader to notice.
+    //
+    // `encryption.key` and `blind-index.key` are read here, at boot, out of the
+    // `YADGAR_KEYS_DIR` mount. Every other file this process reads at boot is a
+    // member of [`crate::rotate::watch_set`] -- the listener's pair, the
+    // upstream's, the broker password, the enrolment CA and the mounted
+    // configuration document. These two are not, and until now nothing recorded
+    // whether that was a decision or an oversight.
+    //
+    // THE RULING IS RESERVED AND THIS COMMENT DOES NOT MAKE IT (ledger 730).
+    // What is settled is only that the omission is deliberate and written down.
+    // The question left open, stated as a question: watching these would make a
+    // rotated key end the process under ADR-0523, and the pod would come back
+    // holding the new key over rows encrypted under the old one -- so the
+    // restart is either the signal an operator needs or an outage nobody asked
+    // for, and which of the two it is depends on a key-rotation procedure that
+    // does not exist yet. Ledger 730 decides it.
+    //
+    // ADR-0523-UNWATCHED: read at boot, deliberately not in rotate::watch_set;
+    // the ruling on whether it belongs there is reserved to ledger 730.
     let bytes = std::fs::read(&path).map_err(|e| KeyError::Unreadable(path.clone(), e))?;
     if bytes.len() != 32 {
         return Err(KeyError::WrongLength(path, bytes.len()));
