@@ -157,9 +157,14 @@ Two things the loop deliberately does not do:
 that is easy to get silently wrong is testable: re-inserting an unchanged
 endpoint churns connections every tick and looks like working code.
 
-`iam`'s own Service is an ordinary `ClusterIP` — nothing balances across `iam`
-replicas client-side yet, the same gap `gateway`'s `upstream.rs` documents for
-`task`.
+**`iam`'s own Service is headless too, since ledger 615.** It was an ordinary
+`ClusterIP`, on the premise that nothing balanced across `iam` replicas
+client-side — the gap `gateway`'s `upstream.rs` used to document for `task`.
+That premise is gone: `connect_iam` now routes through `yadgar_dial`, and a
+`ClusterIP`'s virtual address resolves the instant the Service object exists
+regardless of whether any pod backs it, which also hid a genuinely absent
+`iam` from `yadgar_dial_upstream_never_resolved` at boot. Headless lets both
+the balancer and the gauge see the real pod set.
 
 ## It does not wait for `iam-db` to be ready — but it does wait for its keys
 

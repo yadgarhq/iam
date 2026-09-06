@@ -1,13 +1,24 @@
-# A NORMAL Service, unlike iam-db's. Nothing balances across iam replicas
-# client-side yet — the same gap gateway/src/upstream.rs documents for `task`:
-# until a caller of iam needs it enough to justify a headless Service plus the
-# shared balancing helper, a ClusterIP is honest about what actually happens
-# rather than declaring a balancing story nothing implements.
+# HEADLESS, deliberately, matching iam-db's shape (ledger 615). A normal
+# Service load-balances at L4, and a gRPC client holds one long-lived HTTP/2
+# connection — so it would pin to a single pod and leave the others idle.
+# clusterIP: None publishes every pod address so the client can balance
+# across them itself (D23).
+#
+# WAS a normal ClusterIP, on the premise that nothing balanced across iam
+# replicas client-side. That premise is gone: gateway's `connect_iam` now
+# routes through `yadgar_dial`, the same balancer `task` already used. A
+# ClusterIP also hid a genuinely absent `iam` from
+# `yadgar_dial_upstream_never_resolved` — its virtual address resolves via DNS
+# the instant the Service object exists, whether or not any pod backs it,
+# so the gauge could never see a zero-endpoint boot. Headless makes DNS
+# answer with the real pod set, which is what both the balancer and the
+# gauge need to see.
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ .Chart.Name }}
 spec:
+  clusterIP: None
   selector:
     app: {{ .Chart.Name }}
   ports:
