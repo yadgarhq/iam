@@ -1547,24 +1547,25 @@ impl IamService for Iam {
     /// RATHER THAN ELIMINATED: the issuance is recorded and the victim's old
     /// password stops working, so the act is loud rather than silent.
     ///
-    /// **A REPLAYED KEY RETURNS A TOKEN THAT CANNOT BE REDEEMED, AND THAT IS A
-    /// KNOWN GAP IN THE CONTRACT RATHER THAN AN OVERSIGHT HERE.** The key is
-    /// forwarded to `CreateEnrolment` unchanged, because D9 applies to every
-    /// mutating RPC and the store is where deduplication lives (D4). On a replay
-    /// the store answers with the ORIGINAL `enrolment_id` and keeps the ORIGINAL
-    /// `secret_hash` — while this call has minted a FRESH secret, whose hash was
-    /// never stored. The contract asks for a replay to return the same token and
-    /// in the same breath records why it cannot: the store "keeps only a hash",
-    /// which is also why D73 puts token RESEND outside the first cut. Nothing in
-    /// this service can reconcile the two; deriving the secret from the key
-    /// would, and is refused — it makes a caller-chosen string the entropy of an
-    /// unauthenticated endpoint's whole authenticator.
+    /// **A REPLAYED KEY MINTS A SECOND, LIVE ENROLMENT — NOT A DEDUPLICATED
+    /// NO-OP, AND NOT A DEAD TOKEN.** The key is forwarded to `CreateEnrolment`
+    /// unchanged, because D9 applies to every mutating RPC and D4 says
+    /// deduplication belongs in the store. But `iam_enrolment` carries no
+    /// idempotency column, and `CreateEnrolment` discards the key it is
+    /// handed: a retry, arriving with a secret this call minted FRESH, inserts
+    /// a SECOND row under a SECOND `enrolment_id`, redeemable exactly like the
+    /// first.
     ///
-    /// The consequence is bounded and recoverable: a replay hands the admin a
-    /// dead token, its redemption is refused like any unknown secret, and the
-    /// fix is the one this RPC already is — mint another. Not forwarding the key
-    /// would trade that for `iam` unilaterally disabling a mechanism the
-    /// contract mandates, which is the worse of the two.
+    /// **THAT IS A KNOWN GAP IN THE CONTRACT, TRACKED AS LEDGER 668, RATHER
+    /// THAN AN OVERSIGHT HERE.** ADR-0519 decided this RPC refuses a replayed
+    /// key instead of minting a second one; the refusal has to live in
+    /// `iam-db`, because `iam` holds no store to recognise a key it has seen
+    /// (D4) — deriving the secret from the key instead, so `iam` itself could
+    /// refuse, is rejected: it would make a caller-chosen string the entropy
+    /// of an unauthenticated endpoint's whole authenticator. Not forwarding
+    /// the key would trade the gap for `iam` unilaterally disabling a
+    /// mechanism the contract mandates, which is worse, so the key travels
+    /// and the gap stays open until ledger 668 closes it.
     ///
     /// **UNCONFIGURED ENROLMENT REFUSES HERE RATHER THAN AT BOOT.** The contract
     /// rule is about the TOKEN — never mint one carrying an empty `gateway` —
