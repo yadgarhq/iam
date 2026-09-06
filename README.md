@@ -160,9 +160,14 @@ Two things the loop deliberately does not do:
 that is easy to get silently wrong is testable: re-inserting an unchanged
 endpoint churns connections every tick and looks like working code.
 
-`iam`'s own Service is an ordinary `ClusterIP` — nothing balances across `iam`
-replicas client-side yet, the same gap `gateway`'s `upstream.rs` documents for
-`task`.
+**`iam`'s own Service is headless too, since ledger 615.** It was an ordinary
+`ClusterIP`, on the premise that nothing balanced across `iam` replicas
+client-side — the gap `gateway`'s `upstream.rs` used to document for `task`.
+That premise is gone: `connect_iam` now routes through `yadgar_dial`, and a
+`ClusterIP`'s virtual address resolves the instant the Service object exists
+regardless of whether any pod backs it, which also hid a genuinely absent
+`iam` from `yadgar_dial_upstream_never_resolved` at boot. Headless lets both
+the balancer and the gauge see the real pod set.
 
 ## It does not wait for `iam-db` to be ready — but it does wait for its keys
 
@@ -198,11 +203,12 @@ certificate, absent crypto keys) still fails boot, and a transient absence dials
 lazily.
 
 `yadgar-dial`'s re-resolution loop logs at ERROR on every tick while a host has
-NEVER resolved, distinctly from the warning a blip gets. **That line reaches
-`kubectl logs` and nothing else today** — `dial` exports no metric for the
-never-resolved state, this chart ships no `PrometheusRule`, and nothing ships
-logs off the node — so the signal exists and is not yet alertable. That is the
-part of the crash loop this change genuinely removes.
+NEVER resolved, distinctly from the warning a blip gets. **That log line is no
+longer the only signal.** `dial` now exports
+`yadgar_dial_upstream_never_resolved`, and `deploy`'s `DialUpstreamNeverResolved`
+rule alerts on it after 2m. This chart itself still ships no `PrometheusRule` —
+the rule lives in `deploy` — but the gap the crash-loop's removal opened is
+covered.
 
 The crypto keys are the opposite case, deliberately: their absence fails boot.
 A service that started without them would pass its readiness probe and then
