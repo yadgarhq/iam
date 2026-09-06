@@ -381,9 +381,9 @@ fn a_ciphertext_written_by_the_current_framing_still_decrypts() {
 /// and the verifier's answer to it.
 ///
 /// **WHAT THE ABSOLUTE FLOORS ABOVE DO NOT COVER.**
-/// `a_stored_hash_is_expensive_in_absolute_terms` pins the VARIANT and the COST
-/// — `Argon2id`, `m >= 19456`, `t >= 2` — and it is silent about the
-/// DERIVATION. `hash_secret` hashes `secret` and `verify_counted` hashes
+/// `a_stored_hash_is_expensive_in_absolute_terms` pins the VARIANT, the COST and
+/// the DIGEST LENGTH — `Argon2id`, `m >= 19456`, `t >= 2`, `output_len == 32` —
+/// and it is silent about the DERIVATION. `hash_secret` hashes `secret` and `verify_counted` hashes
 /// `password.as_bytes()`, and the two are written independently: a pepper, a
 /// `normalise`, or a change of input encoding applied to BOTH is one commit that
 /// leaves every parameter assertion green, leaves
@@ -395,7 +395,7 @@ fn a_ciphertext_written_by_the_current_framing_still_decrypts() {
 /// **AND THE MAJOR BUMP `Cargo.toml` ALREADY ANTICIPATES.** The manifest pins
 /// `argon2 = "0.5"` with a note to revisit "deliberately, not by autoupdate".
 /// This is the assertion that makes such a bump visible: the vector below is
-/// what every row in `iam_credential.argon2id_hash` looks like, and if a new
+/// what every row in `iam_password.argon2id_hash` looks like, and if a new
 /// major derives a different digest from the same PHC string then this goes red
 /// on the bump rather than in production.
 ///
@@ -544,9 +544,14 @@ fn the_dummy_hash_costs_exactly_what_a_stored_hash_costs() {
     // measurement taken from the thing it is measuring reports agreement, not
     // correctness.
     //
-    // `Params` covers the digest length too, without a separate assertion:
-    // `Params::try_from` recovers `output_len` from the hash itself, because the
-    // PHC parameter string does not carry it.
+    // `Params` CARRIES the digest length too — `Params::try_from` recovers
+    // `output_len` by measuring the hash itself, because the PHC parameter string
+    // does not carry it — and that is NOT the same as covering it. This
+    // comparison is the relative assertion again: `hash_secret` mints both sides,
+    // so halving the digest to 128 bits halves both and this stays green.
+    // Measured. The absolute pin is in
+    // `a_stored_hash_is_expensive_in_absolute_terms`, below, beside the cost
+    // floors it is silent about for exactly the same reason.
     let k = loaded_keys("dummy-cost");
 
     let stored = k.hash_password("correct horse").expect("hash a password");
@@ -599,6 +604,20 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
     // green — measured, before this line existed. The module header's own table
     // rules Argon2d out, and only an ABSOLUTE assertion holds it to that.
     //
+    // THE DIGEST LENGTH IS PINNED HERE TOO, AND IT IS THE ONLY EXACT NUMERIC
+    // BOUND. The loop below asserts four things and they are not all of a kind:
+    // the VARIANT exactly, `m` and `t` as FLOORS, and `output_len` exactly. So
+    // the `==` on the digest is not an exception carved into a test of floors —
+    // the variant is already an `==`, and for the same reason. A floor is the
+    // right shape for a COST, where one direction is a hardening. It is the wrong
+    // shape for anything else, and neither the variant nor the digest length is a
+    // cost. The argument for why the digest length is one of those is at the
+    // assertion itself.
+    //
+    // IT SITS HERE RATHER THAN BESIDE THE FROZEN-HASH TEST ABOVE because the two
+    // pin OPPOSITE DIRECTIONS: that one pins VERIFICATION of a hash minted by an
+    // earlier release, this one pins what the MINTING side produces today.
+    //
     // p = 1 IS NOT ASSERTED, and its absence is deliberate rather than an
     // oversight. `MIN_P_COST: u32 = 1` with `p_cost() >= MIN_P_COST` used to sit
     // beside the two floors below, described as load-bearing with them and unable
@@ -640,6 +659,53 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
             params.t_cost() >= MIN_T_COST,
             "{which}: t={} is below OWASP's {MIN_T_COST}-pass minimum for Argon2id",
             params.t_cost()
+        );
+        // EXACT, LIKE THE VARIANT ABOVE AND UNLIKE THE TWO FLOORS BETWEEN THEM.
+        // `>=` is right for `m` and `t` because raising them is a hardening this
+        // test must permit. It is wrong here in BOTH directions. Lowering the
+        // digest is a silent weakening — 128 bits of stored hash where this file
+        // says 256. Raising it hardens nothing, because the work Argon2id does
+        // lives in `m` and `t` and not in how many bytes are read out at the end.
+        // What changing it DOES do is change what every row in
+        // `iam_password.argon2id_hash` looks like, while every row already
+        // written keeps the old length forever. That is a FORMAT change, and a
+        // format change is reviewed rather than permitted by a `>=`.
+        //
+        // WHY NOTHING ELSE SEES IT. The PHC parameter string carries `m`, `t` and
+        // `p` and does NOT carry `output_len`; `Params::try_from(&PasswordHash)`
+        // recovers it only by measuring the decoded digest —
+        // `builder.output_len(output.len())`, `argon2 0.5.3` `src/params.rs`. A
+        // length change is therefore invisible to every reader that goes through
+        // the parameter string, which is why it needs an assertion of its own.
+        //
+        // MUTATION THIS CATCHES: `Params::new(19456, 2, 1, Some(16))` in place of
+        // `Argon2::default()` — every cost parameter untouched, the stored digest
+        // halved to 128 bits. Measured before this line existed: the whole suite
+        // green, 153 passed 0 failed, 120 of them in this binary. The equality
+        // test above stays green because `hash_secret` mints both hashes and
+        // halves them together; the frozen-hash test stays green because it
+        // verifies a PHC STRING that carries its own 32-byte digest, not anything
+        // this function mints.
+        //
+        // THE 32 IS A LITERAL (ADR-0599), and deliberately not
+        // `Params::DEFAULT.output_len()` — an expectation routed through the
+        // constant the code hashes with agrees with the code whatever the code
+        // says. It could not be that constant in any case: `Params::DEFAULT`
+        // carries `output_len: None` in `argon2 0.5.3`, and the 32 arrives from a
+        // SEPARATE `Params::DEFAULT_OUTPUT_LEN` applied at hash time
+        // (`src/lib.rs`, `.unwrap_or(Params::DEFAULT_OUTPUT_LEN)`). Neither
+        // constant is the thing being asserted.
+        //
+        // p = 1 IS STILL NOT ASSERTED, and the paragraph above saying why stands
+        // unchanged. `p = 1 -> 4` also survives this suite, measured alongside the
+        // mutation above, and is left surviving on purpose: raising the lane
+        // count is a hardening rather than a downgrade, and `Params::new` already
+        // refuses anything below 1.
+        assert_eq!(
+            params.output_len(),
+            Some(32),
+            "{which}: the digest is {:?} bytes, and a stored password hash is 32",
+            params.output_len()
         );
     }
 }

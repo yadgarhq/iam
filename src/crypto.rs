@@ -452,9 +452,22 @@ impl Keys {
     ///
     /// IT CANNOT BE CLOSED BY REHASHING. A password hash cannot be re-derived to
     /// new parameters without the plaintext, so the usual "rehash them at next
-    /// login" answer only ever applies to people who log in — and [`Self::hash_password`]
-    /// has no production caller, `iam` exposes no `SetPassword`, and `CreateUser`
-    /// takes no password, so today it applies to nobody.
+    /// login" answer only ever applies to a password that arrives in cleartext,
+    /// and no `Login` rehashes anything.
+    ///
+    /// THIS PARAGRAPH USED TO SAY [`Self::hash_password`] HAD NO PRODUCTION CALLER
+    /// AT ALL, and that the residual therefore applied to nobody. It was true when
+    /// it was written and stopped being true underneath it: `RedeemEnrolment` mints
+    /// through `hash_password` — `service::Iam::redeem_inner` — so every credential
+    /// set since then carries THIS release's parameters. The other two clauses
+    /// still hold: `iam` exposes no `SetPassword` of its own (`iamdb.v1` does, and
+    /// that is the divergence named above), and `CreateUser` takes no password.
+    ///
+    /// THE CORRECTION MAKES THE RESIDUAL SMALLER, NOT LARGER, and it does not close
+    /// it. Minting at today's cost is not rehashing at today's cost: a row written
+    /// before a tune keeps its old parameters, `RedeemEnrolment` never revisits it,
+    /// and the enumeration gap over those rows is exactly as wide as it was. What
+    /// changes is only that the set of rows at the current cost is not empty.
     ///
     /// THE DEFENCE THAT GENERALISES IS A RESPONSE-TIME FLOOR ON `Login`, AND IT IS
     /// BUILT — [`crate::service::DEFAULT_LOGIN_RESPONSE_FLOOR`], configurable
