@@ -313,8 +313,9 @@ fn a_stored_hash_the_verifier_refuses_before_hashing_is_not_a_fast_path() {
 // pin the actual bytes, so the algorithm and the framing cannot change silently.
 //
 // The vectors are computed OUTSIDE this codebase — the SHA-256 one is the
-// published `SHA-256("abc")`, the ciphertext is from OpenSSL via node — so they
-// are answers to check against rather than a recording of what this code does.
+// published `SHA-256("abc")`, the ciphertext is from OpenSSL via node, and the
+// Argon2id PHC string is from the reference `argon2` CLI — so they are answers to
+// check against rather than a recording of what this code does.
 // ---------------------------------------------------------------------------
 
 fn hex(bytes: &[u8]) -> String {
@@ -370,6 +371,72 @@ fn a_ciphertext_written_by_the_current_framing_still_decrypts() {
         "959f6b089f5258e686f30033f7dd344c",
     ));
     assert_eq!(k.decrypt(&framed).unwrap(), "Ada Lovelace");
+}
+
+/// A password hash written by a PREVIOUS RELEASE must still verify today.
+///
+/// Argon2id is SALTED, so its output is not deterministic and there is no digest
+/// to pin the way [`token_hashing_is_sha256_and_not_merely_some_32_byte_digest`]
+/// pins one. The pinnable thing is the OTHER direction: a FROZEN PHC string,
+/// and the verifier's answer to it.
+///
+/// **WHAT THE ABSOLUTE FLOORS ABOVE DO NOT COVER.**
+/// `a_stored_hash_is_expensive_in_absolute_terms` pins the VARIANT and the COST
+/// — `Argon2id`, `m >= 19456`, `t >= 2` — and it is silent about the
+/// DERIVATION. `hash_secret` hashes `secret` and `verify_counted` hashes
+/// `password.as_bytes()`, and the two are written independently: a pepper, a
+/// `normalise`, or a change of input encoding applied to BOTH is one commit that
+/// leaves every parameter assertion green, leaves
+/// `a_password_verifies_against_its_own_hash_and_not_another` green — it hashes
+/// and verifies in the same run — and locks every existing account out
+/// permanently. A password hash cannot be re-derived without the plaintext, so
+/// that lockout is not recoverable by a migration.
+///
+/// **AND THE MAJOR BUMP `Cargo.toml` ALREADY ANTICIPATES.** The manifest pins
+/// `argon2 = "0.5"` with a note to revisit "deliberately, not by autoupdate".
+/// This is the assertion that makes such a bump visible: the vector below is
+/// what every row in `iam_credential.argon2id_hash` looks like, and if a new
+/// major derives a different digest from the same PHC string then this goes red
+/// on the bump rather than in production.
+///
+/// **THE VECTOR IS EXTERNAL, and that matters more here than anywhere else in
+/// this section.** A hash minted by `hash_password` and pasted back would be a
+/// recording of this implementation rather than an answer to check it against —
+/// it would agree with the code whatever the code did, which is the failure the
+/// whole file is about. This one comes from the Argon2 REFERENCE
+/// IMPLEMENTATION, at the parameters `hash_secret` mints at today:
+///
+/// ```text
+/// printf '%s' 'correct horse' \
+///   | argon2 'yadgar-iam-kat!!' -id -t 2 -k 19456 -p 1 -l 32 -v 13 -e
+/// ```
+///
+/// (`libargon2` from nixpkgs, the upstream `phc-winner-argon2` CLI.) The salt is
+/// the 16 ASCII bytes `yadgar-iam-kat!!`, which is what
+/// `eWFkZ2FyLWlhbS1rYXQhIQ` decodes to.
+///
+/// **FROZEN. DO NOT REGENERATE IT.** If this test fails, the derivation changed
+/// and every stored password hash stopped verifying — that is the finding, and
+/// pasting in whatever the new code produces destroys it.
+#[test]
+fn a_password_hash_written_by_an_earlier_release_still_verifies() {
+    const FROZEN: &str = "$argon2id$v=19$m=19456,t=2,p=1$\
+                          eWFkZ2FyLWlhbS1rYXQhIQ$\
+                          JIoEgemsqN1ZkEMvf6asIY6nrWzevWnc8DUFn+rAg+4";
+
+    let k = keys();
+    assert!(
+        k.verify_password(Some(FROZEN), "correct horse"),
+        "the frozen hash no longer accepts the password it was minted from"
+    );
+    // The negative half, because an accept-only assertion passes for a verifier
+    // that accepts everything — and `verify_password` returning `true`
+    // unconditionally is a real shape, since its `None` arm already returns a
+    // bare `false` for work it refused.
+    assert!(
+        !k.verify_password(Some(FROZEN), "wrong horse"),
+        "the frozen hash must still reject a password that is not its own"
+    );
 }
 
 // ---------------------------------------------------------------------------
