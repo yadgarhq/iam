@@ -200,11 +200,12 @@ certificate, absent crypto keys) still fails boot, and a transient absence dials
 lazily.
 
 `yadgar-dial`'s re-resolution loop logs at ERROR on every tick while a host has
-NEVER resolved, distinctly from the warning a blip gets. **That line reaches
-`kubectl logs` and nothing else today** — `dial` exports no metric for the
-never-resolved state, this chart ships no `PrometheusRule`, and nothing ships
-logs off the node — so the signal exists and is not yet alertable. That is the
-part of the crash loop this change genuinely removes.
+NEVER resolved, distinctly from the warning a blip gets. **That log line is no
+longer the only signal.** `dial` now exports
+`yadgar_dial_upstream_never_resolved`, and `deploy`'s `DialUpstreamNeverResolved`
+rule alerts on it after 2m. This chart itself still ships no `PrometheusRule` —
+the rule lives in `deploy` — but the gap the crash-loop's removal opened is
+covered.
 
 The crypto keys are the opposite case, deliberately: their absence fails boot.
 A service that started without them would pass its readiness probe and then
