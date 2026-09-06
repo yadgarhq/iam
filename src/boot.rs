@@ -60,6 +60,7 @@ pub fn nats_credentials(
         };
     }
 
+    // ADR-0523-WATCHED: Credentials
     let raw =
         std::fs::read_to_string(&path).map_err(|source| BootError::NatsPasswordUnreadable {
             path: path.clone(),
