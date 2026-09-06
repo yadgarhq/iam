@@ -85,12 +85,15 @@ Two residuals are accepted rather than hidden, and both are in the contract:
   hash cannot be replayed. Every attempt but the last leaves an orphan.
   `ListCredentials` exists to find those and is **not implemented yet** — until
   it is, an orphan is reachable only in the store.
-- A **replayed `IssueEnrolment` key returns a token that cannot be redeemed.**
-  The key is forwarded and the store deduplicates it, so the replay answers with
-  the original `enrolment_id` while keeping the original secret's hash — and the
-  secret in the token was minted afresh. The store keeps only a hash, which is
-  the same fact that puts token _resend_ outside D73's first cut. The recovery is
-  the one this RPC already is: mint another.
+- A **replayed `IssueEnrolment` key mints a second, live enrolment.** `iam-db`'s
+  `iam_enrolment` table carries no idempotency column, and `CreateEnrolment`
+  discards the key it is handed rather than comparing against it — so a retry,
+  arriving with a secret `iam` minted afresh, inserts a second row with a
+  second `enrolment_id`, redeemable exactly like the first. Not a deduplicated
+  no-op, and not a dead token. The store keeps only a hash, which is the same
+  fact that puts token _resend_ outside D73's first cut. ADR-0519 decided this
+  RPC refuses a replayed key instead of minting a second one; that refusal was
+  never built, and closing the gap is ledger 668.
 
 ## The inheritable setting, which this service carries and never resolves
 
