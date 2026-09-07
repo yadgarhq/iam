@@ -1762,8 +1762,10 @@ impl IamService for Iam {
             // consulting a key. It is still forwarded rather than dropped: the
             // field is the CONTRACT's, and a caller that sent a key must not
             // have it silently removed by a hop that has decided it does not
-            // need one. If this RPC ever gains a ledger, the key is already
-            // arriving.
+            // need one. If this RPC ever gains a ledger the key is already
+            // arriving, though the ledger itself would be `iam-db`'s to add —
+            // its handler discards the key today, so nothing on this side makes
+            // that work smaller.
             idempotency: req.get_ref().idempotency.clone(),
             user_id: req.get_ref().user_id.clone(),
             is_admin: req.get_ref().is_admin,
