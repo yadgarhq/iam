@@ -109,6 +109,25 @@ pub mod subject {
     /// costs one resolve each and is the safe direction to be wrong in; the
     /// alternative is a cache the event cannot address, which fails by leaving
     /// the revoked credential working.
+    ///
+    /// **`SetUserAdmin` PUBLISHES ON THIS SUBJECT AND REVOKES NOTHING, AND THE
+    /// NAME THEREFORE OVER-STATES WHAT HAPPENED.** A promotion or a demotion
+    /// needs exactly the eviction this subject already drives — the gateway
+    /// lands both subjects on `Cache::forget_user` — and the broker permits this
+    /// service to publish only the two named here (`deploy/infra/nats.yaml`), so
+    /// a third subject would be refused asynchronously while `publish` returned
+    /// `Ok(())`: no invalidation AND no record. A mislabelled record beats an
+    /// absent one, and that is the whole of the argument.
+    ///
+    /// **THE COST IS REAL AND IS NOT DEFERRED TO A FUTURE READER.** There is no
+    /// audit store on this boundary, so the gateway's eviction line — which
+    /// carries the subject as a field — is one of the only records an
+    /// administrative act leaves. Every promotion emits one saying a credential
+    /// was revoked. **THIS SUBJECT IS AN EVICTION SIGNAL AND NEVER EVIDENCE
+    /// THAT A REVOCATION OCCURRED**, and a consumer that reads it as evidence is
+    /// reading it wrongly. Renaming it — or splitting an `admin-changed` subject
+    /// out — is a `deploy` broker-permission change first and this constant
+    /// second, in that order, or the failure above is what ships.
     pub const CREDENTIAL_REVOKED: &str = "yadgar.iam.credential.revoked";
     /// A user's team membership changed. Payload: the user id.
     ///
