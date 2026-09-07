@@ -71,6 +71,14 @@ struct FakeDb {
     password: Option<(String, String)>,
     /// A `(code, message)` to fail `CreateUser` with, for the redaction test.
     create_user_fails: Option<(tonic::Code, &'static str)>,
+    /// A `(code, message)` to fail `SetUserAdmin` with.
+    ///
+    /// **THE STORE REFUSES THIS WRITE FOR A REASON NO OTHER FIELD CAN PRODUCE**:
+    /// `iam-db` answers `NOT_FOUND` when the id names nobody live, rather than
+    /// reporting an `OK` for a promotion that touched no row. Without this knob
+    /// the refusal is unreachable from a test, and "nothing is invalidated for a
+    /// user the store refused to write" is a claim with no way to fail.
+    set_user_admin_fails: Option<(tonic::Code, &'static str)>,
     /// What `ResolveCredential` answers.
     resolves_to: Option<String>,
     /// D73's flag, as the STORE reports it. Separate from `resolves_to` so a
@@ -111,12 +119,21 @@ impl IamDbService for FakeDb {
         // one property a script of fixed answers cannot have and the promote →
         // resolve assertion needs. `resolves_admin` stays the answer until a
         // `SetUserAdmin` lands, so no existing test changes.
+        //
+        // **KEYED ON `user_id`, AND WITHOUT THAT THE ECHO CERTIFIES ITSELF.** A
+        // fake that returned the last write's flag whatever user it named would
+        // answer `is_admin: true` for the person this credential resolves to
+        // after a promotion of somebody else — so `iam` forwarding the WRONG id
+        // would leave the promote → resolve test green. This is the store's own
+        // rule, which is that the row promoted is the row named.
+        let resolved = self.resolves_to.clone().unwrap_or_default();
         let promoted = self
             .recorded
             .lock()
             .expect("recorded")
             .set_user_admin
-            .last()
+            .iter()
+            .rfind(|w| w.user_id == resolved)
             .map(|w| w.is_admin);
         Ok(Response::new(db::ResolveCredentialResponse {
             user_id: self.resolves_to.clone().unwrap_or_default(),
@@ -194,11 +211,17 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::SetUserAdminRequest>,
     ) -> Result<Response<db::SetUserAdminResponse>, Status> {
+        // RECORDED BEFORE THE REFUSAL, so a test can tell "the store refused"
+        // from "the store was never asked" — the two produce the same `Err` at
+        // the caller and only this log tells them apart.
         self.recorded
             .lock()
             .expect("recorded")
             .set_user_admin
             .push(req.into_inner());
+        if let Some((code, message)) = self.set_user_admin_fails {
+            return Err(Status::new(code, message));
+        }
         Ok(Response::new(db::SetUserAdminResponse {}))
     }
 
@@ -1100,6 +1123,45 @@ async fn a_promotion_is_visible_to_the_next_resolve_and_the_cache_is_told() {
         invalidator.published(),
         vec![(subject::CREDENTIAL_REVOKED, "yadgar:user:1".to_string())],
         "and the gateway was told to stop answering from its cache"
+    );
+}
+
+#[tokio::test]
+async fn a_promotion_the_store_refuses_invalidates_nothing() {
+    // THE ORDERING, AND IT IS A CLAIM THE COMMENT AT THE PUBLISH SITE MAKES.
+    // Publishing BEFORE the upstream call leaves every other test in this file
+    // green: the happy paths publish either way, and `iam-db`'s refusal is
+    // unreachable without a knob to provoke it. So without this test the
+    // sentence "publishing after the upstream `Ok` is what keeps that safe" is
+    // an assertion nothing checks.
+    //
+    // WHY IT MATTERS RATHER THAN BEING TIDY: `iam-db` answers `NOT_FOUND` for an
+    // id that names nobody live, which is what a mistyped user id produces. An
+    // invalidation published for it evicts a cache entry for a user that was
+    // never promoted — a wasted resolve today, and on the day this subject means
+    // more than an eviction, a record of an act that did not happen.
+    const REFUSAL: &str = "no live user with that id";
+    let (iam, rec, invalidator) = iam_with(FakeDb {
+        set_user_admin_fails: Some((tonic::Code::NotFound, REFUSAL)),
+        ..Default::default()
+    })
+    .await;
+
+    let err = iam
+        .set_user_admin(promote(true, None))
+        .await
+        .expect_err("the store refused the write");
+
+    assert_eq!(err.code(), tonic::Code::NotFound, "the code propagates");
+    assert_eq!(
+        rec.lock().expect("recorded").set_user_admin.len(),
+        1,
+        "the store WAS asked — this is a refusal, not a request that never left"
+    );
+    assert!(
+        invalidator.published().is_empty(),
+        "nothing may be invalidated for a user the store refused to write, and \
+         the publish is after the upstream call precisely so"
     );
 }
 

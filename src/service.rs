@@ -1713,10 +1713,28 @@ impl IamService for Iam {
     /// **THE ACTOR IS RELAYED, AND THIS IS THE FIRST SITE ON THIS SERVICE THAT
     /// RELAYS ONE.** ADR-0534's field is audit-only: it is asserted by the
     /// gateway, verified by nothing on the wire, and MUST NOT be an
-    /// authorisation input. So it is forwarded exactly as received — `None`
-    /// stays `None`, and an empty actor is never fabricated to fill the field,
-    /// because `iam-db` renders an empty id as `<unattributed>` and that would
-    /// make a dropped id indistinguishable from an absent one.
+    /// authorisation input. So it is forwarded exactly as received, and `None`
+    /// stays `None`.
+    ///
+    /// **THE RELAY HAS NO SINK TODAY, AND SAYING SO IS THE POINT.**
+    /// `iamdb.v1.SetUserAdmin` READS NEITHER `unverified_actor` NOR
+    /// `idempotency` — its UPDATE binds `is_admin` and `user_id` and nothing
+    /// else — so what this hop carries is discarded on arrival. The one place
+    /// in `iam-db` that reads the field at all is `set_inherited_setting`,
+    /// which logs it and renders an empty id as `<unattributed>`; there is no
+    /// audit store on this boundary for it to land in. Adding that log line to
+    /// the administrative writes is a change in `iam-db` that
+    /// `plans/the-administrative-surface.md` §6.1 prices and explicitly leaves
+    /// outside this plan's steps. **So this relay has a source arriving in step
+    /// 5 and nowhere to land until §6.1's change 2 lands too**, and a reader
+    /// must not take the forwarding for an attribution that is being recorded.
+    ///
+    /// **AN EMPTY ACTOR IS NEVER FABRICATED TO FILL THE FIELD**, and that rule
+    /// does not rest on what any reader does today. `Some(UnverifiedActor {
+    /// user_id: "" })` asserts that somebody was named and their id was empty,
+    /// which is not what an absent actor means — so on the day a sink exists it
+    /// is a false record, and it makes an id this service DROPPED
+    /// indistinguishable from one the caller never sent.
     ///
     /// **D73 EXCLUDES ADMIN SELF-DEMOTION AND THIS SERVICE CANNOT ENFORCE IT.**
     /// The only caller identity on this request is that same unverifiable actor,
@@ -1736,7 +1754,16 @@ impl IamService for Iam {
         );
 
         let mut upstream = Request::new(db::SetUserAdminRequest {
-            // D9's key travels, on `revoke_credential`'s reasoning.
+            // D9'S KEY TRAVELS AND `iam-db` DISCARDS IT, WHICH IS NOT THE SAME
+            // ARGUMENT `revoke_credential` MAKES. There the key is what turns a
+            // second delivery into a replay; here the store's own comment says
+            // it is "idempotent (D9) without a ledger because it ASSIGNS rather
+            // than toggles", so a redelivery reaches the same state without
+            // consulting a key. It is still forwarded rather than dropped: the
+            // field is the CONTRACT's, and a caller that sent a key must not
+            // have it silently removed by a hop that has decided it does not
+            // need one. If this RPC ever gains a ledger, the key is already
+            // arriving.
             idempotency: req.get_ref().idempotency.clone(),
             user_id: req.get_ref().user_id.clone(),
             is_admin: req.get_ref().is_admin,
