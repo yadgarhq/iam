@@ -1702,8 +1702,45 @@ impl IamService for Iam {
         ))
     }
 
-    /// NOT IMPLEMENTED IN THIS CHANGE. D73's admin flag reaches the store
-    /// (`iamdb.v1.SetUserAdmin`) and this service does not drive it yet.
+    /// Set or clear D73's admin flag, and publish the invalidation.
+    ///
+    /// **ONE HOP, AND IT ADDS NO RULE OF ITS OWN.** `iamdb.v1.SetUserAdmin`
+    /// performs the write, refuses an id it cannot promote — an unknown or
+    /// soft-deleted person is `NOT_FOUND` rather than a silent `OK` — and is
+    /// idempotent by assigning rather than toggling. Re-deciding any of that here
+    /// would be a second place for it to be wrong.
+    ///
+    /// **THE ACTOR IS RELAYED, AND THIS IS THE FIRST SITE ON THIS SERVICE THAT
+    /// RELAYS ONE.** ADR-0534's field is audit-only: it is asserted by the
+    /// gateway, verified by nothing on the wire, and MUST NOT be an
+    /// authorisation input. So it is forwarded exactly as received, and `None`
+    /// stays `None`.
+    ///
+    /// **THE RELAY HAS NO SINK TODAY, AND SAYING SO IS THE POINT.**
+    /// `iamdb.v1.SetUserAdmin` READS NEITHER `unverified_actor` NOR
+    /// `idempotency` — its UPDATE binds `is_admin` and `user_id` and nothing
+    /// else — so what this hop carries is discarded on arrival. The one place
+    /// in `iam-db` that reads the field at all is `set_inherited_setting`,
+    /// which logs it and renders an empty id as `<unattributed>`; there is no
+    /// audit store on this boundary for it to land in. Adding that log line to
+    /// the administrative writes is a change in `iam-db` that
+    /// `plans/the-administrative-surface.md` §6.1 prices and explicitly leaves
+    /// outside this plan's steps. **So this relay has a source arriving in step
+    /// 5 and nowhere to land until §6.1's change 2 lands too**, and a reader
+    /// must not take the forwarding for an attribution that is being recorded.
+    ///
+    /// **AN EMPTY ACTOR IS NEVER FABRICATED TO FILL THE FIELD**, and that rule
+    /// does not rest on what any reader does today. `Some(UnverifiedActor {
+    /// user_id: "" })` asserts that somebody was named and their id was empty,
+    /// which is not what an absent actor means — so on the day a sink exists it
+    /// is a false record, and it makes an id this service DROPPED
+    /// indistinguishable from one the caller never sent.
+    ///
+    /// **D73 EXCLUDES ADMIN SELF-DEMOTION AND THIS SERVICE CANNOT ENFORCE IT.**
+    /// The only caller identity on this request is that same unverifiable actor,
+    /// so a check here would be authorising on it. `iam.proto` puts both
+    /// administrative checks at the gateway for that reason; the absence of a
+    /// self-demotion rule here is deliberate rather than an oversight.
     async fn set_user_admin(
         &self,
         req: Request<SetUserAdminRequest>,
@@ -1715,8 +1752,74 @@ impl IamService for Iam {
             Kind::Write,
             tel(rid, &req.get_ref().user_id),
         );
-        call.fail("UNIMPLEMENTED");
-        Err(Status::unimplemented("SetUserAdmin is not implemented yet"))
+
+        let mut upstream = Request::new(db::SetUserAdminRequest {
+            // D9'S KEY TRAVELS AND `iam-db` DISCARDS IT, WHICH IS NOT THE SAME
+            // ARGUMENT `revoke_credential` MAKES. There the key is what turns a
+            // second delivery into a replay; here the store's own comment says
+            // it is "idempotent (D9) without a ledger because it ASSIGNS rather
+            // than toggles", so a redelivery reaches the same state without
+            // consulting a key. It is still forwarded rather than dropped: the
+            // field is the CONTRACT's, and a caller that sent a key must not
+            // have it silently removed by a hop that has decided it does not
+            // need one. If this RPC ever gains a ledger the key is already
+            // arriving, though the ledger itself would be `iam-db`'s to add —
+            // its handler discards the key today, so nothing on this side makes
+            // that work smaller.
+            idempotency: req.get_ref().idempotency.clone(),
+            user_id: req.get_ref().user_id.clone(),
+            is_admin: req.get_ref().is_admin,
+            // FORWARDED, AND EVERY OTHER SITE IN THIS FILE STILL SENDS `None`.
+            // The comment at `issue_credential` argues that a relay of a field
+            // nothing populates reads as a relay that works; the administrative
+            // route is what gives this one a real value to carry, so here the
+            // argument runs the other way.
+            unverified_actor: req.get_ref().unverified_actor.clone(),
+        });
+        forward_request_id(&req, &mut upstream);
+
+        self.client()
+            .set_user_admin(upstream)
+            .await
+            .map_err(upstream_failed)?;
+
+        // **THE SUBJECT NAMES SOMETHING THAT DID NOT HAPPEN, AND THAT COST IS
+        // PAID DELIBERATELY.** No credential was revoked here: a person's
+        // authority changed. The broker permits `iam` to publish exactly two
+        // subjects (`deploy/infra/nats.yaml`, the `iam` user's `publish.allow`),
+        // and a publish to a third one is refused ASYNCHRONOUSLY while
+        // `Client::publish` has already returned `Ok(())` — see this module's
+        // header. A new subject before its broker permission would therefore
+        // leave NO record and NO invalidation, and a mislabelled record beats an
+        // absent one.
+        //
+        // **WHAT IT COSTS, STATED RATHER THAN LEFT TO BE FOUND.** The gateway
+        // logs the subject as a field on every eviction
+        // (`gateway/src/invalidate.rs`, "cached identity invalidated"), and there
+        // is no audit store on this boundary — so today a promotion to
+        // administrator leaves a record that says `yadgar.iam.credential.revoked`,
+        // on the verb whose record matters most. `Call::start` above names the
+        // verb truthfully, which is what keeps this a second and corroborated
+        // record rather than the only one. A consumer must NOT read this subject
+        // as evidence that a revocation occurred.
+        //
+        // **UNCONDITIONAL, AND ON THE USER FROM THE REQUEST.** Demotion needs the
+        // eviction at least as much as promotion does, and this service cannot
+        // tell the two apart anyway: the store assigns the wanted value and
+        // answers with an empty message, so there is no prior value to compare
+        // and `SetUserAdminResponse` carries no id to publish. Publishing AFTER
+        // the upstream `Ok` is what keeps that safe — a `NOT_FOUND` for an
+        // unknown or soft-deleted person has already returned above, so nothing
+        // is invalidated for a user the store refused to write.
+        self.invalidator
+            .credential_revoked(&req.get_ref().user_id)
+            .await;
+
+        call.finish(Outcome {
+            status: "OK",
+            ..Default::default()
+        });
+        Ok(Response::new(SetUserAdminResponse {}))
     }
 
     /// NOT IMPLEMENTED IN THIS CHANGE. D74's overrides are contract surface this
@@ -1901,13 +2004,19 @@ impl IamService for Iam {
             // arrive on. Relaying `r.unverified_actor` today would move `None`
             // and READ AS A RELAY THAT WORKS.
             //
-            // **THE RELAY HAS SEVEN SITES AND THIS IS ONE**: here,
-            // `revoke_credential`, `create_user`, `add_team_member`,
-            // `remove_team_member`, and the two that already said so before this
-            // change — `issue_enrolment` and `set_inherited_setting`. Five of the
-            // seven were invisible until this file stopped using a rest pattern,
-            // so whoever wires the path by grepping for the field would have
-            // found two.
+            // **THE RELAY HAS EIGHT SITES AND SEVEN OF THEM STILL SEND `None`**:
+            // here, `revoke_credential`, `create_user`, `add_team_member`,
+            // `remove_team_member`, and the two that already said so before the
+            // change that wrote this comment — `issue_enrolment` and
+            // `set_inherited_setting`. Five of them were invisible until this file
+            // stopped using a rest pattern, so whoever wires the path by grepping
+            // for the field would have found two.
+            //
+            // **`set_user_admin` IS THE EXCEPTION AND IT RELAYS FOR REAL**, so
+            // "nothing populates the field" is no longer true of this service as
+            // a whole. It stays true here: the administrative route reaches that
+            // verb and not this one. Sweeping the remaining seven is ledger 612's
+            // work, on the day a caller exists for each.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut create);

@@ -27,7 +27,7 @@ use tonic::transport::{Channel, Endpoint};
 use super::*;
 use crate::crypto::argon2_verifications;
 use crate::invalidate::subject;
-use crate::pb::yadgar::common::v1::InheritedSetting;
+use crate::pb::yadgar::common::v1::{InheritedSetting, UnverifiedActor};
 use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbServiceServer};
 
 /// Everything the fake twin was asked to do.
@@ -55,6 +55,12 @@ struct Recorded {
     create_user: Vec<db::CreateUserRequest>,
     add_team_member: Vec<db::AddTeamMemberRequest>,
     remove_team_member: Vec<db::RemoveTeamMemberRequest>,
+    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY.** Every other
+    /// administrative write forwards `unverified_actor: None`, so recording the
+    /// request buys nothing there but the field list. This one forwards what the
+    /// caller asserted, and a hard-coded `None` answers `Ok` exactly like a
+    /// working relay — so the forwarded request is the only oracle.
+    set_user_admin: Vec<db::SetUserAdminRequest>,
 }
 
 /// A stand-in for `iam-db`: answers from a fixed script and records the asking.
@@ -65,6 +71,14 @@ struct FakeDb {
     password: Option<(String, String)>,
     /// A `(code, message)` to fail `CreateUser` with, for the redaction test.
     create_user_fails: Option<(tonic::Code, &'static str)>,
+    /// A `(code, message)` to fail `SetUserAdmin` with.
+    ///
+    /// **THE STORE REFUSES THIS WRITE FOR A REASON NO OTHER FIELD CAN PRODUCE**:
+    /// `iam-db` answers `NOT_FOUND` when the id names nobody live, rather than
+    /// reporting an `OK` for a promotion that touched no row. Without this knob
+    /// the refusal is unreachable from a test, and "nothing is invalidated for a
+    /// user the store refused to write" is a claim with no way to fail.
+    set_user_admin_fails: Option<(tonic::Code, &'static str)>,
     /// What `ResolveCredential` answers.
     resolves_to: Option<String>,
     /// D73's flag, as the STORE reports it. Separate from `resolves_to` so a
@@ -101,9 +115,29 @@ impl IamDbService for FakeDb {
         &self,
         _req: Request<db::ResolveCredentialRequest>,
     ) -> Result<Response<db::ResolveCredentialResponse>, Status> {
+        // A WRITE THIS FAKE ACCEPTED IS VISIBLE TO THE NEXT READ, which is the
+        // one property a script of fixed answers cannot have and the promote →
+        // resolve assertion needs. `resolves_admin` stays the answer until a
+        // `SetUserAdmin` lands, so no existing test changes.
+        //
+        // **KEYED ON `user_id`, AND WITHOUT THAT THE ECHO CERTIFIES ITSELF.** A
+        // fake that returned the last write's flag whatever user it named would
+        // answer `is_admin: true` for the person this credential resolves to
+        // after a promotion of somebody else — so `iam` forwarding the WRONG id
+        // would leave the promote → resolve test green. This is the store's own
+        // rule, which is that the row promoted is the row named.
+        let resolved = self.resolves_to.clone().unwrap_or_default();
+        let promoted = self
+            .recorded
+            .lock()
+            .expect("recorded")
+            .set_user_admin
+            .iter()
+            .rfind(|w| w.user_id == resolved)
+            .map(|w| w.is_admin);
         Ok(Response::new(db::ResolveCredentialResponse {
             user_id: self.resolves_to.clone().unwrap_or_default(),
-            is_admin: self.resolves_admin,
+            is_admin: promoted.unwrap_or(self.resolves_admin),
             owner_reads_own_record: self.resolves_setting.clone(),
             ..Default::default()
         }))
@@ -175,8 +209,19 @@ impl IamDbService for FakeDb {
 
     async fn set_user_admin(
         &self,
-        _req: Request<db::SetUserAdminRequest>,
+        req: Request<db::SetUserAdminRequest>,
     ) -> Result<Response<db::SetUserAdminResponse>, Status> {
+        // RECORDED BEFORE THE REFUSAL, so a test can tell "the store refused"
+        // from "the store was never asked" — the two produce the same `Err` at
+        // the caller and only this log tells them apart.
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .set_user_admin
+            .push(req.into_inner());
+        if let Some((code, message)) = self.set_user_admin_fails {
+            return Err(Status::new(code, message));
+        }
         Ok(Response::new(db::SetUserAdminResponse {}))
     }
 
@@ -991,6 +1036,177 @@ async fn revoking_a_credential_publishes_the_invalidation() {
         invalidator.published(),
         vec![(subject::CREDENTIAL_REVOKED, "yadgar:user:1".to_string())]
     );
+}
+
+// ---------------------------------------------------------------------------
+// D73's promote verb.
+// ---------------------------------------------------------------------------
+
+/// The key every `SetUserAdmin` in these tests carries, so a dropped one is
+/// visible as an absence rather than as a different value.
+const PROMOTE_KEY: &str = "01J0000000000000000000000A";
+
+fn promote(is_admin: bool, actor: Option<UnverifiedActor>) -> Request<SetUserAdminRequest> {
+    Request::new(SetUserAdminRequest {
+        idempotency: Some(Idempotency {
+            key: PROMOTE_KEY.into(),
+        }),
+        user_id: "yadgar:user:1".into(),
+        is_admin,
+        unverified_actor: actor,
+    })
+}
+
+#[tokio::test]
+async fn setting_the_admin_flag_publishes_the_invalidation_in_both_directions() {
+    // MUTATION THIS CATCHES: a body that drives the store and publishes nothing.
+    // The gateway caches what a credential resolves to for 300 seconds
+    // (`YADGAR_CREDENTIAL_TTL_SECONDS`), so without this the promoted person is
+    // not an admin for five minutes and the demoted one keeps the authority for
+    // the same window. An `Ok` from this RPC says nothing about either.
+    //
+    // BOTH DIRECTIONS, on `adding_a_team_member_publishes_the_invalidation`'s
+    // reasoning: a publish written for promotion only leaves the demotion late,
+    // which is the direction that matters for a compromised admin.
+    for is_admin in [true, false] {
+        let (iam, _rec, invalidator) = iam_with(FakeDb::default()).await;
+
+        iam.set_user_admin(promote(is_admin, None))
+            .await
+            .expect("set the flag");
+
+        assert_eq!(
+            invalidator.published(),
+            vec![(subject::CREDENTIAL_REVOKED, "yadgar:user:1".to_string())],
+            "the cached identity must be dropped whether the flag went up or down"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_promotion_is_visible_to_the_next_resolve_and_the_cache_is_told() {
+    // THE END-TO-END SHAPE, and what it cannot reach is worth as much as what it
+    // can. This asserts the two halves that live in THIS repository: the flag
+    // the store now holds travels back out through `ResolveCredential`, and the
+    // invalidation that makes the gateway ask again was published. **The
+    // eviction itself is `gateway/src/attest.rs`'s `Cache::forget_user` and is
+    // out of this crate**, so "the promoted person is an admin inside the TTL"
+    // is only closed by the pair — this test and the gateway's.
+    let (iam, _rec, invalidator) = iam_with(FakeDb {
+        resolves_to: Some("yadgar:user:1".into()),
+        resolves_admin: false,
+        ..Default::default()
+    })
+    .await;
+
+    let before = iam
+        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .await
+        .expect("resolve")
+        .into_inner();
+    assert!(!before.is_admin, "nobody is an admin before the promotion");
+
+    iam.set_user_admin(promote(true, None))
+        .await
+        .expect("promote");
+
+    let after = iam
+        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .await
+        .expect("resolve")
+        .into_inner();
+    assert!(
+        after.is_admin,
+        "the promotion reached the store and came back"
+    );
+    assert_eq!(
+        invalidator.published(),
+        vec![(subject::CREDENTIAL_REVOKED, "yadgar:user:1".to_string())],
+        "and the gateway was told to stop answering from its cache"
+    );
+}
+
+#[tokio::test]
+async fn a_promotion_the_store_refuses_invalidates_nothing() {
+    // THE ORDERING, AND IT IS A CLAIM THE COMMENT AT THE PUBLISH SITE MAKES.
+    // Publishing BEFORE the upstream call leaves every other test in this file
+    // green: the happy paths publish either way, and `iam-db`'s refusal is
+    // unreachable without a knob to provoke it. So without this test the
+    // sentence "publishing after the upstream `Ok` is what keeps that safe" is
+    // an assertion nothing checks.
+    //
+    // WHY IT MATTERS RATHER THAN BEING TIDY: `iam-db` answers `NOT_FOUND` for an
+    // id that names nobody live, which is what a mistyped user id produces. An
+    // invalidation published for it evicts a cache entry for a user that was
+    // never promoted — a wasted resolve today, and on the day this subject means
+    // more than an eviction, a record of an act that did not happen.
+    const REFUSAL: &str = "no live user with that id";
+    let (iam, rec, invalidator) = iam_with(FakeDb {
+        set_user_admin_fails: Some((tonic::Code::NotFound, REFUSAL)),
+        ..Default::default()
+    })
+    .await;
+
+    let err = iam
+        .set_user_admin(promote(true, None))
+        .await
+        .expect_err("the store refused the write");
+
+    assert_eq!(err.code(), tonic::Code::NotFound, "the code propagates");
+    assert_eq!(
+        rec.lock().expect("recorded").set_user_admin.len(),
+        1,
+        "the store WAS asked — this is a refusal, not a request that never left"
+    );
+    assert!(
+        invalidator.published().is_empty(),
+        "nothing may be invalidated for a user the store refused to write, and \
+         the publish is after the upstream call precisely so"
+    );
+}
+
+#[tokio::test]
+async fn the_promote_verb_relays_the_actor_the_caller_asserted() {
+    // ADR-0534's RELAY, AND THIS IS ITS FIRST SITE WITH A SOURCE. Every other
+    // administrative write in this service forwards `unverified_actor: None`
+    // because nothing populates the field; the administrative route (this plan's
+    // step 5) makes this one the exception.
+    //
+    // MUTATION THIS CATCHES: a hard-coded `None`, copied from the six sites
+    // around it. It answers `Ok`, it publishes the invalidation, and every other
+    // assertion in this file passes — the forwarded request is the only place the
+    // difference shows. The WHOLE request is compared rather than the actor
+    // alone, so a dropped idempotency key or a dropped flag is caught here too.
+    //
+    // BOTH ARMS, because a relay that fabricates `Some(UnverifiedActor { user_id:
+    // "" })` when the caller sent nothing is the false green §9 names: `iam-db`
+    // logs `<unattributed>` for an empty id, so the wrong route reaches the right
+    // output and hides a real id that was dropped.
+    for actor in [
+        Some(UnverifiedActor {
+            user_id: "yadgar:user:admin".into(),
+        }),
+        None,
+    ] {
+        let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+        iam.set_user_admin(promote(true, actor.clone()))
+            .await
+            .expect("promote");
+
+        assert_eq!(
+            rec.lock().expect("recorded").set_user_admin,
+            vec![db::SetUserAdminRequest {
+                idempotency: Some(Idempotency {
+                    key: PROMOTE_KEY.into()
+                }),
+                user_id: "yadgar:user:1".into(),
+                is_admin: true,
+                unverified_actor: actor,
+            }],
+            "the store must be asked what the caller asked for, actor included"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1952,7 +2168,8 @@ fn an_absent_ca_is_a_deployment_and_an_empty_one_is_a_mistake() {
 }
 
 // ---------------------------------------------------------------------------
-// What v1.6.0 added and this change does NOT implement.
+// What v1.6.0 added and this service still does NOT implement. `SetUserAdmin`
+// was a member until D73's promote verb was built; the two below are not.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1970,12 +2187,6 @@ async fn the_unbuilt_rpcs_refuse_rather_than_answering() {
         .await
         .expect_err("ListCredentials is not built");
     assert_eq!(listed.code(), tonic::Code::Unimplemented);
-
-    let admin = iam
-        .set_user_admin(Request::new(SetUserAdminRequest::default()))
-        .await
-        .expect_err("SetUserAdmin is not built");
-    assert_eq!(admin.code(), tonic::Code::Unimplemented);
 
     let limit = iam
         .set_rate_limit_override(Request::new(SetRateLimitOverrideRequest::default()))
