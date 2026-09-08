@@ -148,14 +148,16 @@ fn env_required(key: &str) -> Result<String, String> {
 /// body to `error.to_string()` turns
 /// `a_refusal_carries_the_layer_below_transport_error` red.
 ///
-/// **THE DUPLICATION `gateway#44` ACCEPTED APPLIES HERE UNCHANGED.**
-/// `BalanceError` has ten variants, six of which carry `#[source]` — and all
-/// six also interpolate `{source}` into their own `#[error]` string, `Tls`
-/// included. So the walk appends a duplicate tail on every one of them: a CA
-/// bundle that cannot be read renders `... (os error 2). TLS was requested \
-/// ...: No such file or directory (os error 2)`. That is a known defect
-/// (ledger 737, tracked in `yadgar-dial`, not fixed here) and is accepted as
-/// the cost of reaching the one layer this file would otherwise lose.
+/// **THE DUPLICATION `gateway#44` ACCEPTED NO LONGER APPLIES.** `BalanceError`
+/// has ten variants, six of which carry `#[source]`, `Tls` included; on the
+/// pin this file carried through `yadgar-dial` v0.2.1 all six also
+/// interpolated `{source}` into their own `#[error]` string, so the walk
+/// appended a duplicate tail on every one of them — a CA bundle that could not
+/// be read rendered `... (os error 2). TLS was requested ...: No such file or
+/// directory (os error 2)`. `yadgar-dial` v0.2.5 (ledger 737) dropped the
+/// interpolation and reordered the six messages so the chain walk supplies the
+/// cause exactly once; this file adopted that tag and the duplicate tail is
+/// gone.
 fn refusal(error: &dyn std::error::Error) -> String {
     yadgar_telemetry::diagnose::chain(error)
 }
