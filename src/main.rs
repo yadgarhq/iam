@@ -84,114 +84,22 @@
 //! drain was reached on no rollout at all.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
+use tonic::transport::Server;
 use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 
+use yadgar_iam::boot;
 use yadgar_iam::crypto::Keys;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 use yadgar_iam::rotate;
 use yadgar_iam::serve;
-use yadgar_iam::service::{EnrolmentConfig, Iam, ResponseFloors};
-use yadgar_iam::upstream;
-
-/// One configuration knob, read from its ONE source, with no compiled-in
-/// default behind it (ADR-0569).
-///
-/// This replaced `env_or(key, default)`, and the deletion is the point rather
-/// than the rename: while the helper took a `default` argument, every knob in
-/// this binary had somewhere for a fallback to live, and a fallback is invisible
-/// at the point of use, survives an upgrade unnoticed, and makes the effective
-/// setting depend on which layer a reader happens to inspect.
-///
-/// AN EMPTY VALUE REFUSES TOO, and with its own message. A set-but-empty
-/// variable and an absent one collapsing into a single branch is a defect this
-/// estate found three separate times in one week: Helm renders an unset value as
-/// `""`, so the empty case is what a nulled chart value actually produces, and it
-/// is the one an operator is most likely to hit.
-fn env_required(key: &str) -> Result<String, String> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        Ok(_) => Err(format!(
-            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
-             nothing to fall back to. The chart renders it; a values override that nulls it \
-             produces exactly this."
-        )),
-        Err(_) => Err(format!(
-            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
-             it from the environment alone and refuses to start rather than invent a value. \
-             The chart renders it."
-        )),
-    }
-}
-
-/// The `iam-db` boot refusal, flattened through the estate's one error-chain
-/// walker (ledger 733, ledger 740, ADR-0591) instead of a second copy.
-///
-/// **THE ONLY `to_string()` SITE IN THIS FILE THAT TAKES IT.** Every other
-/// refusal here — `serve::ServerTls`, `upstream::UpstreamTls`,
-/// `rotate::Configuration` — already returns a complete sentence with nothing
-/// further under it worth a walk. `upstream::connect` is different: it returns
-/// `yadgar_dial::BalanceError`, and `BalanceError::Tls` wraps a
-/// `tonic::transport::Error` whose entire `Display` is the two words
-/// `transport error` — measured, this is the one place in this file where the
-/// head of the chain is a dead end and the reason sits one `source()` hop
-/// below it. `gateway#44` measured the same signature at its own two call
-/// sites and took the walk there for the identical reason; this is the same
-/// class, ledger 740, reaching the two repositories `gateway` does not dial.
-///
-/// **NOT A SECOND FLATTENER.** The body is a call to
-/// `yadgar_telemetry::diagnose::chain` and nothing else. It exists as a named
-/// function only because `main` is a binary target: every `map_err` closure
-/// inside it is unreachable from a test, so routing this one call through a
-/// seam is what gives the property somewhere to be asserted. Reverting this
-/// body to `error.to_string()` turns
-/// `a_refusal_carries_the_layer_below_transport_error` red.
-///
-/// **THE DUPLICATION `gateway#44` ACCEPTED NO LONGER APPLIES.** `BalanceError`
-/// has ten variants, six of which carry `#[source]`, `Tls` included; on the
-/// pin this file carried through `yadgar-dial` v0.2.1 all six also
-/// interpolated `{source}` into their own `#[error]` string, so the walk
-/// appended a duplicate tail on every one of them — a CA bundle that could not
-/// be read rendered `... (os error 2). TLS was requested ...: No such file or
-/// directory (os error 2)`. `yadgar-dial` v0.2.5 (ledger 737) dropped the
-/// interpolation and reordered the six messages so the chain walk supplies the
-/// cause exactly once; this file adopted that tag and the duplicate tail is
-/// gone.
-fn refusal(error: &dyn std::error::Error) -> String {
-    yadgar_telemetry::diagnose::chain(error)
-}
+use yadgar_iam::service::Iam;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .json()
-        // A DEFAULT, because from_default_env() with RUST_LOG unset enables
-        // NOTHING — the service runs silently and its boot sequence, its
-        // capability probe result and its errors all vanish. Found by deploying:
-        // two replicas were Running and `kubectl logs` returned nothing at all,
-        // so the only way to see why one had restarted was the previous
-        // container's exit output.
-        //
-        // A service nobody can observe is one D67 cannot measure either.
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    boot::logging();
 
-    // THE TRANSPORT THIS SERVICE LISTENS ON, decided before anything else. A
-    // missing certificate, an unreadable one, a file holding no certificate at
-    // all and a key belonging to a different certificate are all refused HERE —
-    // never downgraded to the plaintext listener, because a listener that
-    // quietly stayed in the clear is the one failure an operator who asked for
-    // TLS cannot see.
-    //
-    // `.to_string()` on the way out for the reason spelled out on the dial
-    // below: `Box<dyn Error>` prints with DEBUG, and these messages are
-    // sentences naming a file.
-    let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
-    let mut server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
+    let (listen_tls, server) = boot::listener()?;
 
     // Fails boot loudly if the keys are absent or unreadable — deliberately
     // before the listener binds. See the module doc above for why this one
@@ -199,72 +107,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = Keys::from_env()?;
     tracing::info!("crypto keys loaded; names are encrypted at rest (D72)");
 
-    // The HEADLESS Service name (D23). Resolving it yields every ready pod
-    // address rather than one virtual IP.
-    let db_host = env_required("IAM_DB_HOST")?;
-    let db_port: u16 = env_required("IAM_DB_PORT")?.parse()?;
+    let (db, db_tls) = boot::iam_db().await?;
 
-    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
-    // the cleartext dial this service has always done. `iam-db` can now serve
-    // TLS, also opt-in and also off, so the cut-over is a later change that
-    // turns both ends on together and can be reverted on its own.
-    //
-    // `.to_string()` on the way out, and not decoration: `main` returns
-    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
-    // `NoCaFile("IAM_DB")` on the operator's terminal instead of the sentence
-    // naming the missing variable and saying why cleartext is not the answer.
-    let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB).map_err(|e| e.to_string())?;
-    let db = upstream::connect(&db_host, db_port, db_tls.as_ref())
-        .await
-        // `refusal` rather than `to_string()` (ledger 733, ledger 740): see its
-        // own doc comment for why this is the one site in this file that takes
-        // the chain walk. `BalanceError`'s other messages are already complete
-        // paragraphs explaining that an empty bundle trusts nobody and that a
-        // missing one is not a reason to connect in cleartext — `Tls` is not
-        // one of them, and Debug would print the struct and throw all of that
-        // away regardless.
-        .map_err(|e| refusal(&e))?;
-    tracing::info!(
-        reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
-        tls = db_tls.is_some(),
-        "connected to iam-db"
-    );
+    let (config, schedule) = boot::rotation()?;
 
-    // How often those files are re-hashed, and how long THIS pod waits before
-    // acting on a change. The splay is what stops both replicas exiting inside
-    // the same kubelet sync window — a PDB constrains eviction and does not
-    // govern a self-exit.
-    //
-    // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
-    // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
-    // `/etc/yadgar/config/shared/shared.yaml`. There is no compiled-in default
-    // behind it any more: an absent, empty, or half-written document refuses
-    // the boot and names the file. The chart still sets TLS_ROTATION_POLL_SECS
-    // and TLS_ROTATION_SPLAY_MAX_SECS — this binary no longer reads either, but
-    // they stay so a rollout that lands this chart before this binary's digest
-    // still resolves a schedule on the old one. The runbook is
-    // `yadgarhq/deploy`'s MIGRATION_NOTES.md, steps 2a and 2b — NOT this
-    // repository's, which has no such section.
-    //
-    // `.to_string()` on the way out because `Box<dyn Error>` prints with DEBUG
-    // and these messages are sentences.
-    let config = rotate::Configuration::mounted();
-    let schedule = config.schedule().map_err(|e| e.to_string())?;
+    boot::metrics()?;
 
-    // The BINARY installs the exporter, never the library — a library that
-    // installs one picks the backend for every service linking it. A failure here
-    // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
-    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
-        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
-    }
-
-    // The broker, for D72's cache invalidation. Does NOT gate startup: a broker
-    // outage must not become an authentication outage, and the TTL is the
-    // backstop for exactly this. The warning at connect time is what makes the
-    // degraded state visible rather than assumed.
-    //
     // THE CREDENTIAL IS READ BEFORE THE CONNECTION IS ATTEMPTED, and its absence
     // is the one thing here that DOES gate startup. The distinction is the same
     // one D69 draws everywhere else: an unreachable broker is an outage of one
@@ -282,38 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // wrong is either a refusal or an anonymous connection that looks healthy.
     // See [`yadgar_iam::boot::nats_credentials`] for the four half-configured
     // states it refuses.
-    let nats_credentials = yadgar_iam::boot::nats_credentials(|key| std::env::var(key).ok())?;
-    // WARNS AND DEGRADES ONE RPC. It does NOT fail boot, and the difference
-    // matters more here than anywhere else in this file: `iam` is the
-    // authentication plane. A CrashLoopBackOff would stop `Login` at once and
-    // every dependent service's credential resolution as soon as the gateway's
-    // 300s cache expired — an estate-wide outage caused by a value that belongs
-    // to ONE administrative RPC.
-    //
-    // The contract's rule is about the TOKEN — never mint one carrying an empty
-    // gateway — and `IssueEnrolment` keeps it whole by refusing with
-    // FAILED_PRECONDITION. That is loud to the operator who calls it, and this
-    // warning is loud to the operator who deploys it; between them nothing is
-    // silent, and nothing else stops working.
-    //
-    // Contrast the crypto keys above, which DO fail boot: without them every
-    // request touching a credential fails, so there is no reduced service left
-    // to protect. Here there is.
-    let enrolment = match EnrolmentConfig::from_env() {
-        Ok(config) => {
-            tracing::info!("enrolment tokens carry this deployment's gateway and CA (D73)");
-            Some(config)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "IssueEnrolment is UNAVAILABLE on this deployment and will refuse \
-                 with FAILED_PRECONDITION; everything else, ResolveCredential and \
-                 Login included, is unaffected. Set ENROLMENT_GATEWAY to enable it."
-            );
-            None
-        }
-    };
+    let nats_credentials = boot::nats_credentials(|key| std::env::var(key).ok())?;
+
+    let enrolment = boot::enrolment();
 
     // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION IN ONE PLACE AND
     // BEFORE ANYTHING IT NAMES IS MOVED AWAY (ADR-0523). Every entry is hashed
@@ -359,37 +178,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
-    // The shortest time `Login` may answer in, whatever it found. Argon2id takes
-    // its cost from the PHC string it is verifying, so a stored hash provisioned
-    // at parameters other than this build's makes the response time report which
-    // usernames exist — see `crypto::Keys::verify_password`.
-    //
-    // PARSED, NOT SALVAGED, AND NOT INVENTED EITHER: the chart is the one source
-    // of this number (ADR-0569), so an absent, empty or mistyped value fails the
-    // boot naming the variable. There is no longer a compiled-in floor to fall
-    // back to. Substituting one silently would leave an operator who believes
-    // they raised the floor running the old one, and a security control nobody
-    // can tell is misconfigured is the failure this floor's own warning exists
-    // to prevent. `service::DEFAULT_LOGIN_RESPONSE_FLOOR` survives as the
-    // MEASUREMENT the chart's value was calibrated from — documentation, read by
-    // no knob path.
-    let login_response_floor =
-        Duration::from_millis(env_required("LOGIN_RESPONSE_FLOOR_MS")?.parse()?);
+    let floors = boot::response_floors()?;
 
-    // ITS OWN VALUE, because `RedeemEnrolment` legitimately does more work — two
-    // Argon2id operations and a further round trip — and a floor sized for
-    // `Login` would be exceeded by every successful redemption, turning the
-    // warning that says "raise this" into one that fires on every call.
-    let redeem_response_floor =
-        Duration::from_millis(env_required("REDEEM_RESPONSE_FLOOR_MS")?.parse()?);
-    tracing::info!(
-        login_floor_ms = login_response_floor.as_millis() as u64,
-        redeem_floor_ms = redeem_response_floor.as_millis() as u64,
-        "Login and RedeemEnrolment answer no sooner than their response-time floors"
-    );
+    let addr: SocketAddr = boot::env_required("LISTEN")?.parse()?;
 
-    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
+    serve_and_drain(
+        server,
+        addr,
+        Iam::new(keys, db, invalidator, floors, enrolment),
+        listen_tls.as_ref(),
+        watch_inputs,
+        schedule,
+    )
+    .await
+}
 
+/// Serve until a signal or a rotation ends it, then drain within the budget.
+///
+/// A SEPARATE FUNCTION AND NOT A `boot` ONE. Everything [`yadgar_iam::boot`]
+/// holds is a decision made before the listener binds; this is the process's
+/// whole life after it. It stays in the binary because there is nothing here a
+/// test could assert that `yadgar-lifecycle`'s own `tests/drain.rs` does not.
+async fn serve_and_drain(
+    mut server: Server,
+    addr: SocketAddr,
+    iam: Iam,
+    listen_tls: Option<&serve::ServerTls>,
+    watch_inputs: rotate::Inputs,
+    schedule: rotate::Schedule,
+) -> Result<(), Box<dyn std::error::Error>> {
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
     // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
     // installs both signal handlers when it is CALLED — a SIGTERM arriving between here and
@@ -421,16 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
     let serving = tokio::spawn(
         server
-            .add_service(IamServiceServer::new(Iam::new(
-                keys,
-                db,
-                invalidator,
-                ResponseFloors {
-                    login: login_response_floor,
-                    redeem: redeem_response_floor,
-                },
-                enrolment,
-            )))
+            .add_service(IamServiceServer::new(iam))
             // ONE DRAIN PATH, TWO REASONS TO TAKE IT. `serve_with_shutdown` stops
             // accepting and lets in-flight calls finish, so the rotation exit
             // gets the same drain a signal does rather than a second mechanism
@@ -464,172 +272,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{env_required, refusal};
-
-    // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
-    // runs these on threads of one process, so tests sharing a variable name
-    // would pass or fail depending on scheduling.
-
-    /// The case a naive test omits, and the only one that proves the value is
-    /// USED. A test that merely asserts "boot succeeds" passes just as happily
-    /// with a compiled-in default still in place behind the read.
-    #[test]
-    fn a_set_value_is_returned_verbatim() {
-        std::env::set_var("YADGAR_TEST_IAM_REQUIRED_PRESENT", "0.0.0.0:50052");
-        assert_eq!(
-            env_required("YADGAR_TEST_IAM_REQUIRED_PRESENT").as_deref(),
-            Ok("0.0.0.0:50052")
-        );
-    }
-
-    #[test]
-    fn an_absent_knob_refuses_and_names_itself() {
-        std::env::remove_var("YADGAR_TEST_IAM_REQUIRED_ABSENT");
-        let err = env_required("YADGAR_TEST_IAM_REQUIRED_ABSENT").unwrap_err();
-        assert!(
-            err.contains("YADGAR_TEST_IAM_REQUIRED_ABSENT"),
-            "the refusal must name the knob, got: {err}"
-        );
-        assert!(err.contains("NOT SET"), "got: {err}");
-    }
-
-    /// **THE CASE THAT DISCRIMINATES.** Helm renders an unset value as `""`, so
-    /// a nulled chart value arrives here as set-but-empty rather than as absent.
-    /// An implementation that collapses the two into one branch is the defect
-    /// this estate found three separate times in one week, so the messages are
-    /// asserted to DIFFER rather than merely to exist.
-    #[test]
-    fn an_empty_knob_refuses_with_its_own_message() {
-        std::env::set_var("YADGAR_TEST_IAM_REQUIRED_EMPTY", "");
-        std::env::remove_var("YADGAR_TEST_IAM_REQUIRED_EMPTY_ABSENT");
-        let empty = env_required("YADGAR_TEST_IAM_REQUIRED_EMPTY").unwrap_err();
-        let absent = env_required("YADGAR_TEST_IAM_REQUIRED_EMPTY_ABSENT").unwrap_err();
-        assert!(empty.contains("set but EMPTY"), "got: {empty}");
-        assert!(
-            empty.replace("YADGAR_TEST_IAM_REQUIRED_EMPTY", "K")
-                != absent.replace("YADGAR_TEST_IAM_REQUIRED_EMPTY_ABSENT", "K"),
-            "empty and absent must not share one message"
-        );
-    }
-
-    /// THE ONE THING LEDGER 733/740 IS ABOUT, against the REAL error rather
-    /// than a fixture that could be shaped to pass.
-    ///
-    /// `tonic::transport::Error`'s whole `Display` is the two words `transport
-    /// error`, and `BalanceError::Tls` interpolates exactly that — so the
-    /// sentence `main` used to print for an unusable transport was `TLS could
-    /// not be configured: transport error`, which names no file, no key and no
-    /// reason. What went wrong sits one layer BELOW tonic's error and is
-    /// reachable only by walking `source()`.
-    ///
-    /// **BOTH RENDERINGS ARE ASSERTED, and the negative one is the point.** A
-    /// test that only checked `refusal` contains the reason would pass against
-    /// a `to_string()` that happened to carry it; asserting that `to_string()`
-    /// does NOT is what shows the layer is genuinely lost, which is the
-    /// finding rather than a matched absence.
-    ///
-    /// MUTATION: replace `refusal`'s body with `error.to_string()` and this
-    /// fails.
-    ///
-    /// The error is produced by `yadgar_iam::upstream::connect` — the same
-    /// call `main` makes — given a bundle that is a real authority and a
-    /// verification domain `rustls::ServerName` refuses. No dial is involved:
-    /// the domain is rejected while `yadgar_dial::connect_tls` builds the
-    /// tonic endpoint, before anything is resolved.
-    #[tokio::test]
-    async fn a_refusal_carries_the_layer_below_transport_error() {
-        let ca = MintedCa::new();
-        let tls = upstream_tls(ca.path(), "not a server name");
-
-        let error = yadgar_iam::upstream::connect("iam-db", 50051, Some(&tls))
-            .await
-            .expect_err("a domain rustls cannot parse must refuse before any dial");
-
-        assert!(
-            refusal(&error).contains("invalid dns name"),
-            "the refusal must carry the layer below tonic's `transport error`; got: {:?}",
-            refusal(&error)
-        );
-        assert!(
-            !error.to_string().contains("invalid dns name"),
-            "if the head already carried the reason there would be nothing to walk \
-             for, and this test would be certifying itself; got: {:?}",
-            error.to_string()
-        );
-    }
-
-    /// `UpstreamTls` assembled the way a DEPLOYMENT assembles it — through
-    /// `from_lookup` over the `IAM_DB_TLS_*` names — rather than by hand, so
-    /// the test cannot configure a shape `main` could never produce.
-    fn upstream_tls(ca_file: &std::path::Path, domain: &str) -> yadgar_iam::upstream::UpstreamTls {
-        let vars = [
-            ("IAM_DB_TLS_ENABLED".to_string(), "1".to_string()),
-            (
-                "IAM_DB_TLS_CA_FILE".to_string(),
-                ca_file.display().to_string(),
-            ),
-            ("IAM_DB_TLS_DOMAIN".to_string(), domain.to_string()),
-        ];
-        yadgar_iam::upstream::UpstreamTls::from_lookup(yadgar_iam::upstream::IAM_DB, |key| {
-            vars.iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.to_string())
-        })
-        .expect("a flag, a bundle and a domain are a valid configuration")
-        .expect("the flag is set, so TLS is on")
-    }
-
-    /// A CA bundle that is a REAL authority, minted per run and deleted after.
-    ///
-    /// It has to be real: an empty or unparsable bundle is refused by
-    /// `TlsOptions::prepare` BEFORE the endpoint is built, so it would produce
-    /// `CaEmpty` and never reach the variant under test. Minted rather than
-    /// checked in, for the reason every other rig in this repository gives — a
-    /// fixture key in the repository is a secret in the repository.
-    ///
-    /// The name carries a COUNTER as well as the pid: `cargo test` runs these
-    /// on threads of one process, and a clock is a timestamp rather than a
-    /// nonce (ledger 706, 710, 729).
-    struct MintedCa(std::path::PathBuf);
-
-    impl MintedCa {
-        fn new() -> Self {
-            use rcgen::{
-                BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
-                KeyUsagePurpose,
-            };
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-            let key = KeyPair::generate().expect("a key pair");
-            let mut params = CertificateParams::new(Vec::<String>::new()).expect("parameters");
-            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-            params
-                .distinguished_name
-                .push(DnType::CommonName, "yadgar-iam boot-refusal test authority");
-            let ca = CertifiedIssuer::self_signed(params, key).expect("a self-signed authority");
-
-            let path = std::env::temp_dir().join(format!(
-                "yadgar-iam-refusal-{}-{}.pem",
-                std::process::id(),
-                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            std::fs::write(&path, ca.pem()).expect("the bundle must be written");
-            Self(path)
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for MintedCa {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
 }

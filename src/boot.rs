@@ -7,7 +7,16 @@
 //! that either stops or connects ANONYMOUSLY, and the second one looks healthy.
 //! `iam-db` grew a `boot` module for the same reason and this is its twin.
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use tonic::transport::{Channel, Server};
+
 use crate::invalidate::Credentials;
+use crate::rotate::{self, Configuration, Schedule};
+use crate::serve::{self, ServerTls};
+use crate::service::{EnrolmentConfig, ResponseFloors};
+use crate::upstream::{self, UpstreamTls};
 
 /// The file holding the broker password. A PATH, never the value (D80).
 const PASSWORD_FILE_KEY: &str = "NATS_PASSWORD_FILE";
@@ -125,146 +134,262 @@ pub enum BootError {
     NatsUserWithoutPassword,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An environment stating only what a test cares about.
-    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |key| {
-            pairs
-                .iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| v.to_string())
-        }
-    }
-
-    /// A file holding exactly these bytes, at a path this test owns.
-    fn password_file(name: &str, contents: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("yadgar-iam-boot-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the password directory");
-        let path = dir.join("password");
-        std::fs::write(&path, contents).expect("write the password");
-        path.to_str().expect("a utf-8 path").to_string()
-    }
-
-    /// Deliberately unlike anything the implementation could contain. A fixture
-    /// equal to a constant in the code under test would pass for a build that
-    /// used its own idea of a password rather than the configured one.
-    const PASSWORD: &str = "sentinel-of-the-nats-password-4c17";
-    const USER: &str = "sentinel-user";
-
-    #[test]
-    fn both_set_is_the_credential_the_files_and_the_environment_describe() {
-        let path = password_file("both", PASSWORD);
-        let got = nats_credentials(env_of(&[
-            ("NATS_PASSWORD_FILE", path.as_str()),
-            ("NATS_USER", USER),
-        ]))
-        .expect("a fully configured broker credential loads")
-        .expect("and it is a credential rather than nothing");
-
-        assert_eq!(got.user, USER);
-        assert_eq!(got.password, PASSWORD);
-    }
-
-    #[test]
-    fn neither_set_presents_nothing_rather_than_refusing() {
-        // A BROKER WITH NO AUTHORIZATION BLOCK IS A SUPPORTED DEPLOYMENT, and
-        // the chart says so. Refusing here would turn every deployment that has
-        // not cut over into a CrashLoopBackOff.
-        assert!(nats_credentials(env_of(&[]))
-            .expect("an unconfigured broker is not an error")
-            .is_none());
-    }
-
-    #[test]
-    fn a_password_with_no_user_refuses_the_boot() {
-        let path = password_file("no-user", PASSWORD);
-        let err = nats_credentials(env_of(&[("NATS_PASSWORD_FILE", path.as_str())]))
-            .expect_err("a password with no account to present it as cannot authenticate");
-
-        assert!(matches!(err, BootError::NatsPasswordWithoutUser), "{err}");
-    }
-
-    #[test]
-    fn a_user_with_no_password_refuses_the_boot_rather_than_connecting_anonymously() {
-        // THE ASYMMETRY THIS CLOSES. The opposite half-configuration refused from
-        // the day it was written; this one returned `Ok(None)` and connected with
-        // no credential at all, logging a warning nobody reads — the silent fall
-        // back the sibling arm's own message calls out.
-        //
-        // MUTATION THIS CATCHES: returning `Ok(None)` when the path is empty
-        // regardless of the user, which is what the code did. Every other test in
-        // this file passes under it, including the one above — the two arms are
-        // independent and only this one sees the missing half.
-        let err = nats_credentials(env_of(&[("NATS_USER", USER)]))
-            .expect_err("an account with no password cannot authenticate");
-
-        assert!(matches!(err, BootError::NatsUserWithoutPassword), "{err}");
-    }
-
-    #[test]
-    fn an_empty_password_file_refuses_the_boot() {
-        // A blank password is not one, and a Secret whose key exists and holds
-        // nothing is a deployment mistake rather than a request to connect
-        // anonymously.
-        let path = password_file("empty", "\n");
-        let err = nats_credentials(env_of(&[
-            ("NATS_PASSWORD_FILE", path.as_str()),
-            ("NATS_USER", USER),
-        ]))
-        .expect_err("a blank password must refuse the boot");
-
-        assert!(matches!(err, BootError::NatsPasswordEmpty { .. }), "{err}");
-    }
-
-    #[test]
-    fn an_unreadable_password_file_refuses_the_boot_naming_the_path() {
-        // NAMING THE PATH IS THE POINT. An optional volume mount that cannot be
-        // satisfied mounts an EMPTY directory rather than failing the pod, so the
-        // only evidence the operator gets is this message.
-        let err = nats_credentials(env_of(&[
-            ("NATS_PASSWORD_FILE", "/var/run/secrets/nats/absent"),
-            ("NATS_USER", USER),
-        ]))
-        .expect_err("a path naming no file must refuse the boot");
-
-        assert!(
-            matches!(err, BootError::NatsPasswordUnreadable { .. }),
-            "{err}"
-        );
-        assert!(
-            err.to_string().contains("/var/run/secrets/nats/absent"),
-            "the refusal must name the path it could not read: {err}"
-        );
-    }
-
-    #[test]
-    fn only_the_trailing_newline_is_stripped() {
-        // `kubectl create secret --from-file` stores the bytes exactly, editor
-        // newline included, and a password with a `\n` on the end is a different
-        // password. Inner whitespace is a legitimate part of one and is left
-        // alone — stripping it would send a different password than the Secret
-        // holds, failing as an authorization violation with no visible cause.
-        let path = password_file("newline", "  spaced  password  \r\n");
-        let got = nats_credentials(env_of(&[
-            ("NATS_PASSWORD_FILE", path.as_str()),
-            ("NATS_USER", USER),
-        ]))
-        .expect("it loads")
-        .expect("and it is a credential");
-
-        assert_eq!(got.password, "  spaced  password  ");
-    }
-
-    #[test]
-    fn an_empty_password_file_variable_is_the_same_as_an_absent_one() {
-        // A chart that renders the key with no value must not be a different
-        // deployment from one that omits it.
-        assert!(nats_credentials(env_of(&[("NATS_PASSWORD_FILE", "")]))
-            .expect("an empty path is no path")
-            .is_none());
+/// One configuration knob, read from its ONE source, with no compiled-in
+/// default behind it (ADR-0569).
+///
+/// This replaced `env_or(key, default)`, and the deletion is the point rather
+/// than the rename: while the helper took a `default` argument, every knob in
+/// this binary had somewhere for a fallback to live, and a fallback is invisible
+/// at the point of use, survives an upgrade unnoticed, and makes the effective
+/// setting depend on which layer a reader happens to inspect.
+///
+/// AN EMPTY VALUE REFUSES TOO, and with its own message. A set-but-empty
+/// variable and an absent one collapsing into a single branch is a defect this
+/// estate found three separate times in one week: Helm renders an unset value as
+/// `""`, so the empty case is what a nulled chart value actually produces, and it
+/// is the one an operator is most likely to hit.
+pub fn env_required(key: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(format!(
+            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
+             nothing to fall back to. The chart renders it; a values override that nulls it \
+             produces exactly this."
+        )),
+        Err(_) => Err(format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
+             it from the environment alone and refuses to start rather than invent a value. \
+             The chart renders it."
+        )),
     }
 }
+
+/// The `iam-db` boot refusal, flattened through the estate's one error-chain
+/// walker (ledger 733, ledger 740, ADR-0591) instead of a second copy.
+///
+/// **THE ONLY `to_string()` SITE IN THIS FILE THAT TAKES IT.** Every other
+/// refusal here — `serve::ServerTls`, `upstream::UpstreamTls`,
+/// `rotate::Configuration` — already returns a complete sentence with nothing
+/// further under it worth a walk. `upstream::connect` is different: it returns
+/// `yadgar_dial::BalanceError`, and `BalanceError::Tls` wraps a
+/// `tonic::transport::Error` whose entire `Display` is the two words
+/// `transport error` — measured, this is the one place in this file where the
+/// head of the chain is a dead end and the reason sits one `source()` hop
+/// below it. `gateway#44` measured the same signature at its own two call
+/// sites and took the walk there for the identical reason; this is the same
+/// class, ledger 740, reaching the two repositories `gateway` does not dial.
+///
+/// **NOT A SECOND FLATTENER.** The body is a call to
+/// `yadgar_telemetry::diagnose::chain` and nothing else. It exists as a named
+/// function only because `main` is a binary target: every `map_err` closure
+/// inside it is unreachable from a test, so routing this one call through a
+/// seam is what gives the property somewhere to be asserted. Reverting this
+/// body to `error.to_string()` turns
+/// `a_refusal_carries_the_layer_below_transport_error` red.
+///
+/// **THE DUPLICATION `gateway#44` ACCEPTED NO LONGER APPLIES.** `BalanceError`
+/// has ten variants, six of which carry `#[source]`, `Tls` included; on the
+/// pin this file carried through `yadgar-dial` v0.2.1 all six also
+/// interpolated `{source}` into their own `#[error]` string, so the walk
+/// appended a duplicate tail on every one of them — a CA bundle that could not
+/// be read rendered `... (os error 2). TLS was requested ...: No such file or
+/// directory (os error 2)`. `yadgar-dial` v0.2.5 (ledger 737) dropped the
+/// interpolation and reordered the six messages so the chain walk supplies the
+/// cause exactly once; this file adopted that tag and the duplicate tail is
+/// gone.
+pub fn refusal(error: &dyn std::error::Error) -> String {
+    yadgar_telemetry::diagnose::chain(error)
+}
+
+/// Structured logging, before anything that could want to report a refusal.
+///
+/// FIRST, and that is the whole of its placement argument: every refusal below
+/// is reported through `tracing`, so a subscriber installed later would lose
+/// the ones that fire earliest — the very ones an operator diagnosing a boot
+/// needs.
+pub fn logging() {
+    tracing_subscriber::fmt()
+        .json()
+        // A DEFAULT, because from_default_env() with RUST_LOG unset enables
+        // NOTHING — the service runs silently and its boot sequence, its
+        // capability probe result and its errors all vanish. Found by deploying:
+        // two replicas were Running and `kubectl logs` returned nothing at all,
+        // so the only way to see why one had restarted was the previous
+        // container's exit output.
+        //
+        // A service nobody can observe is one D67 cannot measure either.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+}
+
+/// The transport this service LISTENS on, and the server built on it.
+pub fn listener() -> Result<(Option<ServerTls>, Server), Box<dyn std::error::Error>> {
+    // THE TRANSPORT THIS SERVICE LISTENS ON, decided before anything else. A
+    // missing certificate, an unreadable one, a file holding no certificate at
+    // all and a key belonging to a different certificate are all refused HERE —
+    // never downgraded to the plaintext listener, because a listener that
+    // quietly stayed in the clear is the one failure an operator who asked for
+    // TLS cannot see.
+    //
+    // `.to_string()` on the way out for the reason spelled out on the dial
+    // below: `Box<dyn Error>` prints with DEBUG, and these messages are
+    // sentences naming a file.
+    let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
+    let server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
+    Ok((listen_tls, server))
+}
+
+/// The channel to `iam-db`, and the TLS configuration it was dialled under.
+///
+/// The configuration comes back with the channel because [`crate::rotate`]
+/// watches the files it names; a dial that dropped it would leave a rotated CA
+/// bundle unnoticed.
+pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::error::Error>> {
+    // The HEADLESS Service name (D23). Resolving it yields every ready pod
+    // address rather than one virtual IP.
+    let db_host = env_required("IAM_DB_HOST")?;
+    let db_port: u16 = env_required("IAM_DB_PORT")?.parse()?;
+
+    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
+    // the cleartext dial this service has always done. `iam-db` can now serve
+    // TLS, also opt-in and also off, so the cut-over is a later change that
+    // turns both ends on together and can be reverted on its own.
+    //
+    // `.to_string()` on the way out, and not decoration: `main` returns
+    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
+    // `NoCaFile("IAM_DB")` on the operator's terminal instead of the sentence
+    // naming the missing variable and saying why cleartext is not the answer.
+    let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB).map_err(|e| e.to_string())?;
+    let db = upstream::connect(&db_host, db_port, db_tls.as_ref())
+        .await
+        // `refusal` rather than `to_string()` (ledger 733, ledger 740): see its
+        // own doc comment for why this is the one site in this file that takes
+        // the chain walk. `BalanceError`'s other messages are already complete
+        // paragraphs explaining that an empty bundle trusts nobody and that a
+        // missing one is not a reason to connect in cleartext — `Tls` is not
+        // one of them, and Debug would print the struct and throw all of that
+        // away regardless.
+        .map_err(|e| refusal(&e))?;
+    tracing::info!(
+        reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
+        tls = db_tls.is_some(),
+        "connected to iam-db"
+    );
+    Ok((db, db_tls))
+}
+
+/// The mounted configuration document, and the rotation schedule it states.
+pub fn rotation() -> Result<(Configuration, Schedule), Box<dyn std::error::Error>> {
+    // How often those files are re-hashed, and how long THIS pod waits before
+    // acting on a change. The splay is what stops both replicas exiting inside
+    // the same kubelet sync window — a PDB constrains eviction and does not
+    // govern a self-exit.
+    //
+    // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
+    // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
+    // `/etc/yadgar/config/shared/shared.yaml`. There is no compiled-in default
+    // behind it any more: an absent, empty, or half-written document refuses
+    // the boot and names the file. The chart still sets TLS_ROTATION_POLL_SECS
+    // and TLS_ROTATION_SPLAY_MAX_SECS — this binary no longer reads either, but
+    // they stay so a rollout that lands this chart before this binary's digest
+    // still resolves a schedule on the old one. The runbook is
+    // `yadgarhq/deploy`'s MIGRATION_NOTES.md, steps 2a and 2b — NOT this
+    // repository's, which has no such section.
+    //
+    // `.to_string()` on the way out because `Box<dyn Error>` prints with DEBUG
+    // and these messages are sentences.
+    let config = rotate::Configuration::mounted();
+    let schedule = config.schedule().map_err(|e| e.to_string())?;
+    Ok((config, schedule))
+}
+
+/// The Prometheus exporter.
+pub fn metrics() -> Result<(), Box<dyn std::error::Error>> {
+    // The BINARY installs the exporter, never the library — a library that
+    // installs one picks the backend for every service linking it. A failure here
+    // is logged and ignored: a service that cannot export metrics should still
+    // serve traffic, which is D25's rule applied to the metrics path too.
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
+        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
+    }
+    Ok(())
+}
+
+/// What this deployment fills into an enrolment token, or `None` if it cannot
+/// mint one at all.
+pub fn enrolment() -> Option<EnrolmentConfig> {
+    // WARNS AND DEGRADES ONE RPC. It does NOT fail boot, and the difference
+    // matters more here than anywhere else in this file: `iam` is the
+    // authentication plane. A CrashLoopBackOff would stop `Login` at once and
+    // every dependent service's credential resolution as soon as the gateway's
+    // 300s cache expired — an estate-wide outage caused by a value that belongs
+    // to ONE administrative RPC.
+    //
+    // The contract's rule is about the TOKEN — never mint one carrying an empty
+    // gateway — and `IssueEnrolment` keeps it whole by refusing with
+    // FAILED_PRECONDITION. That is loud to the operator who calls it, and this
+    // warning is loud to the operator who deploys it; between them nothing is
+    // silent, and nothing else stops working.
+    //
+    // Contrast the crypto keys above, which DO fail boot: without them every
+    // request touching a credential fails, so there is no reduced service left
+    // to protect. Here there is.
+    match EnrolmentConfig::from_env() {
+        Ok(config) => {
+            tracing::info!("enrolment tokens carry this deployment's gateway and CA (D73)");
+            Some(config)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "IssueEnrolment is UNAVAILABLE on this deployment and will refuse \
+                 with FAILED_PRECONDITION; everything else, ResolveCredential and \
+                 Login included, is unaffected. Set ENROLMENT_GATEWAY to enable it."
+            );
+            None
+        }
+    }
+}
+
+/// The shortest times `Login` and `RedeemEnrolment` may answer in.
+pub fn response_floors() -> Result<ResponseFloors, Box<dyn std::error::Error>> {
+    // The shortest time `Login` may answer in, whatever it found. Argon2id takes
+    // its cost from the PHC string it is verifying, so a stored hash provisioned
+    // at parameters other than this build's makes the response time report which
+    // usernames exist — see `crypto::Keys::verify_password`.
+    //
+    // PARSED, NOT SALVAGED, AND NOT INVENTED EITHER: the chart is the one source
+    // of this number (ADR-0569), so an absent, empty or mistyped value fails the
+    // boot naming the variable. There is no longer a compiled-in floor to fall
+    // back to. Substituting one silently would leave an operator who believes
+    // they raised the floor running the old one, and a security control nobody
+    // can tell is misconfigured is the failure this floor's own warning exists
+    // to prevent. `service::DEFAULT_LOGIN_RESPONSE_FLOOR` survives as the
+    // MEASUREMENT the chart's value was calibrated from — documentation, read by
+    // no knob path.
+    let login_response_floor =
+        Duration::from_millis(env_required("LOGIN_RESPONSE_FLOOR_MS")?.parse()?);
+
+    // ITS OWN VALUE, because `RedeemEnrolment` legitimately does more work — two
+    // Argon2id operations and a further round trip — and a floor sized for
+    // `Login` would be exceeded by every successful redemption, turning the
+    // warning that says "raise this" into one that fires on every call.
+    let redeem_response_floor =
+        Duration::from_millis(env_required("REDEEM_RESPONSE_FLOOR_MS")?.parse()?);
+    tracing::info!(
+        login_floor_ms = login_response_floor.as_millis() as u64,
+        redeem_floor_ms = redeem_response_floor.as_millis() as u64,
+        "Login and RedeemEnrolment answer no sooner than their response-time floors"
+    );
+    Ok(ResponseFloors {
+        login: login_response_floor,
+        redeem: redeem_response_floor,
+    })
+}
+
+#[cfg(test)]
+mod tests;
