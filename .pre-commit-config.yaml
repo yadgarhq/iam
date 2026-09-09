@@ -22,7 +22,7 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.18.3
     hooks:
       - id: gitleaks
       - id: prettier
@@ -36,6 +36,21 @@ repos:
       - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
+      # ADR-0635 and ADR-0577. The mechanical ceilings — 500 lines a file, 120 a
+      # function — and clippy's complexity lints beside them. Adopted here after
+      # the tree was brought under them rather than before: five files and three
+      # functions were over, and turning the gate on first would have meant
+      # starting with an exemption list, which is how a limit stops meaning
+      # anything.
+      #
+      # THE REV ABOVE HAS TO BE v1.18.3 OR LATER FOR THIS PAIR, and here that is
+      # load-bearing rather than headroom. Measured over this branch: the
+      # v1.18.2 script exits 123, naming `src/crypto/tests.rs` (757 lines) and
+      # `src/service/tests.rs` (3673) — two unit-test submodules that predate
+      # this change — plus three test functions. The v1.18.3 script exits 0.
+      # actions#69 is what added the `tests.rs` exemption those two need.
+      - id: complexity
+      - id: cargo-clippy-complexity
       - id: cargo-deny
       - id: observe-coverage
       - id: helm-lint

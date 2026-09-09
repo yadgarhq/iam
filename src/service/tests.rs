@@ -25,6 +25,10 @@ use prost::Message as _;
 use tonic::transport::{Channel, Endpoint};
 
 use super::*;
+// The bounds and the checks that apply them moved out of `service.rs` and in
+// beside the RPC each belongs to; `use super::*` reaches the module root alone,
+// so the few this file names are imported by name.
+use super::credential::MAX_EXPIRES_IN_SECONDS;
 use crate::crypto::argon2_verifications;
 use crate::invalidate::subject;
 use crate::pb::yadgar::common::v1::{InheritedSetting, UnverifiedActor};
