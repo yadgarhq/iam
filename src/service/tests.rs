@@ -3234,7 +3234,7 @@ fn the_outcome_of_a_label_refusal_is_one_the_shared_mapping_produces() {
 /// One `CreateUser`, with `external_id` and `display_name` chosen by the caller.
 ///
 /// Both fields in one helper because both are bounded by the same constant for
-/// the same reason — see [`super::MAX_ENCRYPTED_FIELD_BYTES`] — and a bound test
+/// the same reason — see [`super::admin::MAX_ENCRYPTED_FIELD_BYTES`] — and a bound test
 /// that could only reach one of them would leave the other's arm unpinned.
 async fn create_user_named(
     external_id: &str,
@@ -3563,7 +3563,7 @@ async fn the_first_idempotency_key_the_ledger_refuses_is_refused_before_the_stor
 /// 1020 bytes and the column holds it — measured, as a `PRIMARY KEY`, on
 /// `mariadb:11.8.9`. A byte bound of 255 would refuse it and hand the caller a
 /// refusal the store never makes. It is the MIRROR of
-/// [`super::MAX_ENCRYPTED_FIELD_BYTES`], which counts BYTES because
+/// [`super::admin::MAX_ENCRYPTED_FIELD_BYTES`], which counts BYTES because
 /// `VARBINARY(512)` does, and the two must not be tidied into one unit.
 #[tokio::test]
 async fn a_multibyte_idempotency_key_the_ledger_stores_is_not_refused_for_its_byte_length() {
