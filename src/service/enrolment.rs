@@ -381,6 +381,14 @@ impl Iam {
             // name and read as a relay that works. Wiring the relay is
             // ADR-0534's own change, not this pin bump.
             unverified_actor: None,
+            // RELAYED VERBATIM. The gateway sets this iff the caller is the
+            // bootstrap token (ADR-0655); `iam` neither sets nor inspects it
+            // — `iam-db` is the only tier that evaluates the predicate, inside
+            // the same transaction as the insert. Copying `false` here by
+            // omission is the false green ADR-0655's own design exists to
+            // refuse: the demand would be silently dropped and the ordinary
+            // path taken with nobody having checked anything.
+            require_zero_credential_admin: req.get_ref().require_zero_credential_admin,
         });
         forward_request_id(&req, &mut create);
 
