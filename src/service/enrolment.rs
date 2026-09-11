@@ -375,12 +375,17 @@ impl Iam {
             // redemption looks an enrolment up by exactly this value.
             secret_hash: Keys::token_hash(&secret),
             expires_at: Some(expires_at),
-            // NOT FORWARDED, DELIBERATELY. `IssueEnrolmentRequest` grew this
-            // field in proto v1.10.0 and nothing in the estate populates it
-            // yet, so copying it across would carry `None` under a different
-            // name and read as a relay that works. Wiring the relay is
-            // ADR-0534's own change, not this pin bump.
-            unverified_actor: None,
+            // FORWARDED, AND THE SINK IS REAL. `iamdb.v1.CreateEnrolment` records
+            // the actor from v0.7.31 on, and the gateway stamps an attested
+            // administrator's id on `/admin/issue-enrolment`, so both ends of
+            // ADR-0534's relay exist for this verb. Audit-only: forwarded exactly
+            // as received, `None` stays `None`, and nothing here authorises on it.
+            //
+            // ABSENT IS A REAL CALLER HERE RATHER THAN AN EDGE CASE. ADR-0655 lets
+            // the bootstrap token reach this verb, and D73 calls a shared secret
+            // unattributable by construction — so `gateway`'s `Authority::Bootstrap`
+            // stamps nothing, and that `None` must arrive as `None`.
+            unverified_actor: req.get_ref().unverified_actor.clone(),
             // RELAYED VERBATIM. The gateway sets this iff the caller is the
             // bootstrap token (ADR-0655); `iam` neither sets nor inspects it
             // — `iam-db` is the only tier that evaluates the predicate, inside

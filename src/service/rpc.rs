@@ -170,31 +170,42 @@ impl IamService for Iam {
     /// idempotent by assigning rather than toggling. Re-deciding any of that here
     /// would be a second place for it to be wrong.
     ///
-    /// **THE ACTOR IS RELAYED, AND THIS IS THE FIRST SITE ON THIS SERVICE THAT
-    /// RELAYS ONE.** ADR-0534's field is audit-only: it is asserted by the
-    /// gateway, verified by nothing on the wire, and MUST NOT be an
+    /// **THE ACTOR IS RELAYED, AND THIS WAS THE FIRST SITE ON THIS SERVICE THAT
+    /// DID.** `create_user` and `issue_enrolment` relay too since ledger 612, so a
+    /// reader grepping the field now finds three — this paragraph records which one
+    /// came first, not which one is alone. ADR-0534's field is audit-only: it is
+    /// asserted by the gateway, verified by nothing on the wire, and MUST NOT be an
     /// authorisation input. So it is forwarded exactly as received, and `None`
     /// stays `None`.
     ///
-    /// **THE RELAY HAS NO SINK TODAY, AND SAYING SO IS THE POINT.**
-    /// `iamdb.v1.SetUserAdmin` READS NEITHER `unverified_actor` NOR
-    /// `idempotency` — its UPDATE binds `is_admin` and `user_id` and nothing
-    /// else — so what this hop carries is discarded on arrival. The one place
-    /// in `iam-db` that reads the field at all is `set_inherited_setting`,
-    /// which logs it and renders an empty id as `<unattributed>`; there is no
-    /// audit store on this boundary for it to land in. Adding that log line to
-    /// the administrative writes is a change in `iam-db` that
-    /// `plans/the-administrative-surface.md` §6.1 prices and explicitly leaves
-    /// outside this plan's steps. **So this relay has a source arriving in step
-    /// 5 and nowhere to land until §6.1's change 2 lands too**, and a reader
-    /// must not take the forwarding for an attribution that is being recorded.
+    /// **THE RELAY HAS A SINK, AND `iam-db` v0.7.31 IS WHERE IT ARRIVED.**
+    /// `iamdb.v1.SetUserAdmin` now READS `unverified_actor`
+    /// (`iam-db/src/service/policy.rs`, through that crate's single `record_actor`)
+    /// and writes it to the structured log beside the RPC name and the target. Four
+    /// `iam-db` verbs read the field — `CreateUser`, `CreateEnrolment`,
+    /// `SetUserAdmin` and `SetInheritedSetting` — where before v0.7.31 only
+    /// `SetInheritedSetting` did. **THIS DOC COMMENT SAID "THE RELAY HAS NO SINK
+    /// TODAY" UNTIL LEDGER 612 CLOSED**, which was true when written and is the
+    /// kind of claim that outlives its measurement; it is corrected rather than
+    /// deleted so the sequence stays legible.
+    ///
+    /// **`idempotency` IS STILL DISCARDED THERE, AND THAT HALF DID NOT CHANGE.**
+    /// The store's UPDATE binds `is_admin` and `user_id` and nothing else, so the
+    /// key this hop forwards reaches no ledger. The two fields travelled together
+    /// and only one of them landed.
+    ///
+    /// **THERE IS STILL NO AUDIT STORE ON THIS BOUNDARY** (ADR-0620): the log line
+    /// is where an attribution lands today, so a reader must not take the
+    /// forwarding for a durable audit record. That, and not the sink, is what is
+    /// still missing.
     ///
     /// **AN EMPTY ACTOR IS NEVER FABRICATED TO FILL THE FIELD**, and that rule
-    /// does not rest on what any reader does today. `Some(UnverifiedActor {
-    /// user_id: "" })` asserts that somebody was named and their id was empty,
-    /// which is not what an absent actor means — so on the day a sink exists it
-    /// is a false record, and it makes an id this service DROPPED
-    /// indistinguishable from one the caller never sent.
+    /// never rested on what any reader did. `Some(UnverifiedActor { user_id: "" })`
+    /// asserts that somebody was named and their id was empty, which is not what an
+    /// absent actor means — and now that the sink exists it is a false record in a
+    /// real log, rendered `<unattributed>` exactly as a truly absent actor is. That
+    /// is the false green: the right output by the wrong route, making an id this
+    /// service DROPPED indistinguishable from one the caller never sent.
     ///
     /// **D73 EXCLUDES ADMIN SELF-DEMOTION AND THIS SERVICE CANNOT ENFORCE IT.**
     /// The only caller identity on this request is that same unverifiable actor,
