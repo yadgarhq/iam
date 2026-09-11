@@ -1323,6 +1323,17 @@ fn issue(key: &str) -> Request<IssueEnrolmentRequest> {
         idempotency: Some(Idempotency { key: key.into() }),
         user_id: "yadgar:user:1".into(),
         unverified_actor: None,
+        require_zero_credential_admin: false,
+    })
+}
+
+// Same request, with the bootstrap demand set. The gateway is the only
+// caller that ever sets this (ADR-0655); `iam` relays it verbatim and never
+// populates it itself.
+fn issue_demanding(key: &str) -> Request<IssueEnrolmentRequest> {
+    Request::new(IssueEnrolmentRequest {
+        require_zero_credential_admin: true,
+        ..issue(key).into_inner()
     })
 }
 
@@ -1440,6 +1451,49 @@ async fn an_enrolment_expires_in_twenty_four_hours() {
         (deadline - now - 24 * 60 * 60).abs() <= 60,
         "D73's 24 hours; got {} seconds from now",
         deadline - now
+    );
+}
+
+#[tokio::test]
+async fn the_bootstrap_demand_is_relayed_verbatim_to_the_store() {
+    // proto3 defaults `bool` to `false`, so a relay that DROPS this field
+    // entirely still compiles, and every other test in this file — none of
+    // which sets the demand — still passes. `iam-db` would then see an
+    // absent field and take the ordinary administrator-authorized path: the
+    // predicate ADR-0655 exists to enforce is evaluated by nobody, and the
+    // bootstrap token's grant against a live cluster silently has no check
+    // on its target. That is the false green this test exists to catch, and
+    // it can only be caught by looking at the message that ARRIVED at the
+    // store, never at the handler's intention.
+    //
+    // MUTATION THIS CATCHES: dropping the field (the `unverified_actor`
+    // pattern, where NOT forwarding is deliberate, copy-pasted onto the one
+    // field that must travel); hard-coding it `true` or `false` instead of
+    // relaying; inverting it. Two assertions in one test, over the SAME
+    // fixture, is deliberate: demand-true must arrive true and demand-false
+    // must arrive false — one direction alone cannot tell a relay from a
+    // constant.
+    let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.issue_enrolment(issue_demanding("attempt-1"))
+        .await
+        .expect("issue");
+    iam.issue_enrolment(issue("attempt-2"))
+        .await
+        .expect("issue");
+
+    let stored = recorded.lock().expect("recorded").create_enrolment.clone();
+    assert_eq!(stored.len(), 2, "two issuances are two enrolments");
+    assert!(
+        stored[0].require_zero_credential_admin,
+        "a demand set on the incoming request must arrive set on the \
+         outgoing one"
+    );
+    assert!(
+        !stored[1].require_zero_credential_admin,
+        "an absent demand on the incoming request must arrive absent on the \
+         outgoing one, or the ordinary administrator-authorized path (and \
+         re-enrolment as forgotten-password recovery) is silently narrowed"
     );
 }
 
