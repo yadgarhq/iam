@@ -124,11 +124,12 @@ impl Iam {
             idempotency: req.get_ref().idempotency.clone(),
             user_id: req.get_ref().user_id.clone(),
             is_admin: req.get_ref().is_admin,
-            // FORWARDED, AND EVERY OTHER SITE IN THIS FILE STILL SENDS `None`.
-            // The comment at `issue_credential` argues that a relay of a field
-            // nothing populates reads as a relay that works; the administrative
-            // route is what gives this one a real value to carry, so here the
-            // argument runs the other way.
+            // FORWARDED, AND `create_user` BELOW NOW DOES THE SAME — the team-member
+            // verbs in this file are the two that still send `None`. This was the
+            // service's first relay; ledger 612 wired the other two verbs the
+            // gateway actually reaches. The comment at `issue_credential` argues
+            // that a relay of a field nothing populates reads as a relay that
+            // works, and that argument still governs the sites left alone.
             unverified_actor: req.get_ref().unverified_actor.clone(),
         });
         forward_request_id(&req, &mut upstream);
@@ -234,9 +235,12 @@ impl Iam {
             // what the caller sent, which is what `SetUserAdmin` exists to change
             // afterwards.
             is_admin: r.is_admin,
-            // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's seven relay sites.
-            unverified_actor: None,
+            // FORWARDED, AND THE SINK IS REAL. `iamdb.v1.CreateUser` records the
+            // actor from v0.7.31 on, after generating the new id so one line names
+            // both who asked and what was created. ADR-0534's field is audit-only:
+            // it is forwarded exactly as received, `None` stays `None`, and nothing
+            // here authorises on it.
+            unverified_actor: r.unverified_actor.clone(),
         });
         forward_request_id(&req, &mut upstream);
 
@@ -265,7 +269,7 @@ impl Iam {
             team_id: req.get_ref().team_id.clone(),
             user_id: req.get_ref().user_id.clone(),
             // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's seven relay sites.
+            // that comment's five remaining relay sites.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
@@ -301,7 +305,7 @@ impl Iam {
             team_id: req.get_ref().team_id.clone(),
             user_id: req.get_ref().user_id.clone(),
             // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's seven relay sites.
+            // that comment's five remaining relay sites.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);

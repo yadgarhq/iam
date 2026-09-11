@@ -59,11 +59,12 @@ struct Recorded {
     create_user: Vec<db::CreateUserRequest>,
     add_team_member: Vec<db::AddTeamMemberRequest>,
     remove_team_member: Vec<db::RemoveTeamMemberRequest>,
-    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY.** Every other
-    /// administrative write forwards `unverified_actor: None`, so recording the
-    /// request buys nothing there but the field list. This one forwards what the
-    /// caller asserted, and a hard-coded `None` answers `Ok` exactly like a
-    /// working relay — so the forwarded request is the only oracle.
+    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and since ledger 612 one
+    /// of three: `create_user` and `create_enrolment` above carry ADR-0534's actor
+    /// too. The five administrative writes the gateway does not reach still forward
+    /// `unverified_actor: None`, so recording the request buys nothing there but
+    /// the field list. On these three a hard-coded `None` answers `Ok` exactly like
+    /// a working relay — so the forwarded request is the only oracle.
     set_user_admin: Vec<db::SetUserAdminRequest>,
 }
 
@@ -1171,12 +1172,13 @@ async fn a_promotion_the_store_refuses_invalidates_nothing() {
 
 #[tokio::test]
 async fn the_promote_verb_relays_the_actor_the_caller_asserted() {
-    // ADR-0534's RELAY, AND THIS IS ITS FIRST SITE WITH A SOURCE. Every other
-    // administrative write in this service forwards `unverified_actor: None`
-    // because nothing populates the field; the administrative route (this plan's
-    // step 5) makes this one the exception.
+    // ADR-0534's RELAY, AND THIS WAS ITS FIRST SITE WITH A SOURCE. `create_user`
+    // and `issue_enrolment` acquired one too (ledger 612) — those three are the
+    // RPCs the gateway's administrative route reaches. The five writes it does not
+    // reach still forward `unverified_actor: None` because nothing populates the
+    // field there.
     //
-    // MUTATION THIS CATCHES: a hard-coded `None`, copied from the six sites
+    // MUTATION THIS CATCHES: a hard-coded `None`, copied from the four sites
     // around it. It answers `Ok`, it publishes the invalidation, and every other
     // assertion in this file passes — the forwarded request is the only place the
     // difference shows. The WHOLE request is compared rather than the actor
@@ -1333,6 +1335,17 @@ fn issue(key: &str) -> Request<IssueEnrolmentRequest> {
 fn issue_demanding(key: &str) -> Request<IssueEnrolmentRequest> {
     Request::new(IssueEnrolmentRequest {
         require_zero_credential_admin: true,
+        ..issue(key).into_inner()
+    })
+}
+
+// Same request, with ADR-0534's actor on it. The gateway stamps this on
+// `/admin/issue-enrolment` for an ATTESTED administrator and leaves it absent on
+// the bootstrap path (`Authority::actor`), so both arms below are reachable from
+// a real caller rather than only from a test.
+fn issue_by(key: &str, actor: Option<UnverifiedActor>) -> Request<IssueEnrolmentRequest> {
+    Request::new(IssueEnrolmentRequest {
+        unverified_actor: actor,
         ..issue(key).into_inner()
     })
 }
@@ -1494,6 +1507,58 @@ async fn the_bootstrap_demand_is_relayed_verbatim_to_the_store() {
         "an absent demand on the incoming request must arrive absent on the \
          outgoing one, or the ordinary administrator-authorized path (and \
          re-enrolment as forgotten-password recovery) is silently narrowed"
+    );
+}
+
+#[tokio::test]
+async fn issuing_an_enrolment_relays_the_actor_the_caller_asserted() {
+    // ADR-0534's RELAY, AND `iam-db` v0.7.31 IS WHAT MADE IT WORTH PINNING.
+    // `CreateEnrolment` records the actor on arrival
+    // (`iam-db/src/service/enrolment.rs:42`), so a dropped id is a lost audit
+    // line rather than a field nobody reads.
+    //
+    // MUTATION THIS CATCHES: a hard-coded `None`, which is what this site held
+    // until ledger 612. It answers `Ok`, it mints a redeemable secret, and every
+    // other assertion in this file passes — the request that ARRIVED at the store
+    // is the only oracle, never the handler's intention.
+    //
+    // BOTH ARMS, BECAUSE AN EMPTY ACTOR IS THE FALSE GREEN. `Some(UnverifiedActor
+    // { user_id: "" })` asserts somebody was named and their id was empty;
+    // `iam-db` renders that as `<unattributed>`, reaching the right OUTPUT by the
+    // wrong route and making an id this service DROPPED indistinguishable from one
+    // the caller never sent. `gateway`'s `Authority::Bootstrap => None` is the
+    // same rule stated one hop earlier.
+    //
+    // ONE FIELD RATHER THAN THE WHOLE MESSAGE, unlike
+    // `the_promote_verb_relays_the_actor_the_caller_asserted`: `secret_hash`
+    // hashes a freshly minted secret and `expires_at` is 24 hours from now, so no
+    // test can predict the arrived message whole. This is
+    // `the_bootstrap_demand_is_relayed_verbatim_to_the_store`'s shape, for the
+    // same reason.
+    let actor = Some(UnverifiedActor {
+        user_id: "yadgar:user:admin".into(),
+    });
+
+    let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.issue_enrolment(issue_by("attempt-1", actor.clone()))
+        .await
+        .expect("issue");
+    iam.issue_enrolment(issue_by("attempt-2", None))
+        .await
+        .expect("issue");
+
+    let stored = recorded.lock().expect("recorded").create_enrolment.clone();
+    assert_eq!(stored.len(), 2, "two issuances are two enrolments");
+    assert_eq!(
+        stored[0].unverified_actor, actor,
+        "an actor asserted on the incoming request must arrive on the outgoing one"
+    );
+    assert_eq!(
+        stored[1].unverified_actor, None,
+        "an ABSENT actor must arrive absent, never as an actor whose id is the \
+         empty string — the store logs that as `<unattributed>`, so fabricating \
+         it hides a dropped id instead of reporting an absent one"
     );
 }
 
@@ -2807,6 +2872,60 @@ async fn create_user_carries_d73s_admin_flag() {
         "the store must be told this user is an administrator; a dropped flag \
          reports success and leaves the deployment with nobody who can promote \
          anyone"
+    );
+}
+
+/// ADR-0534's actor reaches the store on the verb that CREATES a person.
+///
+/// `iam-db` v0.7.31 records it (`iam-db/src/service/identity.rs:32`), AFTER
+/// generating the new id so the log line names what was acted on as well as who
+/// asked. A dropped id there is an account appearing in the estate with no record
+/// of who called for it — the exact question an incident asks of this verb.
+#[tokio::test]
+async fn creating_a_user_relays_the_actor_the_caller_asserted() {
+    // MUTATION THIS CATCHES: a hard-coded `None`, which is what this site held
+    // until ledger 612, and which is still CORRECT at five sibling sites in this
+    // service. It answers `Ok` and returns a user id, so only the request that
+    // ARRIVED at the store tells a relay from the constant beside it.
+    //
+    // BOTH ARMS, and the absent one is not thoroughness. The bootstrap token is
+    // `None` by D73 — it is "unattributable by construction" — so an absent actor
+    // is a REAL caller's request here, not a hypothetical. `Some(UnverifiedActor
+    // { user_id: "" })` would assert that somebody was named and was nobody, which
+    // `iam-db` prints as `<unattributed>`: the right output by the wrong route,
+    // hiding a dropped id.
+    //
+    // ONE FIELD RATHER THAN THE WHOLE MESSAGE: `external_id_ciphertext` and
+    // `display_name_ciphertext` are produced by `Keys::encrypt` at call time, so
+    // the arrived message is not predictable whole.
+    let actor = Some(UnverifiedActor {
+        user_id: "yadgar:user:admin".into(),
+    });
+
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    for asserted in [actor.clone(), None] {
+        iam.create_user(Request::new(CreateUserRequest {
+            external_id: "someone".into(),
+            display_name: "Some One".into(),
+            unverified_actor: asserted,
+            ..Default::default()
+        }))
+        .await
+        .expect("a user");
+    }
+
+    let seen = rec.lock().expect("recorded").create_user.clone();
+    assert_eq!(seen.len(), 2, "two creations are two writes");
+    assert_eq!(
+        seen[0].unverified_actor, actor,
+        "an actor asserted on the incoming request must arrive on the outgoing one"
+    );
+    assert_eq!(
+        seen[1].unverified_actor, None,
+        "an ABSENT actor must arrive absent, never as an actor whose id is the \
+         empty string — that is what the bootstrap path sends, and the store \
+         cannot tell a fabricated empty id from a dropped real one"
     );
 }
 

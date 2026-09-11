@@ -255,19 +255,20 @@ impl Iam {
             // arrive on. Relaying `r.unverified_actor` today would move `None`
             // and READ AS A RELAY THAT WORKS.
             //
-            // **THE RELAY HAS EIGHT SITES AND SEVEN OF THEM STILL SEND `None`**:
-            // here, `revoke_credential`, `create_user`, `add_team_member`,
-            // `remove_team_member`, and the two that already said so before the
-            // change that wrote this comment — `issue_enrolment` and
-            // `set_inherited_setting`. Five of them were invisible until this file
+            // **THE RELAY HAS EIGHT SITES AND FIVE OF THEM STILL SEND `None`**:
+            // here, `revoke_credential`, `add_team_member`, `remove_team_member` and
+            // `set_inherited_setting`. Five sites were invisible until this file
             // stopped using a rest pattern, so whoever wires the path by grepping
             // for the field would have found two.
             //
-            // **`set_user_admin` IS THE EXCEPTION AND IT RELAYS FOR REAL**, so
-            // "nothing populates the field" is no longer true of this service as
-            // a whole. It stays true here: the administrative route reaches that
-            // verb and not this one. Sweeping the remaining seven is ledger 612's
-            // work, on the day a caller exists for each.
+            // **THREE RELAY FOR REAL — `set_user_admin`, `create_user` and
+            // `issue_enrolment`** — so "nothing populates the field" is not true of
+            // this service as a whole. It stays true here: those three are exactly
+            // the RPCs the gateway's administrative route reaches, and this is not
+            // one of them. The five above wait on a caller each, not on a sink;
+            // `iam-db` v0.7.31 reads the field on four verbs and would need the
+            // same additive change for `CreateCredential`, `RevokeCredential`,
+            // `AddTeamMember` and `RemoveTeamMember`.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut create);
@@ -302,7 +303,7 @@ impl Iam {
             credential_id: req.get_ref().credential_id.clone(),
             // NOT FORWARDED, for the reason given at `issue_credential`: nothing
             // populates the field, so a relay would move `None` and read as one
-            // that works. One of that comment's seven relay sites.
+            // that works. One of that comment's five remaining relay sites.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);

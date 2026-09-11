@@ -190,10 +190,23 @@ impl Iam {
             value: r.value,
             locked: r.locked,
             clear: r.clear,
-            // NOT FORWARDED, for the reason given at IssueEnrolment above: the
-            // field is new in proto v1.10.0, no caller sets it, and the
-            // upstream this forwards to still vendors v1.8.0 and has no field
-            // to receive it. See the follow-up task on ADR-0534's relay.
+            // NOT FORWARDED, AND THE REASON IS THE MISSING CALLER RATHER THAN A
+            // MISSING SINK. The sink is the oldest one in the estate: `iam-db`
+            // reads `unverified_actor` on THIS message (`iamdb.proto`,
+            // `SetInheritedSettingRequest`) and logs it, rendering an empty id as
+            // `<unattributed>` — `SetInheritedSetting` is the one RPC that had a
+            // live reader before `iam-db` v0.7.31 added three more. What is absent
+            // is a source: the gateway's administrative route reaches `CreateUser`,
+            // `IssueEnrolment` and `SetUserAdmin`, and this verb is not among them,
+            // so relaying `r.unverified_actor` would move `None` and read as a
+            // relay that works. One of `issue_credential`'s five remaining relay
+            // sites; it becomes a one-line change the day a caller exists.
+            //
+            // THIS COMMENT PREVIOUSLY CLAIMED the upstream "still vendors v1.8.0
+            // and has no field to receive it". That was false when written against
+            // any pin from v1.10.0 on, and it is worth naming: a call site that
+            // says the sink cannot receive what the sink demonstrably reads sends
+            // whoever wires the relay to the wrong repository.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
