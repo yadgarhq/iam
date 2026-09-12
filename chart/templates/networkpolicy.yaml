@@ -104,6 +104,15 @@ spec:
     - ports:
         - protocol: TCP
           port: 50052
+      # A `podSelector` WITH NO `namespaceSelector` BESIDE IT MATCHES THIS
+      # NAMESPACE ONLY. A caller labelled `app: gateway` in another namespace is
+      # dropped, silently, whatever this list says — unlike the scrape rule
+      # below, where a lone `namespaceSelector` deliberately reaches out of this
+      # namespace. Every client in the reference deployment is a namespace-mate,
+      # so this is correct here and stated because nothing else states it. A
+      # cross-namespace caller needs a `namespaceSelector` in the SAME list item
+      # as its `podSelector`; two separate items are an OR and admit far more
+      # than intended.
       from:
         {{- range $clients }}
         - podSelector:
