@@ -465,3 +465,64 @@ topologySpread:
   maxSkew: 1
   topologyKey: kubernetes.io/hostname
   whenUnsatisfiable: ScheduleAnyway
+
+# WHO MAY REACH THIS MODULE'S PORTS AT ALL (ledger 511). One ingress
+# NetworkPolicy selecting `app: iam`, admitting the gRPC callers on 50052 and,
+# when a scrape source is named, Prometheus on 9090. No egress rule and no
+# namespace-wide default-deny; `templates/networkpolicy.yaml` carries the full
+# reasoning, including the Service-selector hazard anyone testing this must read
+# before labelling a probe pod.
+#
+# A SECOND LAYER, NEVER THE CHOICE. `iamDb.tls.clientCertSecret` above states it
+# from the other side: a NetworkPolicy is enforced by the CNI, so the same
+# manifest protects an EKS deployment and protects nothing on a cluster whose
+# CNI ignores policy — a control that keeps working while it stops protecting,
+# which is D80's second and worse failure. Certificates are the control that
+# holds identically everywhere. This is defence in depth on top of them.
+networkPolicy:
+  # OFF, AND NOT FOR THE REASON `autoscaling.enabled` IS OFF. That default
+  # exists because KEDA's CRD may be absent and the chart would then not install
+  # at all. A NetworkPolicy is core API and installs everywhere, so that arm of
+  # D80 does not reach it — read alone, D80's fail-closed rule argues for
+  # defaulting this `true`.
+  #
+  # The reason is ASYMMETRIC COST. A wrong policy on an enforcing CNI is an
+  # outage, and an absent one is no worse than today. The allow-list below is
+  # correct for THIS deployment and is an assertion about somebody else's
+  # topology anywhere else. An adopter with an enforcing CNI turns it on with one
+  # value and gets the whole baseline; an adopter whose topology differs is not
+  # handed a silent partition on first install.
+  #
+  # Revisit this once the policies have a negative test behind them in a second
+  # cluster. It is a defensible default until then, and should not be left
+  # `false` by habit after.
+  enabled: false
+  # THE WORKLOADS ALLOWED TO REACH 50052. Each name renders one `podSelector` on
+  # `app: <name>`, so an operator with another caller overrides this list rather
+  # than patching rendered YAML (D80 — configuration is the seam).
+  #
+  # `gateway` is the whole set today: `yadgarhq/gateway`'s chart declares `iam`
+  # as an upstream, and nothing else dials this module.
+  #
+  # EMPTY IS REFUSED WHILE `enabled` IS TRUE, and the template fails the render
+  # naming this value. That is not pedantry about a no-op. An empty or missing
+  # `from` matches ALL sources per the Kubernetes API, so the policy would open
+  # 50052 to every pod in the cluster while still listing and describing as a
+  # control — the silent-non-protection failure the block above names. Refusing
+  # to render is loud at install time, which is the only place left to be loud.
+  clients:
+    - gateway
+  # WHERE THE METRICS SCRAPE COMES FROM. Empty renders NO rule for port 9090 at
+  # all, so a bare install exposes the metrics port to nobody rather than to a
+  # guessed namespace. Set `namespace:` and the template admits that namespace:
+  #
+  #   networkPolicy:
+  #     scrapeFrom:
+  #       namespace: observability
+  #
+  # DEPLOYMENT-SPECIFIC BY NATURE, which is why there is no default. The
+  # reference deployment sets it in `yadgarhq/argocd`'s ApplicationSet, in the
+  # shared `values:` block that already carries `autoscaling.enabled` and
+  # `tls.enabled` — the one place that reaches every module uniformly without
+  # naming any of them (D54).
+  scrapeFrom: {}
