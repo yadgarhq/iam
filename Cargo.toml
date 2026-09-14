@@ -93,7 +93,7 @@ argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1.9", features = ["derive"] }
-base64 = "0.22"
+base64 = "0.23"
 async-nats = "0.50"
 uuid = { version = "1", features = ["v7"] }
 
