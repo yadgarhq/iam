@@ -90,7 +90,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # not by autoupdate.
 aes-gcm = "0.10"
 argon2 = "0.5"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 zeroize = { version = "1.9", features = ["derive"] }
 base64 = "0.23"
