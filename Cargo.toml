@@ -88,7 +88,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # well-established; writing cryptographic code against an API being guessed at is
 # the worst place in the system to be approximately right. Revisit deliberately,
 # not by autoupdate.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 argon2 = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
