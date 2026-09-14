@@ -2701,7 +2701,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "async-nats",
- "base64 0.22.1",
+ "base64 0.23.1",
  "hmac",
  "http",
  "metrics",
