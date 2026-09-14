@@ -89,7 +89,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # the worst place in the system to be approximately right. Revisit deliberately,
 # not by autoupdate.
 aes-gcm = "0.10"
-argon2 = "0.5"
+argon2 = "0.6"
 hmac = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1.9", features = ["derive"] }
