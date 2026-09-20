@@ -486,9 +486,8 @@ fn known_user(password: &str) -> Option<(String, String)> {
 fn cheap_user(password: &str) -> Option<(String, String)> {
     let params = argon2::Params::new(8, 1, 1, None).expect("m=8,t=1,p=1 is a legal Argon2 set");
     let hasher = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let salt = argon2::password_hash::SaltString::encode_b64(&[1u8; 16]).expect("salt");
     let hash =
-        argon2::password_hash::PasswordHasher::hash_password(&hasher, password.as_bytes(), &salt)
+        argon2::PasswordHasher::hash_password_with_salt(&hasher, password.as_bytes(), &[1u8; 16])
             .expect("hash at a deliberately low cost")
             .to_string();
     Some(("yadgar:user:1".to_string(), hash))
