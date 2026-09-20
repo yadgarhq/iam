@@ -11,8 +11,7 @@
 //! carries once, and the visibility `CountingArgon2` needs to be nameable from
 //! its parent.
 
-use argon2::password_hash::{PasswordHash, PasswordHasher};
-use argon2::Argon2;
+use argon2::{Argon2, CustomizedPasswordHasher, PasswordHash};
 
 // Count one Argon2id verification THAT ACTUALLY COMPUTED SOMETHING.
 //
@@ -52,10 +51,12 @@ pub(crate) fn argon2_verifications() -> usize {
 /// COUNTED ON `Ok`, NOT ON ENTRY, because REACHING `hash_password_customized` IS
 /// NOT THE SAME AS FILLING THE MEMORY. It is past `password_hash`'s
 /// `(Some(salt), Some(expected_output))` gate and past `Params::try_from`, but
-/// argon2's own impl then rejects a foreign algorithm ident, an unknown version
-/// and a salt below its 8-byte minimum — each before the first block, each listed
-/// at [`verify_counted`]. An entry-point count reports all three as verifications:
-/// the same control-flow-wearing-the-name-of-cost mistake, one level further in.
+/// argon2's own impl then rejects a foreign algorithm ident and an unknown
+/// version — each before the first block, each listed at [`verify_counted`]. An
+/// entry-point count reports both as verifications: the same
+/// control-flow-wearing-the-name-of-cost mistake, one level further in. A salt
+/// below argon2's 8-byte minimum used to be a third such exit; under `phc 0.6`
+/// that minimum is enforced at PARSE time, so it never reaches this impl at all.
 ///
 /// `Ok` is the sound predicate because every one of those exits returns `Err`
 /// ahead of any hashing, and the one error the library can raise AFTER hashing —
@@ -64,22 +65,39 @@ pub(crate) fn argon2_verifications() -> usize {
 /// turns an `assert_eq!(spent, 1)` red rather than leaving it green. The counter
 /// stays independent of `verify_counted` either way: the predicate is the
 /// library's own result, not this module's classification of it.
+///
+/// THE TRAIT IS `CustomizedPasswordHasher` AND THAT IS FORCED, not stylistic.
+/// `password-hash 0.6` split the old single `PasswordHasher` in two: a
+/// `PasswordHasher<H>` that mints its own salt, and a
+/// `CustomizedPasswordHasher<H>` that takes one along with an algorithm ident, a
+/// version and a parameter set. The blanket `PasswordVerifier<phc::PasswordHash>`
+/// — the impl that gives [`super::verify_counted`] its `verify_password` — is
+/// written over `CustomizedPasswordHasher<phc::PasswordHash>` and NOT over
+/// `PasswordHasher`. So implementing the other half of the split would leave this
+/// wrapper with no `verify_password` at all, and the counter measuring nothing.
+///
+/// THE SIGNATURE IS NARROWER THAN IT WAS, and none of what left was a choice of
+/// this file's: the salt is a `&[u8]` where it was a `Salt<'a>`, the algorithm an
+/// `Option<&str>` where it was an `Option<Ident<'a>>`, the version an
+/// `Option<u32>` where it was an `Option<Decimal>`, and `PasswordHash` carries no
+/// lifetime because `phc 0.6` made it an owned type. The delegation and the
+/// count-on-`Ok` predicate are the same two statements they were.
 pub(super) struct CountingArgon2(pub(super) Argon2<'static>);
 
-impl PasswordHasher for CountingArgon2 {
+impl CustomizedPasswordHasher<PasswordHash> for CountingArgon2 {
     type Params = argon2::Params;
 
-    fn hash_password_customized<'a>(
+    fn hash_password_customized(
         &self,
         password: &[u8],
-        algorithm: Option<argon2::password_hash::Ident<'a>>,
-        version: Option<argon2::password_hash::Decimal>,
+        salt: &[u8],
+        algorithm: Option<&str>,
+        version: Option<argon2::password_hash::Version>,
         params: Self::Params,
-        salt: impl Into<argon2::password_hash::Salt<'a>>,
-    ) -> argon2::password_hash::Result<PasswordHash<'a>> {
+    ) -> argon2::password_hash::Result<PasswordHash> {
         let computed = self
             .0
-            .hash_password_customized(password, algorithm, version, params, salt);
+            .hash_password_customized(password, salt, algorithm, version, params);
         if computed.is_ok() {
             ARGON2_VERIFICATIONS.with(|c| c.set(c.get() + 1));
         }

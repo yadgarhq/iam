@@ -12,8 +12,7 @@ pub(crate) fn keys() -> Keys {
     Keys {
         encryption: Zeroizing::new([7u8; 32]),
         blind_index: Zeroizing::new([9u8; 32]),
-        dummy_hash: Argon2::default()
-            .hash_password(b"x", &SaltString::encode_b64(&[3u8; 16]).unwrap())
+        dummy_hash: PasswordHasher::hash_password_with_salt(&Argon2::default(), b"x", &[3u8; 16])
             .unwrap()
             .to_string(),
     }
@@ -179,17 +178,50 @@ fn a_corrupt_stored_hash_is_not_a_fast_path_either() {
     // bare `return false`. The answer is unchanged — so an assertion on the answer
     // alone proves nothing — but the branch then answers in microseconds and
     // reintroduces the enumeration oracle the module exists to close.
+    //
+    // TWO SHAPES, AND THE SECOND ONE MOVED HERE UNDER THE `phc 0.6` BUMP rather
+    // than being invented for this test. A salt decoding to 7 bytes used to PARSE
+    // — `password_hash 0.5` set `Salt::MIN_LENGTH` at 4 CHARACTERS — and was
+    // refused one call deeper by argon2's own 8-BYTE `MIN_SALT_LEN`, so it
+    // belonged in `a_stored_hash_the_verifier_refuses_before_hashing_is_not_a_fast_path`
+    // below, among the rows that reach the `Err(_) => None` arm. `phc 0.6` states
+    // that minimum as 8 BYTES, so `PasswordHash::new` now rejects it and it takes
+    // the `else` arm instead. THE OUTCOME IS IDENTICAL — one full verification
+    // against the dummy, no verdict — which is why this is a relocation and not a
+    // weakened assertion: the property the row was pinning is still pinned, one
+    // test up. It is kept rather than deleted because it is the SUBTLER of the two
+    // shapes here: a PHC string that is well-formed in every respect except its
+    // salt length, against one that is not a PHC string at all.
     let k = keys();
 
-    let before = argon2_verifications();
-    let ok = k.verify_password(Some("not a PHC string at all"), "x");
-    let spent = argon2_verifications() - before;
+    for (shape, stored) in [
+        ("not a PHC string at all", "not a PHC string at all"),
+        (
+            // Decodes to 7 bytes, one byte under the 8-byte minimum that `phc 0.6`
+            // enforces at parse time.
+            "a well-formed PHC string whose salt is one byte too short",
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbA\
+             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
+        ),
+    ] {
+        // Guards the test itself, and is the mirror of the guard in the test
+        // below: these must NOT parse, or this stops covering the `else` arm and
+        // silently becomes a copy of that one.
+        assert!(
+            PasswordHash::new(stored).is_err(),
+            "{shape}: must NOT parse, or this no longer covers the `else` arm"
+        );
 
-    assert!(!ok, "an unparseable stored hash must never verify");
-    assert_eq!(
-        spent, 1,
-        "a corrupt stored hash must still cost one Argon2 verification"
-    );
+        let before = argon2_verifications();
+        let ok = k.verify_password(Some(stored), "x");
+        let spent = argon2_verifications() - before;
+
+        assert!(!ok, "{shape}: an unparseable stored hash must never verify");
+        assert_eq!(
+            spent, 1,
+            "{shape}: a corrupt stored hash must still cost one Argon2 verification"
+        );
+    }
 }
 
 #[test]
@@ -202,22 +234,32 @@ fn a_stored_hash_the_verifier_refuses_before_hashing_is_not_a_fast_path() {
     //
     // - no digest: `password_hash`'s blanket `PasswordVerifier` impl is gated on
     //   `if let (Some(salt), Some(expected_output)) = (&hash.salt, &hash.hash)`
-    //   and otherwise falls straight through to `Err(Error::Password)` — the same
+    //   and otherwise falls straight through to `Err(Error::PasswordInvalid)` — the same
     //   error a wrong password gets, without hashing anything;
     // - an illegal parameter set: `Params::try_from` rejects `m=8,p=2` (Argon2
     //   requires `m >= 8 * p`) and the `?` returns before the first block of
     //   memory is touched.
     //
     // AND A THIRD FAMILY, ONE CALL DEEPER, which the two above do not reach:
-    // argon2's own `hash_password_customized` rejects a foreign algorithm ident, a
-    // version that is neither 0x10 nor 0x13, and a salt DECODING to fewer than
-    // `MIN_SALT_LEN` = 8 bytes. `password_hash`'s `Salt::MIN_LENGTH` is 4
-    // CHARACTERS and `Params::try_from` never looks at the ident, so all three
-    // parse and then die past every guard the two cases above describe. They are
-    // in the table below because the production code closes them through the
-    // catch-all `Err(_) => None` rather than through the enumeration — see
-    // `verify_counted`. Narrowing that arm to the named variants would reopen
-    // exactly these rows, and this test is what makes that loud.
+    // argon2's own `hash_password_customized` rejects a foreign algorithm ident and
+    // a version that is neither 0x10 nor 0x13. `Params::try_from` never looks at
+    // the ident, so both parse and then die past every guard the two cases above
+    // describe. They are in the table below because the production code closes
+    // them through the catch-all `Err(_) => None` rather than through the
+    // enumeration — see `verify_counted`. Narrowing that arm to the named variants
+    // would reopen exactly these rows, and this test is what makes that loud.
+    //
+    // THAT FAMILY HAD A THIRD MEMBER AND IT LEFT THIS TEST UNDER THE `phc 0.6`
+    // BUMP, which is worth stating because the arm's coverage is the thing being
+    // argued for. A salt decoding to fewer than argon2's 8-byte `MIN_SALT_LEN`
+    // used to parse — `password_hash 0.5` set `Salt::MIN_LENGTH` at 4 CHARACTERS —
+    // and now does not, so it is pinned by
+    // `a_corrupt_stored_hash_is_not_a_fast_path_either` above instead. Three rows
+    // below still reach the `Err(_)` arm, so it keeps live coverage and the
+    // argument against narrowing it is unchanged. VERIFIED BY PROBE rather than by
+    // reading: the illegal parameter set, the foreign ident and the unknown
+    // version all still arrive there, and the two digest-less rows still stop at
+    // the gate.
     //
     // MEASURED before the fix, release build: every one of these shapes answered
     // in microseconds against the milliseconds a real verification costs — three
@@ -273,13 +315,6 @@ fn a_stored_hash_the_verifier_refuses_before_hashing_is_not_a_fast_path() {
         (
             "a version Argon2 does not have",
             "$argon2id$v=99$m=19456,t=2,p=1$c29tZXNhbHRzYWx0c2FsdA\
-             $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
-        ),
-        (
-            // Decodes to 7 bytes: legal for `password_hash`, one byte under
-            // Argon2's own minimum.
-            "a salt shorter than Argon2 accepts",
-            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbA\
              $c29tZXNhbHRzYWx0c2FsdHNhbHRzYWx0c2E",
         ),
     ] {
@@ -392,12 +427,15 @@ fn a_ciphertext_written_by_the_current_framing_still_decrypts() {
 /// permanently. A password hash cannot be re-derived without the plaintext, so
 /// that lockout is not recoverable by a migration.
 ///
-/// **AND THE MAJOR BUMP `Cargo.toml` ALREADY ANTICIPATES.** The manifest pins
-/// `argon2 = "0.5"` with a note to revisit "deliberately, not by autoupdate".
-/// This is the assertion that makes such a bump visible: the vector below is
-/// what every row in `iam_password.argon2id_hash` looks like, and if a new
-/// major derives a different digest from the same PHC string then this goes red
-/// on the bump rather than in production.
+/// **AND THE MAJOR BUMP `Cargo.toml` ANTICIPATED — WHICH HAS NOW HAPPENED.** The
+/// manifest used to pin `argon2 = "0.5"` with a note to revisit "deliberately,
+/// not by autoupdate"; it now pins `0.6`, and this assertion is what made that
+/// revisit checkable rather than hopeful. The vector below is what every row in
+/// `iam_password.argon2id_hash` looks like, and a new major deriving a different
+/// digest from the same PHC string goes red HERE, on the bump, rather than in
+/// production. It stayed green across `argon2 0.5.3 -> 0.6.0`, which is the
+/// evidence that the KDF did not move and the bump was therefore not a
+/// data-migration event. The same assertion guards the next major unchanged.
 ///
 /// **THE VECTOR IS EXTERNAL, and that matters more here than anywhere else in
 /// this section.** A hash minted by `hash_password` and pasted back would be a
@@ -621,7 +659,7 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
     // p = 1 IS NOT ASSERTED, and its absence is deliberate rather than an
     // oversight. `MIN_P_COST: u32 = 1` with `p_cost() >= MIN_P_COST` used to sit
     // beside the two floors below, described as load-bearing with them and unable
-    // to fail: `argon2 0.5.3`'s `Params::new` REFUSES `p_cost < 1` (its own
+    // to fail: `argon2 0.6.0`'s `Params::new` REFUSES `p_cost < 1` (its own
     // `Params::MIN_P_COST`), and `Params::try_from(&PasswordHash)` builds through
     // `ParamsBuilder` into that same constructor — so no PHC string reaching this
     // loop can carry a lower lane count. The crate enforces it; a test that
@@ -674,7 +712,7 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
         // WHY NOTHING ELSE SEES IT. The PHC parameter string carries `m`, `t` and
         // `p` and does NOT carry `output_len`; `Params::try_from(&PasswordHash)`
         // recovers it only by measuring the decoded digest —
-        // `builder.output_len(output.len())`, `argon2 0.5.3` `src/params.rs`. A
+        // `params.output_len = Some(output.len())`, `argon2 0.6.0` `src/params.rs`. A
         // length change is therefore invisible to every reader that goes through
         // the parameter string, which is why it needs an assertion of its own.
         //
@@ -691,7 +729,7 @@ fn a_stored_hash_is_expensive_in_absolute_terms() {
         // `Params::DEFAULT.output_len()` — an expectation routed through the
         // constant the code hashes with agrees with the code whatever the code
         // says. It could not be that constant in any case: `Params::DEFAULT`
-        // carries `output_len: None` in `argon2 0.5.3`, and the 32 arrives from a
+        // carries `output_len: None` in `argon2 0.6.0`, and the 32 arrives from a
         // SEPARATE `Params::DEFAULT_OUTPUT_LEN` applied at hash time
         // (`src/lib.rs`, `.unwrap_or(Params::DEFAULT_OUTPUT_LEN)`). Neither
         // constant is the thing being asserted.
@@ -754,4 +792,57 @@ fn the_bound_is_bytes_and_not_characters() {
     assert_eq!(k.encrypt(&"\u{1F600}".repeat(121)).unwrap().len(), 512);
     // 484 of them is 1936 bytes, which is far past it.
     assert_eq!(k.encrypt(&"\u{1F600}".repeat(484)).unwrap().len(), 1964);
+}
+
+/// THE SALT `hash_secret` MINTS IS 16 BYTES, AND NOTHING ELSE PINNED IT.
+///
+/// `password-hash 0.6` moved salt generation OUT of this crate and INTO
+/// `PasswordHasher::hash_password`, which draws `RECOMMENDED_SALT_LEN` bytes from
+/// `getrandom`. That deleted the one line — `SaltString::generate(&mut OsRng)` —
+/// a reader could previously have checked the length against, and replaced it
+/// with a constant inside a dependency. This is the assertion that puts the
+/// length back under this repository's control.
+///
+/// **WHY NOTHING ELSE SEES IT, and it is the same blindness
+/// `a_stored_hash_is_expensive_in_absolute_terms` documents for `output_len`.**
+/// The PHC parameter string carries `m`, `t` and `p` and says nothing about the
+/// salt, so every assertion routed through `argon2::Params` is silent here.
+/// `a_password_hash_written_by_an_earlier_release_still_verifies` is silent too,
+/// and for a sharper reason: it VERIFIES a frozen string carrying its own
+/// 16-byte salt, so it pins the salt of a hash this function did not mint.
+/// `the_same_password_hashes_differently_for_two_users` passes for a salt of ANY
+/// non-zero length, since two random 4-byte salts still differ.
+///
+/// **MUTATION THIS CATCHES:** a future bump — or a `hash_password_with_salt` call
+/// substituted for `hash_password` — that mints a shorter salt. Salt length is
+/// what bounds precomputation across the whole table rather than the cost of any
+/// one guess, so shortening it is a silent weakening of exactly the kind this
+/// file exists to refuse, and every row already written keeps its old length.
+///
+/// **16 AND 22 ARE LITERALS** (ADR-0599, ADR-0573), and deliberately not
+/// `argon2::RECOMMENDED_SALT_LEN`. An expectation routed through the constant the
+/// code generates from agrees with the code whatever the constant says.
+#[test]
+fn the_minted_salt_is_sixteen_bytes() {
+    let k = keys();
+    let phc = k.hash_password("correct horse").expect("hash a password");
+    let parsed = PasswordHash::new(&phc).expect("a freshly written hash parses");
+    let salt = parsed.salt.expect("a minted hash carries its salt");
+
+    // The DECODED length, so the assertion is about entropy rather than an
+    // encoding — the same distinction `a_minted_token_carries_the_full_256_bits`
+    // draws.
+    assert_eq!(
+        salt.as_ref().len(),
+        16,
+        "the minted salt is {} bytes, and a stored Argon2id salt is 16",
+        salt.as_ref().len()
+    );
+    // And the ENCODED width, because that is what the stored column holds and
+    // what a reader comparing a live row against the frozen vector above sees.
+    assert_eq!(
+        salt.to_string().len(),
+        22,
+        "16 bytes of salt encode as 22 base64 characters in a PHC string"
+    );
 }

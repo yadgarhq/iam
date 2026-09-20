@@ -18,11 +18,17 @@
 //! Using Argon2id for the token, or a bare hash for the username, would each look
 //! like the careful choice and be the wrong one.
 
-use aes_gcm::aead::rand_core::RngCore;
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+// `Generate` REPLACES THE `OsRng` THIS FILE IMPORTED: `aes-gcm 0.11` re-exports
+// no RNG, and the OS CSPRNG is reached through `Generate::generate` on the array
+// being filled. `generate()` and NOT `try_generate()` — `OsRng.fill_bytes` was
+// infallible-or-panic, so the fallible arm would add a `CryptoError` variant for
+// a case the previous code never surfaced, which is wider than this port.
+use aes_gcm::aead::{Aead, Generate, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+// `argon2::PasswordHash`, NOT `argon2::password_hash::PasswordHash`: the latter
+// is a `#[deprecated(since = "0.6.0")]` alias for the same type, and this crate
+// denies all clippy lints.
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -144,23 +150,31 @@ pub(crate) use counting::argon2_verifications;
 ///
 /// - no digest, or no salt — the impl is gated on
 ///   `if let (Some(salt), Some(expected_output)) = (&hash.salt, &hash.hash)` and
-///   otherwise falls straight through to `Err(Error::Password)`, the very error a
+///   otherwise falls straight through to `Err(Error::PasswordInvalid)`, the very error a
 ///   wrong password gets;
 /// - a parameter string `Params::try_from` rejects — `m=8,t=1,p=2` is legal PHC
 ///   and not a legal Argon2 configuration (`m >= 8 * p`), so the `?` returns
 ///   before the first block of memory is touched;
 /// - and `hash_password_customized`, which is a FAMILY rather than one case,
-///   because the exits are argon2's own: a foreign algorithm ident, a version
-///   that is neither 0x10 nor 0x13, and a salt DECODING to fewer than
-///   `argon2::MIN_SALT_LEN` = 8 bytes — against `password_hash`'s
-///   `Salt::MIN_LENGTH` of 4 CHARACTERS, so a salt too short for Argon2 parses
-///   perfectly well. The first of those is not visible from the blanket impl at
-///   all: `Params::try_from` never reads the algorithm ident, so
+///   because the exits are argon2's own: a foreign algorithm ident, and a version
+///   that is neither 0x10 nor 0x13. The first of those is not visible from the
+///   blanket impl at all: `Params::try_from` never reads the algorithm ident, so
 ///   `$scrypt$v=19$m=19456,t=2,p=1$…` sails past it and dies one call deeper.
+///
+/// ONE MEMBER OF THAT THIRD FAMILY MOVED UNDER THE `phc 0.6` BUMP, and it is
+/// named here because the list above used to carry it. A salt DECODING to fewer
+/// than `argon2::MIN_SALT_LEN` = 8 bytes used to parse perfectly well, because
+/// `password_hash 0.5`'s `Salt::MIN_LENGTH` was 4 CHARACTERS. `phc 0.6` states
+/// that minimum as 8 BYTES, so such a salt is now refused by `PasswordHash::new`
+/// rather than one call deeper by argon2. The caller-visible outcome is
+/// UNCHANGED — the `.ok()` in [`Keys::verify_password`] short-circuits and the
+/// `else` arm pays the dummy — but the route is the parse rather than the
+/// `Err(_)` arm below. That arm keeps live coverage from the other three shapes,
+/// and `crypto::tests` pins which shape takes which route.
 ///
 /// THE `Err(_)` ARM BELOW IS DELIBERATELY BROADER THAN THAT LIST, AND MUST NOT BE
 /// NARROWED TO IT. The list is a reading of two crates at their pinned versions;
-/// the arm is the property. Anything that is not `Error::Password` means the
+/// the arm is the property. Anything that is not `Error::PasswordInvalid` means the
 /// verifier did not answer, and an unanswered verification is one the caller
 /// still owes — whether or not the reason appears above. Tightening the arm into
 /// the named variants is a refactor that looks like precision and silently
@@ -171,13 +185,13 @@ pub(crate) use counting::argon2_verifications;
 /// on one developer machine. Treat the absolute numbers as host-dependent; the
 /// three to four ORDERS OF MAGNITUDE between them are not, and that gap is the
 /// whole oracle. Telling the two apart is why this returns the verdict rather
-/// than a bare bool: `Error::Password` is ambiguous ON ITS OWN — a wrong password
+/// than a bare bool: `Error::PasswordInvalid` is ambiguous ON ITS OWN — a wrong
 /// and the ungated fall-through both return it — and stops being ambiguous only
 /// once the digest is known present, which is checked first.
 ///
 /// Compiles to the bare verification outside tests — the counting wrapper exists
 /// only under `cfg(test)` and costs nothing in a deployed binary.
-fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> Option<bool> {
+fn verify_counted(password: &str, parsed: &PasswordHash) -> Option<bool> {
     // The library's gate, restated. With no digest there is nothing to compare a
     // computation against, so it does not perform one.
     if parsed.salt.is_none() || parsed.hash.is_none() {
@@ -196,7 +210,7 @@ fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> Option<bool> {
         // The digest is present, so both of these are the answer to a real
         // computation rather than a refusal wearing the same error.
         Ok(()) => Some(true),
-        Err(argon2::password_hash::Error::Password) => Some(false),
+        Err(argon2::password_hash::Error::PasswordInvalid) => Some(false),
         // An unusable parameter set, a mismatched algorithm: refused BEFORE any
         // hashing, and so not a verification at all.
         Err(_) => None,
@@ -230,9 +244,16 @@ fn verify_counted(password: &str, parsed: &PasswordHash<'_>) -> Option<bool> {
 fn hash_secret(secret: &[u8]) -> Result<String, argon2::password_hash::Error> {
     // A fresh salt per hash, so two people choosing the same password are not
     // visibly identical in the table.
-    let salt = SaltString::generate(&mut OsRng);
+    //
+    // THE SALT IS NO LONGER MINTED ON A LINE OF ITS OWN, which is the one line in
+    // this port worth reading twice. `password-hash 0.6` moved generation inside
+    // `PasswordHasher::hash_password`, which draws `RECOMMENDED_SALT_LEN` = 16
+    // bytes from the OS CSPRNG through `getrandom` — the same length from the same
+    // source as the `SaltString::generate(&mut OsRng)` it replaced. Fewer lines,
+    // not a different salt; `crypto::tests::the_minted_salt_is_sixteen_bytes`
+    // asserts the width rather than leaving this comment to be believed.
     Argon2::default()
-        .hash_password(secret, &salt)
+        .hash_password(secret)
         .map(|h| h.to_string())
 }
 
@@ -257,8 +278,7 @@ impl Keys {
     /// test in the binary, so the construction that mints `dummy_hash` had no
     /// test at all — and that hash is one half of the timing equalisation.
     fn from_dir(dir: &str) -> Result<Self, KeyError> {
-        let mut filler = [0u8; 32];
-        OsRng.fill_bytes(&mut filler);
+        let filler = <[u8; 32]>::generate();
         let dummy_hash = hash_secret(&filler).map_err(|e| KeyError::Dummy(e.to_string()))?;
 
         Ok(Self {
@@ -271,16 +291,19 @@ impl Keys {
     /// Encrypt a name for storage. Randomised — the same name encrypts
     /// differently every time, which is why lookup needs [`Self::blind_index`].
     pub fn encrypt(&self, plaintext: &str) -> Result<Vec<u8>, CryptoError> {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*self.encryption));
+        // `new_from_slice` rather than `Key::from_slice` into `new`: the array
+        // type's `from_slice` PANICS on a length mismatch, and `read_key` already
+        // refuses anything but 32 bytes — so the fallible form costs nothing.
+        let cipher =
+            Aes256Gcm::new_from_slice(&*self.encryption).map_err(|_| CryptoError::Encrypt)?;
         // A FRESH nonce per encryption. GCM's security collapses entirely if a
         // nonce repeats under the same key — not gracefully, but to the point
         // where an attacker can recover the authentication key. 96 bits from the
         // OS CSPRNG is the standard construction.
-        let mut nonce_bytes = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce_bytes = <[u8; 12]>::generate();
+        let nonce = Nonce::from(nonce_bytes);
         let mut out = cipher
-            .encrypt(nonce, plaintext.as_bytes())
+            .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|_| CryptoError::Encrypt)?;
         // Nonce first, then ciphertext. It is not secret — it must not repeat,
         // which is a different property — and storing it alongside is what makes
@@ -295,9 +318,15 @@ impl Keys {
             return Err(CryptoError::Truncated);
         }
         let (nonce_bytes, ciphertext) = framed.split_at(12);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&*self.encryption));
+        let cipher =
+            Aes256Gcm::new_from_slice(&*self.encryption).map_err(|_| CryptoError::Decrypt)?;
+        // `try_into` rather than `from_slice`, which `aes-gcm 0.11`'s
+        // `hybrid-array` deprecates. The check above means the head is always 12
+        // bytes, but an `expect` would be a panic on a path fed ATTACKER-SUPPLIED
+        // bytes; `Truncated` rather than `Decrypt`, since this is a framing fault.
+        let nonce: Nonce<_> = nonce_bytes.try_into().map_err(|_| CryptoError::Truncated)?;
         let plain = cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| CryptoError::Decrypt)?;
         String::from_utf8(plain).map_err(|_| CryptoError::Decrypt)
     }
@@ -330,8 +359,7 @@ impl Keys {
 
     /// Mint a new bearer token: 256 bits from the OS CSPRNG.
     pub fn mint_token() -> Result<Zeroizing<String>, CryptoError> {
-        let mut raw = [0u8; 32];
-        OsRng.fill_bytes(&mut raw);
+        let raw = <[u8; 32]>::generate();
         // URL-safe and unpadded, so it survives a header, a config file and a
         // shell copy-paste without quoting.
         Ok(Zeroizing::new(base64::Engine::encode(

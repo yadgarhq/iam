@@ -81,17 +81,46 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # hashing passwords, computing blind indexes and token hashes. None of this
 # touches storage — iam-db holds ciphertext and hashes only, and every one of
 # these operations happens here before a value crosses that boundary.
-# The 0.10 / 0.5 / 0.12 / 0.10 line, NOT the newest majors, and deliberately.
-# aes-gcm 0.11 replaces `Aead` with a buffer-based `AeadInOut`, and argon2 0.6
-# moves salt generation inside `hash_password` — both are real API rewrites. This
-# is the line the ecosystem actually runs and the one whose usage is
-# well-established; writing cryptographic code against an API being guessed at is
-# the worst place in the system to be approximately right. Revisit deliberately,
-# not by autoupdate.
-aes-gcm = "0.10"
-argon2 = "0.5"
-hmac = "0.12"
-sha2 = "0.10"
+# THE FOUR MOVE TOGETHER OR NOT AT ALL, and that is a fact about the ecosystem
+# rather than a preference of this crate. All four sit on the `digest 0.11` /
+# `crypto-common 0.2` generation, so a bump of one against the 0.10-era siblings
+# does not type-check: `sha2 0.11`'s `Sha256` stops satisfying the `CoreProxy`
+# that `hmac 0.12`'s `Hmac<D>` is bounded on, and `hmac 0.13`'s `EagerHash` bound
+# is unsatisfiable by `sha2 0.10`. Measured, both directions, on the four
+# single-crate Dependabot branches — each one red on its own. So there is no
+# "bump them one at a time" order, and four separate pull requests is not a
+# smaller change than this one, it is an impossible one.
+#
+# THE PREVIOUS PIN'S NOTE SAID "revisit deliberately, not by autoupdate". This
+# is that revisit, and what made it safe to do rather than to guess at is that
+# NOTHING ABOUT THE STORED FORMAT MOVES. `argon2 0.6`'s `Params::DEFAULT` is
+# byte-identical to `0.5.3`'s — m=19456, t=2, p=1, `DEFAULT_OUTPUT_LEN` 32,
+# `Algorithm::default()` still Argon2id and `Version::default()` still V0x13 —
+# so `Argon2::default()` mints exactly the PHC string it minted before. The
+# frozen known-answer vector in `crypto::tests` is the assertion that says so,
+# and it passes unchanged. Had those defaults moved, this would have been a
+# re-hash of every stored password rather than a dependency bump, and it would
+# have stopped here.
+#
+# WHAT DID CHANGE IS ALL API, and it is a real rewrite rather than a rename:
+# `password-hash 0.6` splits `PasswordHasher` into a salt-taking
+# `PasswordHasher<H>` and a `CustomizedPasswordHasher<H>`, moves `PasswordHash`
+# into the `phc` crate without a lifetime, replaces `Salt`/`Ident`/`Decimal` in
+# the hashing signature with `&[u8]` / `Option<&str>` / `Option<u32>`, and
+# renames `Error::Password` to `Error::PasswordInvalid`. `aes-gcm 0.11` drops the
+# `OsRng` re-export and keeps `Aead` as a blanket impl over `AeadInOut`.
+#
+# `getrandom` IS NAMED RATHER THAN INHERITED, under the same discipline as
+# `tls-ring` and tokio's `time` above. It is in `aes-gcm`'s default feature set
+# today, so this crate would compile without asking for it; the day that default
+# changes, `crypto`'s three CSPRNG reads lose `Generate::generate` and the error
+# lands on a line nobody edited. It is also THE replacement for the `OsRng` that
+# `aes-gcm 0.10` re-exported and `0.11` does not — this crate has no other source
+# of random bytes, so the feature is load-bearing rather than incidental.
+aes-gcm = { version = "0.11", features = ["getrandom"] }
+argon2 = "0.6"
+hmac = "0.13"
+sha2 = "0.11"
 zeroize = { version = "1.9", features = ["derive"] }
 base64 = "0.23"
 async-nats = "0.50"
