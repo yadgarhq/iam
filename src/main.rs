@@ -90,6 +90,7 @@ use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 
 use yadgar_iam::boot;
 use yadgar_iam::crypto::Keys;
+use yadgar_iam::key_identity;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 use yadgar_iam::rotate;
 use yadgar_iam::serve;
@@ -106,6 +107,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dependency is NOT allowed to degrade gracefully the way iam-db is.
     let keys = Keys::from_env()?;
     tracing::info!("crypto keys loaded; names are encrypted at rest (D72)");
+
+    // WHICH key set those are, as the opaque bytes `iamdb.v1`'s key-identity arm
+    // stores and compares (ADR-0764, ADR-0765). Derived HERE because `keys` is
+    // moved into `Iam` below, and BOOT IS GATED ON NONE OF IT: this is a local
+    // computation over material already loaded, and the round trip that uses it
+    // happens in a task after the listener binds.
+    let identity = key_identity::Identity::of(&keys);
 
     let (db, db_tls) = boot::iam_db().await?;
 
@@ -182,6 +190,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = boot::env_required("LISTEN")?.parse()?;
 
+    // THE CHECK RUNS AS A TASK AFTER BOOT, and the channel it uses is the SAME
+    // lazy one every RPC uses — a clone, not a second dial. `Channel` is cheap to
+    // clone and reconnects nowhere, so nothing new is opened and nothing new is
+    // waited on.
+    let key_check = key_identity::watch(
+        yadgar_iam::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient::new(
+            db.clone(),
+        ),
+        identity,
+        key_identity::Retry::standard(),
+    );
+
     serve_and_drain(
         server,
         addr,
@@ -189,16 +209,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listen_tls.as_ref(),
         watch_inputs,
         schedule,
+        key_check,
     )
     .await
 }
 
-/// Serve until a signal or a rotation ends it, then drain within the budget.
+/// Serve until a signal, a rotation or the key-identity check ends it, then
+/// drain within the budget.
 ///
 /// A SEPARATE FUNCTION AND NOT A `boot` ONE. Everything [`yadgar_iam::boot`]
 /// holds is a decision made before the listener binds; this is the process's
 /// whole life after it. It stays in the binary because there is nothing here a
-/// test could assert that `yadgar-lifecycle`'s own `tests/drain.rs` does not.
+/// test could assert that `yadgar-lifecycle`'s own `tests/drain.rs` does not —
+/// and the one thing that WOULD have been unreachable, which of the three arms
+/// ended the serve and what the exit code owes it, lives in
+/// [`yadgar_iam::key_identity::until_stopped`] instead of in the `select!`
+/// below. That is `rotate::watch_set`'s argument: an arm written inline here
+/// could be deleted and the whole suite would still pass.
 async fn serve_and_drain(
     mut server: Server,
     addr: SocketAddr,
@@ -206,6 +233,7 @@ async fn serve_and_drain(
     listen_tls: Option<&serve::ServerTls>,
     watch_inputs: rotate::Inputs,
     schedule: rotate::Schedule,
+    key_check: impl std::future::Future<Output = key_identity::Mismatch>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
     // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
@@ -248,28 +276,53 @@ async fn serve_and_drain(
             }),
     );
 
-    // WHAT ENDS THE SERVE, and nothing else does.
-    let stop = async {
-        tokio::select! {
-            // SIGTERM and SIGINT, already armed above. SIGTERM is the one
-            // Kubernetes sends, and the one this binary used to ignore.
-            () = signals => {}
-            // `rotate::watch` resolves ONLY when it has read a change, and never
-            // at all when there is nothing to watch.
-            () = rotate::watch(watch_inputs, schedule) => {}
+    // WHAT ENDS THE SERVE, and nothing else does. THREE ARMS NOW, and only one
+    // of them makes the exit non-zero — which is why the select lives in the
+    // library and this carries its verdict out on a oneshot rather than
+    // repeating it here. `signals` is SIGTERM and SIGINT, already armed above;
+    // `rotate::watch` resolves ONLY when it has read a change, and never at all
+    // when there is nothing to watch; `key_check` resolves ONLY on a definite
+    // MISMATCH.
+    let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+    let stop = async move {
+        let _ = ended_tx.send(
+            key_identity::until_stopped(signals, rotate::watch(watch_inputs, schedule), key_check)
+                .await,
+        );
+    };
+
+    let overran = match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
+        Drain::Finished(result) => {
+            result?;
+            false
+        }
+        // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
+        // an error in the log, not a CrashLoopBackOff on top of it.
+        Drain::Overran => {
+            tracing::error!(
+                budget_secs = DRAIN_BUDGET.as_secs(),
+                "the drain did not finish within its budget; ending anyway with calls still in \
+                 flight. A request blocked this long is the thing to look at"
+            );
+            true
         }
     };
 
-    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
-        Drain::Finished(result) => result?,
-        // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
-        // an error in the log, not a CrashLoopBackOff on top of it.
-        Drain::Overran => tracing::error!(
-            budget_secs = DRAIN_BUDGET.as_secs(),
-            "the drain did not finish within its budget; ending anyway with calls still in \
-             flight. A request blocked this long is the thing to look at"
-        ),
-    }
+    // AFTER THE DRAIN AND OUTSIDE THE MATCH ABOVE, deliberately. A key-identity
+    // refusal whose drain also overran must still exit non-zero: putting this
+    // inside the `Finished` arm is the one-line mutation that silently returns 0
+    // on exactly the pod that most needs to stop. `stop` has completed by the
+    // time `drain_within` returns, so the verdict is always there; a lost
+    // channel is an ordinary stop rather than an invented refusal.
+    //
+    // `.to_string()` for the reason `boot` gives five times over: `Box<dyn
+    // Error>` prints with DEBUG, and this message is a paragraph an operator has
+    // to act on.
+    ended_rx
+        .await
+        .unwrap_or(key_identity::Ended::Ordinary)
+        .into_exit(overran)
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }

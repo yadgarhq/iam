@@ -317,6 +317,27 @@ impl IamDbService for FakeDb {
             .push(req.into_inner());
         Ok(Response::new(db::RemoveTeamMemberResponse {}))
     }
+
+    // THE TWO KEY-IDENTITY ARMS, WHICH NO `IamService` HANDLER REACHES. They
+    // belong to `crate::key_identity`'s startup task, which builds its own twin
+    // and scripts its own answers in `key_identity::tests`. `unimplemented!`
+    // rather than a benign `Ok(Default::default())`: a handler in THIS file
+    // reaching either arm would be a defect, and a default answer would absorb
+    // it silently — the same argument the fake in `key_identity::tests` makes
+    // about the fourteen arms it never serves.
+    async fn get_key_identity(
+        &self,
+        _req: Request<db::GetKeyIdentityRequest>,
+    ) -> Result<Response<db::GetKeyIdentityResponse>, Status> {
+        unimplemented!("no IamService handler asks the twin about the key identity")
+    }
+
+    async fn set_key_identity(
+        &self,
+        _req: Request<db::SetKeyIdentityRequest>,
+    ) -> Result<Response<db::SetKeyIdentityResponse>, Status> {
+        unimplemented!("no IamService handler asks the twin about the key identity")
+    }
 }
 
 /// A port nothing is listening on, learned rather than guessed.
