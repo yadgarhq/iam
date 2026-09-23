@@ -654,20 +654,54 @@ fn the_backoff_is_bounded_by_its_cap() {
 /// stays Ready, serving and unverified, and the one line that said so has
 /// scrolled away.
 ///
-/// THE ASSERTION THAT REDDENS if the report fires only on the first attempt:
-/// `restate(RESTATE_EVERY)`.
+/// THE ASSERTIONS THAT REDDEN. A report that fires only the first time reddens
+/// `restate(Some(RESTATE_AFTER))`. A report on every attempt reddens the
+/// `!restate` pair. A changed reason that waits out the interval reddens
+/// `restate(None)`.
 #[test]
 fn a_standing_fault_is_restated_rather_than_reported_once() {
     assert!(
-        restate(0),
-        "the first attempt under a reason is always reported"
+        restate(None),
+        "a new or changed reason is always reported at once"
     );
+    assert!(!restate(Some(Duration::ZERO)));
+    assert!(!restate(Some(RESTATE_AFTER - Duration::from_secs(1))));
     assert!(
-        (1..RESTATE_EVERY).all(|n| !restate(n)),
-        "a line per retry trains a reader to skip it"
+        restate(Some(RESTATE_AFTER)),
+        "a standing fault is re-stated"
     );
-    assert!(restate(RESTATE_EVERY), "a standing fault is re-stated");
-    assert!(restate(RESTATE_EVERY * 7));
+    assert!(restate(Some(RESTATE_AFTER * 7)));
+}
+
+/// **AND IT REACHES THE OPERATOR IN MINUTES AT THE SHIPPED BACKOFF**, which is
+/// the property the cadence exists for and is NOT the same claim as the
+/// arithmetic above.
+///
+/// This replays the loop's own accumulation against [`Retry::standard`]. THE
+/// ASSERTION THAT REDDENS if the cadence is ever keyed on an attempt COUNT
+/// again: `worst`. Measured under "one line in every twenty attempts", which
+/// was this module's first shape, the gap between two lines about a fault no
+/// retry mends was about eleven minutes, because the backoff saturates at a
+/// minute long before the twentieth attempt — the counter and the wall clock
+/// stop agreeing exactly where it matters.
+#[test]
+fn a_permanent_fault_reaches_an_operator_within_minutes() {
+    let retry = Retry::standard();
+    let mut since = Duration::ZERO;
+    let mut gaps: Vec<Duration> = Vec::new();
+    for attempt in 0..600u32 {
+        since += retry.wait(attempt, 0x5eed_5eed_5eed_5eed);
+        if restate(Some(since)) {
+            gaps.push(since);
+            since = Duration::ZERO;
+        }
+    }
+    assert!(gaps.len() > 20, "an operator is told repeatedly, not once");
+    let worst = gaps.into_iter().max().expect("at least one line");
+    assert!(
+        worst <= RESTATE_AFTER + Duration::from_secs(60),
+        "an operator waited {worst:?} between two lines about a fault no retry mends"
+    );
 }
 
 /// An ordinary stop — a signal, or a rotation — exits zero, and the key-identity

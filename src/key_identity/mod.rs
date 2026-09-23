@@ -47,6 +47,8 @@
 //! or every pod reads `DERIVATION_SKEW` and never passes. ADR-0765 exists
 //! because that hazard has no mechanism behind it otherwise.
 
+use std::time::Duration;
+
 use tonic::transport::Channel;
 
 use crate::crypto::Keys;
@@ -76,15 +78,15 @@ pub const DERIVATION_VERSION: u32 = 1;
 /// red rather than subtle.
 pub const DOMAIN: &str = "yadgar:iam:key-identity:v1";
 
-/// How many attempts under ONE unchanged reason pass before it is re-stated.
+/// How long ONE unchanged reason may stand before it is re-stated.
 ///
 /// **NOT A CONFIGURATION KNOB (ADR-0569).** Nothing else reads it, no chart
 /// renders it, and there is no second source for it to disagree with: it is the
 /// cadence of a log line, which is a property of this mechanism rather than a
 /// setting of this deployment.
-pub const RESTATE_EVERY: u32 = 20;
+pub const RESTATE_AFTER: Duration = Duration::from_secs(300);
 
-/// Whether the `n`th consecutive attempt under one unchanged reason is reported.
+/// Whether a reason that has stood for `since` the last line is re-stated.
 ///
 /// **A STANDING CONDITION REPORTED ONCE IS THE FAILURE, NOT THE FIX.** The
 /// contract's own words about a permanent status are that retrying it for ever
@@ -92,9 +94,24 @@ pub const RESTATE_EVERY: u32 = 20;
 /// indefinitely and silently. One line at the top of a pod's life scrolls away
 /// and leaves exactly that state. A line per retry is the opposite failure and
 /// trains a reader to skip it, which is [`crate::rotate`]'s own rule about a
-/// standing condition. So: the first, then one in every [`RESTATE_EVERY`].
-fn restate(n: u32) -> bool {
-    n.is_multiple_of(RESTATE_EVERY)
+/// standing condition.
+///
+/// **KEYED ON ELAPSED TIME AND NOT ON AN ATTEMPT COUNT, and the difference is
+/// measured rather than stylistic.** [`Retry`] backs off to a minute, so "one
+/// line in every twenty attempts" — the first shape of this function — put
+/// roughly eleven minutes between two lines about a fault no retry mends. The
+/// property an operator has is a line every five minutes; the property a counter
+/// gives is a line every twenty waits, and the two stop agreeing the moment the
+/// backoff saturates. `a_permanent_fault_reaches_an_operator_within_minutes`
+/// asserts the first of those and reddens under the second.
+///
+/// `None` is a reason that has not been reported at all — the first attempt, or
+/// the first under a CHANGED reason — and it is always reported.
+fn restate(since: Option<Duration>) -> bool {
+    match since {
+        None => true,
+        Some(standing) => standing >= RESTATE_AFTER,
+    }
 }
 
 /// What this process claims about its key set, computed once at boot.
@@ -249,7 +266,10 @@ pub async fn watch_with_seed(
     seed: u64,
 ) -> Mismatch {
     let mut attempt: u32 = 0;
-    let mut standing: Option<(&'static str, u32)> = None;
+    // The reason standing right now, and how long it has stood SINCE THE LAST
+    // LINE about it. Accumulated from the waits below rather than read off a
+    // clock, so what an operator gets is what a test can assert.
+    let mut standing: Option<(&'static str, Duration)> = None;
 
     loop {
         match step(&mut client, &identity).await {
@@ -265,31 +285,38 @@ pub async fn watch_with_seed(
             Step::Refused(arm) => return Mismatch { arm },
             Step::NotYet(unverified) => report(&unverified, &mut standing),
         }
-        tokio::time::sleep(retry.wait(attempt, seed)).await;
+        let waited = retry.wait(attempt, seed);
+        if let Some((_, since)) = standing.as_mut() {
+            *since = since.saturating_add(waited);
+        }
+        tokio::time::sleep(waited).await;
         attempt = attempt.saturating_add(1);
     }
 }
 
 /// Tell an operator, on the cadence [`restate`] sets.
-fn report(unverified: &Unverified, standing: &mut Option<(&'static str, u32)>) {
-    let n = match standing {
-        Some((reason, n)) if *reason == unverified.reason => n.saturating_add(1),
-        // A CHANGE OF REASON IS ALWAYS REPORTED, whatever the cadence says. An
-        // UNAVAILABLE twin that comes back answering UNIMPLEMENTED is a
-        // different fact about the deployment, and waiting out a counter to say
-        // so would report the old one.
-        _ => 0,
-    };
-    *standing = Some((unverified.reason, n));
-    if !restate(n) {
+fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration)>) {
+    // A CHANGE OF REASON IS ALWAYS REPORTED, whatever the cadence says. An
+    // UNAVAILABLE twin that comes back answering UNIMPLEMENTED is a different
+    // fact about the deployment, and waiting out the interval to say so would
+    // leave the old one standing as the last thing anybody was told.
+    let since = standing
+        .as_ref()
+        .and_then(|(reason, since)| (*reason == unverified.reason).then_some(*since));
+    if !restate(since) {
+        // THE CLOCK IS NOT RESET HERE. Leaving `standing` alone is what lets the
+        // waits keep accumulating towards the next line; resetting it on every
+        // quiet attempt would mean no line is ever due again.
         return;
     }
+    let stood_for = since.unwrap_or_default();
+    *standing = Some((unverified.reason, Duration::ZERO));
     match unverified.permanent {
         // NO RETRY MENDS THIS, so the pod stays Ready, serving and unverified
         // until somebody acts. ERROR is the level that says a human is needed.
         true => tracing::error!(
             reason = unverified.reason,
-            attempts = n + 1,
+            standing_for_secs = stood_for.as_secs(),
             derivation_version = DERIVATION_VERSION,
             "the key identity is UNVERIFIED and no retry will mend it. This pod is Ready and \
              serving and has NOT proved it holds the key set its rows were encrypted under. \
@@ -298,7 +325,7 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, u32)>) {
         ),
         false => tracing::warn!(
             reason = unverified.reason,
-            attempts = n + 1,
+            standing_for_secs = stood_for.as_secs(),
             "the key identity is not yet verified; retrying. This pod is Ready and serving in \
              the meantime (ADR-0532)"
         ),
