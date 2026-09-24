@@ -13,6 +13,7 @@
 pub mod boot;
 pub mod crypto;
 pub mod invalidate;
+pub mod key_identity;
 /// What this process does when the certificate it read at boot is replaced
 /// underneath it. [`serve`] reads those files once; this notices they changed.
 pub mod rotate;

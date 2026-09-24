@@ -9,9 +9,21 @@
 use super::*;
 
 pub(crate) fn keys() -> Keys {
+    keys_of([7u8; 32], [9u8; 32])
+}
+
+/// The same fixture under a NAMED key set.
+///
+/// `keys()` above is one key set and cannot produce a second, so no test could
+/// ask whether a value derived from the keys MOVES when a key changes — and a
+/// derivation that ignored one of the two keys would satisfy every assertion
+/// that only ever saw one key set. `key_identity::tests` is the caller that
+/// needs the pair; the fixture lives here because the fields are private to this
+/// module.
+pub(crate) fn keys_of(encryption: [u8; 32], blind_index: [u8; 32]) -> Keys {
     Keys {
-        encryption: Zeroizing::new([7u8; 32]),
-        blind_index: Zeroizing::new([9u8; 32]),
+        encryption: Zeroizing::new(encryption),
+        blind_index: Zeroizing::new(blind_index),
         dummy_hash: PasswordHasher::hash_password_with_salt(&Argon2::default(), b"x", &[3u8; 16])
             .unwrap()
             .to_string(),

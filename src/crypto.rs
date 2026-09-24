@@ -494,5 +494,6 @@ fn normalise(username: &str) -> String {
     username.trim().to_lowercase()
 }
 
+mod identity;
 #[cfg(test)]
 pub(crate) mod tests;
