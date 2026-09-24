@@ -397,5 +397,13 @@ fn refusal_for(code: tonic::Code) -> &'static str {
     }
 }
 
+// `pub(crate)` for `crypto::tests`' reason, and for one more: this module owns
+// the ONE global tracing subscriber this test binary may install, and
+// `key_identity::tests` asserts on a log line too. A second, thread-local
+// subscriber there is not equivalent — `tracing` caches a callsite's `Interest`
+// globally, so a callsite first reached by another test on another thread while
+// no subscriber existed is cached as NEVER, and a thread-local default
+// installed afterwards captures nothing. Measured: green single-threaded, zero
+// lines captured in parallel.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -57,8 +57,10 @@ use crate::pb::yadgar::iamdb::v1 as db;
 use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
 
 mod retry;
+mod stop;
 
 pub use retry::Retry;
+pub use stop::{until_stopped, until_stopped_with, Check, Ended};
 
 /// Which function produced the fingerprint. Versions start at 1 (ADR-0765);
 /// zero is refused by both arms, because `uint32` has no presence in proto3.
@@ -104,6 +106,13 @@ pub const RESTATE_AFTER: Duration = Duration::from_secs(300);
 /// gives is a line every twenty waits, and the two stop agreeing the moment the
 /// backoff saturates. `a_permanent_fault_reaches_an_operator_within_minutes`
 /// asserts the first of those and reddens under the second.
+///
+/// **THIS FUNCTION IS THE ARITHMETIC AND NOT THE CADENCE.** Its input is
+/// accumulated by [`watch_with_seed`] and reset by [`report`], and neither of
+/// those two lines is touched by any assertion over this function — both were
+/// deletable, green, while an operator got one line and never another.
+/// `the_cadence_an_operator_gets_is_produced_by_the_loop` runs the real loop
+/// against a real twin and reads the real log, which is what closes them.
 ///
 /// `None` is a reason that has not been reported at all — the first attempt, or
 /// the first under a CHANGED reason — and it is always reported.
@@ -174,72 +183,22 @@ fn mint_idempotency_key() -> String {
 /// under. Permanent: no restart, no retry and no wait changes it.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "the key-identity marker in iam-db does NOT match the key set this process loaded, under \
-     derivation version {DERIVATION_VERSION}. Every name and every credential already stored \
-     was encrypted under a different key set, so this process cannot read its own rows and \
-     will not go on serving as though it could (ADR-0764). Nothing has been written. Mount the \
-     key Secret this installation was provisioned with; if it is lost, the rows are not \
+    "the key-identity marker in iam-db does NOT match the key set this process loaded: {arm} \
+     answered MISMATCH under derivation version {DERIVATION_VERSION}. A MISMATCH on \
+     GetKeyIdentity means a marker was ALREADY stored and disagrees; one on SetKeyIdentity \
+     means another replica recorded a different marker between this pod's read and its write, \
+     so this pod lost a split rollout. Every name and every credential already stored was \
+     encrypted under a different key set, so this process cannot read its own rows and will \
+     not go on serving as though it could (ADR-0764). Nothing has been written. Mount the key \
+     Secret this installation was provisioned with; if it is lost, the rows are not \
      recoverable and no key in the world makes them so."
 )]
 pub struct Mismatch {
-    /// Which arm answered it. A read means a marker was already there; a write
-    /// means this pod lost a split rollout under the same version.
+    /// Which arm answered it, and it is INTERPOLATED INTO THE MESSAGE ABOVE
+    /// rather than held for a reader of this struct. This message is the only
+    /// thing the process prints on its way out, so a field the operator never
+    /// sees states its distinction where nobody reads it.
     arm: &'static str,
-}
-
-/// What ended the serve, and what the process owes the exit code afterwards.
-#[derive(Debug)]
-pub enum Ended {
-    /// A signal, or a rotation. The restart is the point, so the exit is 0.
-    Ordinary,
-    /// The key-identity check refused. The exit is NON-ZERO.
-    KeyIdentityRefused(Mismatch),
-}
-
-impl Ended {
-    /// What the process owes the exit code once BOTH verdicts are in. `Err` is
-    /// the non-zero exit: `main` returns it and the process exits 1.
-    ///
-    /// **THE TWO VERDICTS COMBINE RATHER THAN NEST, and that is the whole reason
-    /// this takes an argument it never branches on.** `drain_overran` is
-    /// `yadgar_lifecycle::Drain::Overran`, whose own ruling is exit 0 — the
-    /// restart is the point, and a CrashLoopBackOff on top of a slow drain helps
-    /// nobody. Reading the refusal only inside the drain's SUCCESS arm is a
-    /// one-line change that silently exits 0 on exactly the pod that most needs
-    /// to stop, and a signature that never saw the overrun could not state the
-    /// rule at all.
-    ///
-    /// # Errors
-    ///
-    /// Only [`Ended::KeyIdentityRefused`]. Everything else is an ordinary stop.
-    pub fn into_exit(self, drain_overran: bool) -> Result<(), Mismatch> {
-        let _ = drain_overran;
-        match self {
-            Self::Ordinary => Ok(()),
-            Self::KeyIdentityRefused(mismatch) => Err(mismatch),
-        }
-    }
-}
-
-/// What ends the serve, and which of the three arms did it.
-///
-/// **IN THE LIBRARY RATHER THAN IN `main`, AND `main` CALLS IT RATHER THAN
-/// REPEATING IT** — [`crate::rotate::watch_set`]'s argument, applied to the stop
-/// select. The exit code is the only thing this whole check produces, and a
-/// `select!` written inline in a binary entry point is reachable from no test:
-/// deleting an arm there compiles and passes the entire suite, which is the
-/// defect `watch_set` exists to close. Three REQUIRED futures and no `Option`,
-/// so an arm cannot be dropped silently.
-pub async fn until_stopped(
-    signals: impl std::future::Future<Output = ()>,
-    rotation: impl std::future::Future<Output = ()>,
-    key_identity: impl std::future::Future<Output = Mismatch>,
-) -> Ended {
-    tokio::select! {
-        () = signals => Ended::Ordinary,
-        () = rotation => Ended::Ordinary,
-        refusal = key_identity => Ended::KeyIdentityRefused(refusal),
-    }
 }
 
 /// Run the check until it passes, or until it must end the serve.
@@ -348,9 +307,18 @@ impl Unverified {
 
     /// An answer this build cannot read as a pass: the zero value, a member
     /// added after this tag, or `RECORDED` from the arm that writes nothing.
+    ///
+    /// **PERMANENT, FOR `UNIMPLEMENTED`'s REASON AND NOT A DIFFERENT ONE.** All
+    /// three things this covers are a version disagreement between the two
+    /// binaries: a peer sending a member this tag does not know, or sending one
+    /// on an arm its own contract says never sends it. None of them is mended by
+    /// waiting, and every one of them is mended by a DEPLOY — which is exactly
+    /// what [`Self::of_status`] classifies `UNIMPLEMENTED` permanent for. Left
+    /// transient it warns for ever, and this module's own table says an operator
+    /// is told when no retry will mend it.
     const UNREADABLE: Self = Self {
         reason: "an outcome this build cannot read as a pass",
-        permanent: false,
+        permanent: true,
     };
 
     /// A non-OK status. EVERY one of them is not-passed; the question this

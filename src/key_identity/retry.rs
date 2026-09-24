@@ -20,7 +20,7 @@ pub struct Retry {
 impl Retry {
     /// The cadence this binary retries on.
     ///
-    /// **NOT A CONFIGURATION KNOB (ADR-0569), for [`super::RESTATE_EVERY`]'s reason.**
+    /// **NOT A CONFIGURATION KNOB (ADR-0569), for [`super::RESTATE_AFTER`]'s reason.**
     /// One second to sixty is a backoff, not a setting: nothing renders it,
     /// nothing else reads it, and there is no second source for an operator to
     /// find it disagreeing with.

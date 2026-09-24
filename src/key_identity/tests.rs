@@ -210,6 +210,16 @@ fn free_port() -> std::net::SocketAddr {
 
 /// Serve `script`, and return a client to it plus the log of what it was asked.
 async fn twin(script: Script) -> (IamDbServiceClient<Channel>, Arc<Mutex<Asked>>) {
+    let (channel, asked) = twin_channel(script).await;
+    (IamDbServiceClient::new(channel), asked)
+}
+
+/// The same twin, as the raw [`Channel`] `main` holds.
+///
+/// [`Check::new`] takes the channel rather than a client, because that is what
+/// `main` has — so the test that proves the wiring has to start from the same
+/// value `main` starts from, or it is not testing the wiring.
+async fn twin_channel(script: Script) -> (Channel, Arc<Mutex<Asked>>) {
     let asked = Arc::new(Mutex::new(Asked::default()));
     let fake = FakeTwin {
         script,
@@ -236,7 +246,7 @@ async fn twin(script: Script) -> (IamDbServiceClient<Channel>, Arc<Mutex<Asked>>
         .connect()
         .await
         .expect("connect to the fake twin");
-    (IamDbServiceClient::new(channel), asked)
+    (channel, asked)
 }
 
 /// Retries fast enough that "it kept retrying" is measurable inside [`WINDOW`].
@@ -383,6 +393,15 @@ async fn the_zero_value_never_passes() {
     assert!(
         asked.set.is_empty(),
         "nothing about it says the store is empty"
+    );
+
+    // AND AN OPERATOR IS TOLD. All three things `UNREADABLE` covers are a
+    // version disagreement between the two binaries, and a deploy is what mends
+    // every one of them — `UNIMPLEMENTED`'s case exactly. THE ASSERTION THAT
+    // REDDENS if it is classified transient again, which warns for ever.
+    assert!(
+        Unverified::UNREADABLE.is_permanent(),
+        "an outcome this build cannot read needs a deploy, not a retry"
     );
 }
 
@@ -790,4 +809,211 @@ fn an_overrun_drain_does_not_rescue_a_refusal() {
     });
     assert!(refused.into_exit(true).is_err());
     assert!(Ended::Ordinary.into_exit(true).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// THE CADENCE THROUGH THE REAL LOOP, AND THE WIRING THE BINARY HANDS OVER
+// ---------------------------------------------------------------------------
+
+/// One line an operator was told, as the two things these assertions are about.
+///
+/// Parsed out of [`crate::service::tests`]'s rendered form, which is
+/// `LEVEL "message" field=value …`.
+#[derive(Clone, Debug)]
+struct Line {
+    error: bool,
+    standing_for_secs: u64,
+}
+
+/// The lines about ONE reason, in order.
+///
+/// **THROUGH THIS BINARY'S ONE GLOBAL SUBSCRIBER, and a thread-local one is NOT
+/// an equivalent shortcut.** `tracing` caches a callsite's `Interest` globally
+/// and lazily: a callsite first reached by another test, on another thread,
+/// while no subscriber existed is cached as NEVER, and a `set_default` installed
+/// afterwards captures nothing at all from it. Measured on this file — green
+/// under `--test-threads=1`, zero lines captured in parallel. The global tap is
+/// registered for every callsite, so this one is enabled whoever gets there
+/// first.
+fn told_about(reason: &str) -> Vec<Line> {
+    crate::service::tests::warnings()
+        .into_iter()
+        .filter(|line| line.contains(&format!("reason={reason}")))
+        .map(|line| Line {
+            error: line.starts_with("ERROR"),
+            standing_for_secs: line
+                .split("standing_for_secs=")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+const UNIMPLEMENTED: &str = "UNIMPLEMENTED: this iam-db predates the key-identity arm";
+
+/// **THE CADENCE IS PRODUCED BY THE LOOP, and this asserts it THROUGH the loop.**
+///
+/// `a_standing_fault_is_restated_rather_than_reported_once` calls [`restate`]
+/// with hand-built `Duration`s and
+/// `a_permanent_fault_reaches_an_operator_within_minutes` RE-IMPLEMENTS the
+/// production accumulation in its own body. Both assert the arithmetic. NEITHER
+/// touches the two lines in [`watch_with_seed`] and [`report`] that compute the
+/// arithmetic's input, so both stayed green while an operator got one line and
+/// never another — which is the failure this module's own documentation names by
+/// hand. This test runs the real loop against a real twin and reads the real log.
+///
+/// THE MUTATIONS THAT REDDEN, each measured one at a time:
+/// deleting the `*since = since.saturating_add(waited)` accumulation in
+/// [`watch_with_seed`] leaves `restate(Some(ZERO))` false for ever, so exactly
+/// one line is ever emitted — `lines.len() > 1` and the `standing_for_secs`
+/// assertion both go red. Deleting `*standing = Some((reason, ZERO))` in
+/// [`report`] leaves `since` `None` for ever, so EVERY attempt reports — the
+/// `lines.len() < attempts / 2` bound and the same `standing_for_secs` assertion
+/// go red. Demoting a permanent fault to WARN reddens the level assertion.
+///
+/// THE CLOCK IS PAUSED AFTER THE CONNECT AND NOT BEFORE IT. [`twin_channel`]
+/// polls for its listener with `tokio::time::sleep`, and a paused clock
+/// auto-advances those five seconds of polling into no real time at all — so the
+/// poll would exhaust before the server bound. The loop is bounded by the SCRIPT
+/// rather than by a `tokio::time::timeout`, for the same reason: an outer timer
+/// is something auto-advance can fire while a round trip is in flight.
+#[tokio::test]
+async fn the_cadence_an_operator_gets_is_produced_by_the_loop() {
+    // Forty permanent answers and then a MISMATCH, which is what ends the loop.
+    // `answer` repeats the LAST entry for ever, so the MISMATCH also makes the
+    // attempt count exact rather than a race with a timer.
+    const ATTEMPTS: usize = 40;
+    let mut get = vec![Answer::Failed(tonic::Code::Unimplemented); ATTEMPTS];
+    get.push(Answer::Outcome(raw(db::KeyIdentityOutcome::Mismatch)));
+
+    let (channel, asked) = twin_channel(Script {
+        get,
+        ..Default::default()
+    })
+    .await;
+
+    // INSTALLED BEFORE THE LOOP AND DRAINING THIS THREAD'S LIST, which is what
+    // keeps the tap's own setup noise out of an assertion about a count.
+    crate::service::tests::warnings_from_here();
+
+    // A FLAT HUNDRED-SECOND BACKOFF, so each wait is between fifty and a hundred
+    // seconds and the cumulative crosses `RESTATE_AFTER` every three to six of
+    // them. The production cadence would need an hour of virtual time to say the
+    // same thing; the property under test is the accumulation, not the numbers.
+    tokio::time::pause();
+    let refusal = watch_with_seed(
+        IamDbServiceClient::new(channel),
+        identity(),
+        Retry::of(Duration::from_secs(100), Duration::from_secs(100)),
+        0x5eed_5eed_5eed_5eed,
+    )
+    .await;
+    tokio::time::resume();
+
+    assert!(refusal.to_string().contains("MISMATCH"));
+    let attempts = asked.lock().expect("asked").get.len();
+    assert_eq!(attempts, ATTEMPTS + 1, "the script bounds the loop exactly");
+
+    let lines = told_about(UNIMPLEMENTED);
+
+    // M6: an operator is told MORE THAN ONCE about a fault no retry mends.
+    assert!(
+        lines.len() > 1,
+        "a standing fault reported once is the failure this arm exists to delete; \
+         got {} line(s) over {attempts} attempts",
+        lines.len()
+    );
+
+    // M7: and NOT on every attempt, which trains a reader to skip it.
+    assert!(
+        lines.len() < attempts / 2,
+        "a line per retry is the opposite failure; got {} lines over {attempts} attempts",
+        lines.len()
+    );
+
+    // AND THE INTERVAL IS THE ONE THE CONSTANT NAMES. Neither mutation above can
+    // produce a line carrying a non-zero `standing_for_secs` at all.
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.standing_for_secs >= RESTATE_AFTER.as_secs()),
+        "no line reported a reason that had stood for {RESTATE_AFTER:?}: {lines:?}"
+    );
+
+    // A PERMANENT FAULT REACHES AN OPERATOR AT ERROR, every time it is stated.
+    assert!(
+        lines.iter().all(|line| line.error),
+        "a fault no retry mends is an ERROR, not a retry counter: {lines:?}"
+    );
+}
+
+/// **THE WIRING SEAM: the check `main` hands over is BUILT IN THE LIBRARY.**
+///
+/// While `serve_and_drain` took the check as a FUTURE, its call site in
+/// `main.rs` could say `{ drop(key_check); std::future::pending() }` — measured
+/// on this branch: it compiles, inference gives `Pending<Mismatch>`, all of this
+/// suite passes and so does `cargo clippy --all-targets --all-features -D
+/// warnings`. The check was constructed and thrown away and nothing anywhere
+/// failed, because `src/main.rs` has no reachable test by this repository's
+/// standing decision. [`Check`] removes the future from that call site, and this
+/// test is what reddens if the same mutation is written where it is still
+/// writable — replacing [`watch`] inside [`until_stopped_with`] with
+/// `std::future::pending()` elapses the window below.
+///
+/// It starts from a [`Channel`] and not a client, because a `Channel` is what
+/// `main` holds and passes to [`Check::new`].
+#[tokio::test]
+async fn the_check_main_hands_over_is_the_one_that_ends_the_serve() {
+    let (channel, asked) = twin_channel(Script {
+        get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Mismatch))],
+        ..Default::default()
+    })
+    .await;
+
+    let ended = tokio::time::timeout(
+        WINDOW,
+        until_stopped_with(
+            std::future::pending(),
+            std::future::pending(),
+            Check::new(channel, identity(), brisk()),
+        ),
+    )
+    .await
+    .expect("the check main hands over must reach the select and end the serve");
+
+    assert!(matches!(ended, Ended::KeyIdentityRefused(_)));
+    assert!(
+        ended.into_exit(false).is_err(),
+        "and it is the arm that makes the exit non-zero"
+    );
+    assert_eq!(
+        asked.lock().expect("asked").get.len(),
+        1,
+        "one round trip settled it, over the channel the binary supplied"
+    );
+}
+
+/// The refusal an operator reads NAMES THE ARM THAT ANSWERED IT.
+///
+/// The distinction is diagnostic and the field's own documentation states it: a
+/// MISMATCH on the read means a marker was already stored, and one on the write
+/// means this pod lost a split rollout. It reached nobody while the `#[error]`
+/// string interpolated `DERIVATION_VERSION` and not `arm` — the message is the
+/// only thing the process prints on its way out.
+///
+/// THE ASSERTION THAT REDDENS if `{arm}` is dropped from that string again:
+/// `assert_ne!`, which is the one that cannot be satisfied by a sentence naming
+/// both arms in prose.
+#[test]
+fn the_refusal_names_the_arm_that_answered_it() {
+    let read = Mismatch { arm: READ }.to_string();
+    let write = Mismatch { arm: WRITE }.to_string();
+    assert!(read.contains(READ), "{read}");
+    assert!(write.contains(WRITE), "{write}");
+    assert_ne!(
+        read, write,
+        "the two arms must not render to the same sentence"
+    );
 }

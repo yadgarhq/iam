@@ -843,12 +843,19 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnTap {
 
 /// Install the tap once for the whole test binary, and drain this thread's list.
 ///
+/// **`pub(crate)` BECAUSE THE INSTALLATION IS ONE-SHOT AND BINARY-WIDE.**
+/// `key_identity::tests` asserts on a log line through the real retry loop, and
+/// a second subscriber there cannot be installed globally beside this one. A
+/// thread-local default is not a substitute: `tracing` caches a callsite's
+/// `Interest` globally, so a callsite another test reached first while no
+/// subscriber existed stays cached as NEVER.
+///
 /// Called at the START of the login helpers rather than inside a test, so the
 /// global default is in place before ANY login can emit anything — an install
 /// racing a warning already in flight is the flakiness this exists to remove.
 /// Draining is what keeps setup noise (`Invalidator::connect(None)` has its own
 /// warnings) out of a test that asserts on emptiness.
-fn warnings_from_here() {
+pub(crate) fn warnings_from_here() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         use tracing_subscriber::layer::SubscriberExt;
@@ -859,7 +866,7 @@ fn warnings_from_here() {
 }
 
 /// Everything this thread has warned since [`warnings_from_here`].
-fn warnings() -> Vec<String> {
+pub(crate) fn warnings() -> Vec<String> {
     WARNINGS.with(|w| w.borrow().clone())
 }
 

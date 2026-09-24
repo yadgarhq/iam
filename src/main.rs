@@ -190,17 +190,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = boot::env_required("LISTEN")?.parse()?;
 
-    // THE CHECK RUNS AS A TASK AFTER BOOT, and the channel it uses is the SAME
-    // lazy one every RPC uses — a clone, not a second dial. `Channel` is cheap to
-    // clone and reconnects nowhere, so nothing new is opened and nothing new is
-    // waited on.
-    let key_check = key_identity::watch(
-        yadgar_iam::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient::new(
-            db.clone(),
-        ),
-        identity,
-        key_identity::Retry::standard(),
-    );
+    // THE CHECK RUNS AFTER BOOT, and the channel it uses is the SAME lazy one
+    // every RPC uses — a clone, not a second dial.
+    //
+    // INGREDIENTS AND NOT A FUTURE, deliberately. A `key_check` future built
+    // here could be dropped and replaced with `std::future::pending()` at the
+    // call site below: that compiles, passes the suite and passes clippy, and
+    // nothing in this file is reachable from a test. `key_identity::Check` has
+    // no such mutation, because the future is built inside the library where
+    // `until_stopped_with`'s own test reddens.
+    let key_check = key_identity::Check::new(db.clone(), identity, key_identity::Retry::standard());
 
     serve_and_drain(
         server,
@@ -221,11 +220,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// holds is a decision made before the listener binds; this is the process's
 /// whole life after it. It stays in the binary because there is nothing here a
 /// test could assert that `yadgar-lifecycle`'s own `tests/drain.rs` does not —
-/// and the one thing that WOULD have been unreachable, which of the three arms
-/// ended the serve and what the exit code owes it, lives in
-/// [`yadgar_iam::key_identity::until_stopped`] instead of in the `select!`
-/// below. That is `rotate::watch_set`'s argument: an arm written inline here
-/// could be deleted and the whole suite would still pass.
+/// and the two things that WOULD have been unreachable live in
+/// [`yadgar_iam::key_identity::until_stopped_with`] instead. Which of the three
+/// arms ended the serve and what the exit code owes it is one; BUILDING the
+/// key-identity arm is the other, and it is the one that took a second attempt.
+/// That is `rotate::watch_set`'s argument: an arm written inline here could be
+/// deleted, and a future built here could be dropped, and the whole suite would
+/// still pass either way.
 async fn serve_and_drain(
     mut server: Server,
     addr: SocketAddr,
@@ -233,7 +234,7 @@ async fn serve_and_drain(
     listen_tls: Option<&serve::ServerTls>,
     watch_inputs: rotate::Inputs,
     schedule: rotate::Schedule,
-    key_check: impl std::future::Future<Output = key_identity::Mismatch>,
+    key_check: key_identity::Check,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // ARMED BEFORE THE SERVER IS SPAWNED, and that ordering is the fix rather
     // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
@@ -286,8 +287,12 @@ async fn serve_and_drain(
     let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
     let stop = async move {
         let _ = ended_tx.send(
-            key_identity::until_stopped(signals, rotate::watch(watch_inputs, schedule), key_check)
-                .await,
+            key_identity::until_stopped_with(
+                signals,
+                rotate::watch(watch_inputs, schedule),
+                key_check,
+            )
+            .await,
         );
     };
 
