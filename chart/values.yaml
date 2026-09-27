@@ -399,22 +399,43 @@ redeemEnrolment:
 # neither value and so cannot get either wrong — which puts the whole burden of
 # holding correct ones here.
 enrolment:
+  # THE OFF-SWITCH FOR IssueEnrolment. `false` renders ENROLMENT_GATEWAY empty,
+  # whatever `gateway` below and `global.hostname` say: iam then logs a WARN at
+  # boot, and IssueEnrolment alone refuses with FAILED_PRECONDITION. Login,
+  # ResolveCredential and RedeemEnrolment are unaffected. `true` applies the
+  # fallback order described under `gateway`. Anything but a boolean is refused
+  # at render, so a string "false" cannot read as on.
+  enabled: true
+
   # The gateway address a person's first client connects to.
   #
-  # EMPTY HERE AND MUST BE SET PER DEPLOYMENT. There is no default that could be
-  # right: this is the address a stranger's laptop dials, and the chart cannot
-  # know it.
+  # EMPTY HERE, AND THAT IS NOT "UNSET" (ADR-0808). Empty falls back to
+  # `https://` + `global.hostname`, the one place an adopter states the estate's
+  # hostname, and to `https://gateway.yadgar.internal:18443` when that is empty
+  # too. A value set here still wins over `global.hostname` — set one when the
+  # address a client dials is not `https://<hostname>` on 443.
+  # `templates/_hostname.tpl` holds the order. The key defaults to empty rather
+  # than to the URL because a non-empty default cannot be told apart from a value
+  # somebody set, so the global would never be read.
   #
-  # LEAVING IT EMPTY DISABLES IssueEnrolment AND NOTHING ELSE. iam warns at boot
-  # and the RPC refuses with FAILED_PRECONDITION naming this variable; Login and
-  # ResolveCredential are unaffected. It is deliberately NOT a boot failure —
-  # iam is the authentication plane, and a CrashLoopBackOff here would take the
-  # estate's credential resolution down over one administrative value. What the
-  # refusal protects is the contract's rule that a minted token never carries an
-  # empty gateway: the field has no presence, so such a token would be
-  # structurally valid and point at nothing, and its failure would surface on
-  # that stranger's machine as an undiagnosable connection error.
-  gateway: "https://gateway.yadgar.internal:18443"
+  # AN EMPTY VALUE HERE MEANS "DERIVE", NOT "OFF". To turn IssueEnrolment off,
+  # set `enabled: false` above; that is the only way the chart renders
+  # ENROLMENT_GATEWAY empty.
+  #
+  # THE DERIVED URL HAS NO PORT, because the edge listener answers on 443. An
+  # edge on any other port needs this key set explicitly.
+  #
+  # AN EMPTY ENROLMENT_GATEWAY DISABLES IssueEnrolment AND NOTHING ELSE. iam
+  # warns at boot and the RPC refuses with FAILED_PRECONDITION naming this
+  # variable; Login and ResolveCredential are unaffected. It is deliberately NOT
+  # a boot failure — iam is the authentication plane, and a CrashLoopBackOff
+  # here would take the estate's credential resolution down over one
+  # administrative value. What the refusal protects is the contract's rule that
+  # a minted token never carries an empty gateway: the field has no presence, so
+  # such a token would be structurally valid and point at nothing, and its
+  # failure would surface on that stranger's machine as an undiagnosable
+  # connection error.
+  gateway: ""
 
   # The Secret holding the root CA the token carries.
   #

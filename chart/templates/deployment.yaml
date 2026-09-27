@@ -354,7 +354,10 @@ spec:
             # — never mint a token carrying an empty gateway — is kept by the
             # refusal, without an availability cost.
             - name: ENROLMENT_GATEWAY
-              value: {{ .Values.enrolment.gateway | quote }}
+            {{- /* Empty when `enrolment.enabled` is false; otherwise
+            `enrolment.gateway`, else `https://` + `global.hostname` (ADR-0808).
+            See `_hostname.tpl` for the order. */}}
+              value: {{ include "iam.enrolmentGateway" (dict "enabled" .Values.enrolment.enabled "local" .Values.enrolment.gateway "context" $) | quote }}
             {{- if .Values.enrolment.caSecret }}
             # Set ONLY when a CA is configured. Absence is the whole of "use
             # system trust", so an empty value here would be a token assembled
