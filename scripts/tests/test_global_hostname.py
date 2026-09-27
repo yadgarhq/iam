@@ -152,7 +152,54 @@ def test_c_an_explicit_local_key_wins_over_global():
 def test_c_red_a_chart_that_prefers_global_is_caught(tmp_path):
     mutant = chart_with(
         tmp_path,
-        "{{- if .local -}}",
-        "{{- if and .local (not $hostname) -}}",
+        "{{- else if .local -}}",
+        "{{- else if and .local (not $hostname) -}}",
     )
     assert global_and_local(mutant) != LOCAL
+
+
+# ── (d) enrolment.enabled false: the off-switch beats every source ─────────────
+#
+# `enrolment.enabled: false` renders ENROLMENT_GATEWAY EMPTY. iam's
+# `EnrolmentConfig::new` refuses an empty gateway, boot logs a WARN and keeps
+# serving, and `IssueEnrolment` alone refuses with FAILED_PRECONDITION. Since an
+# empty `enrolment.gateway` now means "derive", this key is the only way to turn
+# IssueEnrolment off through the chart, so it must win over BOTH other sources.
+
+
+def disabled(chart: Path, *arguments: str) -> str:
+    return enrolment_gateway(chart, "--set", "enrolment.enabled=false", *arguments)
+
+
+def test_d_enabled_false_renders_the_gateway_empty():
+    assert disabled(CHART) == ""
+
+
+def test_d_enabled_false_wins_over_global_hostname():
+    assert disabled(CHART, "--set", f"global.hostname={GLOBAL}") == ""
+
+
+def test_d_enabled_false_wins_over_an_explicit_gateway():
+    assert (
+        disabled(
+            CHART,
+            "--set", f"global.hostname={GLOBAL}",
+            "--set", f"enrolment.gateway={LOCAL}",
+        )
+        == ""
+    )
+
+
+def test_d_enabled_true_is_the_default_render(tmp_path):
+    assert template(CHART, "--set", "enrolment.enabled=true") == template(CHART)
+
+
+def test_d_a_non_boolean_enabled_is_refused():
+    result = helm("template", "iam", str(CHART), "--set-string", "enrolment.enabled=false")
+    assert result.returncode != 0
+    assert "enrolment.enabled" in result.stderr
+
+
+def test_d_red_a_chart_that_ignores_the_gate_is_caught(tmp_path):
+    mutant = chart_with(tmp_path, "{{- if not $enabled -}}", "{{- if false -}}")
+    assert disabled(mutant, "--set", f"global.hostname={GLOBAL}") != ""
