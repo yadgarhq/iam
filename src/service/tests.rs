@@ -37,9 +37,10 @@ use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbSer
 /// Everything the fake twin was asked to do.
 #[derive(Default)]
 struct Recorded {
-    /// The `x-yadgar-request-id` each `ResolveCredential` arrived with, as RAW
-    /// BYTES read lossily: `to_str` refuses any non-ASCII byte, and a recorder
-    /// that read through it would record a cut marker as absent.
+    /// The `x-yadgar-request-id` each `ResolveCredential` arrived with, read
+    /// EXACTLY as `iam-db`'s `request_id_of` reads it: through `to_str()`, which
+    /// refuses any non-ASCII byte. A value that does not survive that read is
+    /// recorded as `""`, the way the real twin would record it.
     resolve_request_ids: Vec<Option<String>>,
     create_credential: Vec<db::CreateCredentialRequest>,
     get_password_hash: Vec<db::GetPasswordHashRequest>,
@@ -127,7 +128,7 @@ impl IamDbService for FakeDb {
         let header = req
             .metadata()
             .get("x-yadgar-request-id")
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            .map(|v| v.to_str().unwrap_or_default().to_string());
         self.recorded
             .lock()
             .expect("recorded")
@@ -3926,21 +3927,19 @@ fn carries(record: &str, id: &str) -> bool {
     record.contains(&format!(r#""request_id":"{id}""#))
 }
 
-/// **AN OVER-LONG INBOUND ID IS CAPPED ON `iam`'s RECORD EXACTLY AS `iam-db`
-/// CAPS IT ON ITS OWN**, so the two hops' records still join.
+/// **AN OVER-LONG INBOUND ID IS CAPPED ONCE, HERE, AND THE CAPPED VALUE IS
+/// BOTH WHAT `iam` RECORDS AND WHAT IT FORWARDS**, so the wire is bounded and
+/// the two hops' records join.
 ///
 /// A header is bounded only by the transport, and `request_id_of` hands its one
 /// `String` to `tel`'s `Scope` and from there to the `CallRecord`. Uncapped, a
 /// caller that is not the gateway puts tens of kilobytes on every record.
 ///
-/// **THE FORWARDED HEADER IS THE INBOUND ONE, UNCUT, and that is measured
-/// rather than chosen.** The cap's marker is `…`, which is not ASCII, and every
-/// reader in the estate — `iam-db`'s `request_id_of` included — reads the header
-/// with `to_str()`, which refuses any non-ASCII byte. Forwarding the capped
-/// value would therefore reach `iam-db` as `""`: the join lost in exactly the
-/// case the cap exists for. Forwarded whole, `iam-db` applies the identical cap
-/// (iam-db#78) and both records carry the same string — which is what the last
-/// assertion pins.
+/// **THE FAKE TWIN READS THE HEADER THROUGH `to_str()`, AS `iam-db` DOES**, so
+/// a non-ASCII cut marker would arrive as `""` and red the second assertion.
+/// `iam-db` re-caps what it reads (yadgarhq/iam-db#80), and capping a capped
+/// value changes nothing — the last assertion — so its record carries the
+/// identical string.
 #[tokio::test]
 async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
     let (iam, recorded, _) = iam_with(FakeDb {
@@ -3949,7 +3948,7 @@ async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
     })
     .await;
     let long = "z".repeat(1000);
-    let cut = format!("{}…", "z".repeat(256));
+    let cut = format!("{}...", "z".repeat(256));
 
     let record = the_call_record(
         iam.resolve_credential(with_request_id(ResolveCredentialRequest::default(), &long)),
@@ -3958,7 +3957,7 @@ async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
 
     assert!(
         carries(&record, &cut),
-        "iam's CallRecord carries the id cut to 256 characters plus `…`: {record}"
+        "iam's CallRecord carries the id cut to 256 characters plus `...`: {record}"
     );
     let forwarded = recorded
         .lock()
@@ -3967,13 +3966,13 @@ async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
         .clone();
     assert_eq!(
         forwarded,
-        vec![Some(long.clone())],
-        "the twin is handed the inbound id whole, so its own cap can see it"
+        vec![Some(cut.clone())],
+        "the twin reads back, through to_str(), the identical capped id"
     );
     assert_eq!(
-        super::capped(&long),
+        super::capped(&cut),
         cut,
-        "and the cap the twin applies to what it was handed is the one on iam's record"
+        "and re-capping it, as the twin does, leaves it unchanged"
     );
 }
 
