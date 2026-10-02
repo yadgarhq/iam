@@ -331,18 +331,66 @@ fn enrolment_refused() -> Status {
 /// the correlation id travels in a header instead. Propagating it is what keeps
 /// the `iam-db` hop joined to the rest of the trace; drop it and a login's
 /// database time floats free of the login that caused it.
+///
+/// **FORWARDED AS [`request_id_of`] CAPS IT**, so the wire to `iam-db` is
+/// bounded and carries the same string as this hop's `CallRecord` (ledger
+/// 1248). That needs the cap's [`CUT_MARKER`] to be ASCII: `iam-db` reads the
+/// header with `to_str()`, which refuses any non-ASCII byte. `iam-db` re-caps
+/// what it reads, and capping a capped value changes nothing, so both records
+/// join. An absent or unreadable inbound id forwards nothing — which `iam-db`
+/// reads exactly as it would have read the unreadable one.
 fn forward_request_id<T, U>(from: &Request<T>, to: &mut Request<U>) {
-    if let Some(v) = from.metadata().get("x-yadgar-request-id") {
-        to.metadata_mut().insert("x-yadgar-request-id", v.clone());
+    let id = request_id_of(from);
+    if id.is_empty() {
+        return;
+    }
+    // Always parses: `to_str()` admitted the inbound value and the marker is
+    // ASCII. Dropped rather than unwrapped if it ever did not (D25).
+    if let Ok(v) = id.parse() {
+        to.metadata_mut().insert("x-yadgar-request-id", v);
     }
 }
 
+/// How many of a caller's characters `x-yadgar-request-id` may put on a record.
+///
+/// A cut value is at most `REQUEST_ID_CAP + 3` characters, the marker included.
+///
+/// **THE SAME BOUND AND MARKER `iam-db` APPLIES** (its `ACTOR_RECORD_CAP`,
+/// `CUT_MARKER` and `capped`; iam-db#78, and the ASCII marker in
+/// yadgarhq/iam-db#80). A copy rather than a shared crate because none holds it
+/// yet; the copies must stay identical, or the two hops' records cut one
+/// over-long id differently and stop joining.
+const REQUEST_ID_CAP: usize = 256;
+
+/// What marks a cut. **ASCII, and that is load-bearing**: the capped id is
+/// forwarded in a header, and `iam-db` reads it with `to_str()`, which refuses
+/// any non-ASCII byte. A `…` here was accepted into metadata and read back as
+/// `""`.
+const CUT_MARKER: &str = "...";
+
+/// `s` cut to [`REQUEST_ID_CAP`] characters, with [`CUT_MARKER`] appended if it
+/// was cut.
+fn capped(s: &str) -> std::borrow::Cow<'_, str> {
+    match s.char_indices().nth(REQUEST_ID_CAP) {
+        Some((at, _)) => format!("{}{CUT_MARKER}", &s[..at]).into(),
+        None => s.into(),
+    }
+}
+
+/// D67's join key for this hop's own `CallRecord`, capped at its one read
+/// point (ledger 1248).
+///
+/// A header is bounded only by the transport, and this one `String` reaches the
+/// `CallRecord` through `tel`'s `Scope`. Capped rather than refused, because a
+/// correlation id is transport-level context and must never fail a call (D25).
+/// The gateway mints every legitimate id as a 36-character UUIDv7, so a value
+/// long enough to be cut did not come from it.
 fn request_id_of<T>(req: &Request<T>) -> String {
     req.metadata()
         .get("x-yadgar-request-id")
         .and_then(|v| v.to_str().ok())
+        .map(|v| capped(v).into_owned())
         .unwrap_or_default()
-        .to_string()
 }
 
 fn tel(request_id: String, user_id: &str) -> yadgar_telemetry::observe::Scope {

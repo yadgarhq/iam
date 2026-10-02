@@ -37,6 +37,11 @@ use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbSer
 /// Everything the fake twin was asked to do.
 #[derive(Default)]
 struct Recorded {
+    /// The `x-yadgar-request-id` each `ResolveCredential` arrived with, read
+    /// EXACTLY as `iam-db`'s `request_id_of` reads it: through `to_str()`, which
+    /// refuses any non-ASCII byte. A value that does not survive that read is
+    /// recorded as `""`, the way the real twin would record it.
+    resolve_request_ids: Vec<Option<String>>,
     create_credential: Vec<db::CreateCredentialRequest>,
     get_password_hash: Vec<db::GetPasswordHashRequest>,
     create_enrolment: Vec<db::CreateEnrolmentRequest>,
@@ -118,8 +123,17 @@ struct FakeDb {
 impl IamDbService for FakeDb {
     async fn resolve_credential(
         &self,
-        _req: Request<db::ResolveCredentialRequest>,
+        req: Request<db::ResolveCredentialRequest>,
     ) -> Result<Response<db::ResolveCredentialResponse>, Status> {
+        let header = req
+            .metadata()
+            .get("x-yadgar-request-id")
+            .map(|v| v.to_str().unwrap_or_default().to_string());
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .resolve_request_ids
+            .push(header);
         // A WRITE THIS FAKE ACCEPTED IS VISIBLE TO THE NEXT READ, which is the
         // one property a script of fixed answers cannot have and the promote →
         // resolve assertion needs. `resolves_admin` stays the answer until a
@@ -3870,4 +3884,117 @@ async fn a_multibyte_identifier_the_column_stores_is_not_refused_for_its_byte_le
         .await
         .0
         .expect("SetInheritedSetting: 96 characters is 96 characters, whatever it spells");
+}
+
+// ---------------------------------------------------------------------------
+// D67's request id: capped at its one read point (ledger 1248).
+// ---------------------------------------------------------------------------
+
+/// Captures every `CallRecord` line `yadgar_telemetry::record::emit` writes,
+/// for as long as the guard `record::set_sink` hands back lives.
+#[derive(Clone, Default)]
+struct RecordCapture(Arc<Mutex<Vec<String>>>);
+
+impl yadgar_telemetry::record::Sink for RecordCapture {
+    fn write_record(&self, line: &str) -> std::io::Result<()> {
+        self.0.lock().expect("the capture").push(line.to_string());
+        Ok(())
+    }
+}
+
+/// `request` with `x-yadgar-request-id: id`.
+fn with_request_id<T>(message: T, id: &str) -> Request<T> {
+    let mut req = Request::new(message);
+    req.metadata_mut()
+        .insert("x-yadgar-request-id", id.parse().expect("an ASCII id"));
+    req
+}
+
+/// The one `CallRecord` line `run` emitted.
+async fn the_call_record<F: std::future::Future>(run: F) -> String {
+    let records = RecordCapture::default();
+    {
+        let _sink = yadgar_telemetry::record::set_sink(Arc::new(records.clone()));
+        let _ = run.await;
+    }
+    let lines = records.0.lock().expect("the capture").clone();
+    assert_eq!(lines.len(), 1, "exactly one CallRecord: {lines:?}");
+    lines[0].clone()
+}
+
+/// Whether a `CallRecord` line carries exactly `id` as its `request_id`.
+fn carries(record: &str, id: &str) -> bool {
+    record.contains(&format!(r#""request_id":"{id}""#))
+}
+
+/// **AN OVER-LONG INBOUND ID IS CAPPED ONCE, HERE, AND THE CAPPED VALUE IS
+/// BOTH WHAT `iam` RECORDS AND WHAT IT FORWARDS**, so the wire is bounded and
+/// the two hops' records join.
+///
+/// A header is bounded only by the transport, and `request_id_of` hands its one
+/// `String` to `tel`'s `Scope` and from there to the `CallRecord`. Uncapped, a
+/// caller that is not the gateway puts tens of kilobytes on every record.
+///
+/// **THE FAKE TWIN READS THE HEADER THROUGH `to_str()`, AS `iam-db` DOES**, so
+/// a non-ASCII cut marker would arrive as `""` and red the second assertion.
+/// `iam-db` re-caps what it reads (yadgarhq/iam-db#80), and capping a capped
+/// value changes nothing — the last assertion — so its record carries the
+/// identical string.
+#[tokio::test]
+async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
+    let (iam, recorded, _) = iam_with(FakeDb {
+        resolves_to: Some("yadgar:user:someone".into()),
+        ..Default::default()
+    })
+    .await;
+    let long = "z".repeat(1000);
+    let cut = format!("{}...", "z".repeat(256));
+
+    let record = the_call_record(
+        iam.resolve_credential(with_request_id(ResolveCredentialRequest::default(), &long)),
+    )
+    .await;
+
+    assert!(
+        carries(&record, &cut),
+        "iam's CallRecord carries the id cut to 256 characters plus `...`: {record}"
+    );
+    let forwarded = recorded
+        .lock()
+        .expect("recorded")
+        .resolve_request_ids
+        .clone();
+    assert_eq!(
+        forwarded,
+        vec![Some(cut.clone())],
+        "the twin reads back, through to_str(), the identical capped id"
+    );
+    assert_eq!(
+        super::capped(&cut),
+        cut,
+        "and re-capping it, as the twin does, leaves it unchanged"
+    );
+}
+
+/// A legitimate id — the gateway's UUIDv7 — is neither cut nor marked, on the
+/// record or on the wire.
+#[tokio::test]
+async fn a_gateway_request_id_reaches_the_record_and_the_twin_unchanged() {
+    let (iam, recorded, _) = iam_with(FakeDb {
+        resolves_to: Some("yadgar:user:someone".into()),
+        ..Default::default()
+    })
+    .await;
+    let id = "01a0fdd8-2b87-704e-b0b6-c3b9adada833";
+
+    let record = the_call_record(
+        iam.resolve_credential(with_request_id(ResolveCredentialRequest::default(), id)),
+    )
+    .await;
+
+    assert!(carries(&record, id), "{record}");
+    assert_eq!(
+        recorded.lock().expect("recorded").resolve_request_ids,
+        vec![Some(id.to_string())]
+    );
 }
