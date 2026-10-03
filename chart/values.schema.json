@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "yadgar/iam",
+  "$comment": "Closure is PER CHART (ADR-0850): this file closes the key set this chart owns and nothing upstream or downstream of it. `additionalProperties: false` sits at the root and at every declared block, so a misspelled key anywhere in the tree is refused by name instead of silently dropped or silently accepted. OPEN (no `properties`, no closure): `global`, because helm injects it into every subchart whether the parent sets it or not and this chart never reads it; `resources` and `rollingUpdate`, because the shape they take is the Kubernetes API's and this chart only forwards it through `toYaml`/`with`. EXTRAS (leaves `chart/values.yaml` never states, read straight off the templates): `image.digest`, rewritten at package time by ci-release (D65), read in `templates/deployment.yaml`; `networkPolicy.scrapeFrom.namespace`, read in `templates/networkpolicy.yaml`, with `values.yaml` shipping the parent block `scrapeFrom: {}` empty. Types, toggle shapes and `required` are NOT this file's job (ADR-0847): `render-checks.yaml` owns them, and `autoscaling`/`autoscaling.enabled`'s `kindIs` guards (ledger 1135) are the worked example — a schema `type` on either would refuse the chart's own default render the day the value changed shape, which is why every leaf here is `{}`.",
+  "properties": {
+    "image": {
+      "properties": {
+        "repository": {},
+        "tag": {},
+        "digest": {}
+      },
+      "additionalProperties": false
+    },
+    "replicaCount": {},
+    "resources": {},
+    "tls": {
+      "properties": {
+        "enabled": {},
+        "certSecret": {},
+        "certSecretKey": {},
+        "keySecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "iamDb": {
+      "properties": {
+        "host": {},
+        "port": {},
+        "tls": {
+          "properties": {
+            "enabled": {},
+            "caSecret": {},
+            "caSecretKey": {},
+            "domain": {},
+            "clientCertSecret": {},
+            "clientCertSecretKey": {},
+            "clientKeySecretKey": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "keysSecret": {},
+    "autoscaling": {
+      "properties": {
+        "enabled": {},
+        "kedaOperator": {
+          "properties": {
+            "apiVersion": {}
+          },
+          "additionalProperties": false
+        },
+        "minReplicas": {},
+        "maxReplicas": {},
+        "threshold": {},
+        "prometheusAddress": {}
+      },
+      "additionalProperties": false
+    },
+    "nats": {
+      "properties": {
+        "url": {},
+        "passwordSecret": {},
+        "passwordSecretKey": {},
+        "user": {}
+      },
+      "additionalProperties": false
+    },
+    "login": {
+      "properties": {
+        "responseFloorMs": {}
+      },
+      "additionalProperties": false
+    },
+    "redeemEnrolment": {
+      "properties": {
+        "responseFloorMs": {}
+      },
+      "additionalProperties": false
+    },
+    "enrolment": {
+      "properties": {
+        "enabled": {},
+        "gateway": {},
+        "caSecret": {},
+        "caSecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "preStopSleepSeconds": {},
+    "terminationGracePeriodSeconds": {},
+    "rollingUpdate": {},
+    "topologySpread": {
+      "properties": {
+        "enabled": {},
+        "maxSkew": {},
+        "topologyKey": {},
+        "whenUnsatisfiable": {}
+      },
+      "additionalProperties": false
+    },
+    "networkPolicy": {
+      "properties": {
+        "enabled": {},
+        "clients": {},
+        "scrapeFrom": {
+          "properties": {
+            "namespace": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "global": {}
+  },
+  "additionalProperties": false
+}
