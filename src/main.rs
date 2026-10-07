@@ -328,7 +328,20 @@ async fn serve_and_drain(
 
     let overran = match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
         Drain::Finished(result) => {
-            result?;
+            // `refusal` rather than a bare `?` (ledger 733, ledger 740): a
+            // `tonic::transport::Error` — what the serving task returns when
+            // it never managed to accept at all, LISTEN already held by
+            // another socket being the ordinary way — renders its Display as
+            // the two words `transport error`. `src/serve.rs`'s own `builder`
+            // doc makes the identical point about the same type one call
+            // site over. The chain walk is what puts the reason, one level
+            // down, in front of the operator instead.
+            result.map_err(|e| {
+                format!(
+                    "the gRPC server on LISTEN={addr} stopped with an error: {}",
+                    boot::refusal(&e)
+                )
+            })?;
             false
         }
         // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
