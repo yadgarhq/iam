@@ -24,7 +24,7 @@
 //! same tonic; this file stands for both, and it is here rather than in `task`
 //! because the other surviving statement about the drain budget is here too —
 //! `a_drain_budget_must_outlast_the_slowest_legitimate_call` compares
-//! `DRAIN_BUDGET` against this repository's `DEFAULT_REDEEM_RESPONSE_FLOOR`.
+//! `DRAIN_BUDGET` against this repository's `MEASURED_REDEEM_RESPONSE_FLOOR`.
 //! `gateway/tests/drain.rs` is the axum half.
 //!
 //! **A GAP THIS RIG CANNOT CLOSE, stated rather than implied away.** `main.rs`

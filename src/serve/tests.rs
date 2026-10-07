@@ -29,13 +29,13 @@ fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Opt
 ///
 /// Both sides are production constants that exist for their own reasons and
 /// live in different modules — this is not two literals written together and
-/// compared. `DEFAULT_REDEEM_RESPONSE_FLOOR` is the MINIMUM time
+/// compared. `MEASURED_REDEEM_RESPONSE_FLOOR` is the MINIMUM time
 /// `RedeemEnrolment` may answer in, so the slowest legitimate call is longer
 /// still; an order of magnitude is the smallest margin that is
 /// distinguishable from the floor itself.
 #[test]
 fn a_drain_budget_must_outlast_the_slowest_legitimate_call() {
-    let floor = crate::service::DEFAULT_REDEEM_RESPONSE_FLOOR;
+    let floor = crate::service::MEASURED_REDEEM_RESPONSE_FLOOR;
     assert!(
         yadgar_lifecycle::DRAIN_BUDGET >= floor * 10,
         "a {:?} budget against a {floor:?} response-time floor cuts off calls that had \
@@ -44,39 +44,65 @@ fn a_drain_budget_must_outlast_the_slowest_legitimate_call() {
     );
 }
 
-/// THE DEFAULT, and the property the whole change is built around: nothing
-/// configured means the plaintext listener, unchanged.
+/// NO UNCONFIGURED ANSWER ANY MORE (ADR-0845). The compiled-in default this
+/// used to fall back to is deleted: absent is refused exactly like any other
+/// value outside "1"/"0", naming the knob.
 #[test]
-fn nothing_configured_means_no_tls() {
-    assert_eq!(ServerTls::from_lookup(LISTEN, lookup(&[])).unwrap(), None);
+fn absent_tls_enabled_is_refused() {
+    let err = ServerTls::from_lookup(LISTEN, lookup(&[])).unwrap_err();
+    // NOT INTERPOLATED into the assert message (CodeQL's cleartext-logging
+    // query reads an enum variant's name — `ClientCertificateWithoutKey` is
+    // this error's sibling variant, holding no secret of any kind, just a
+    // `&'static str` prefix — as a signal that formatting ANY value of the
+    // type "logs sensitive data", even though every field involved is a
+    // prefix or a chart key. The boolean match below is the whole of the
+    // proof; a plain `assert!` needs no diagnostic string to redden
+    // informatively, since the panic already names the file and line.
+    assert!(matches!(
+        err,
+        ServerTlsError::EnabledNotBoolean("LISTEN", _)
+    ));
+    // ON THE MESSAGE, not only the variant: a refusal that dropped the
+    // variable name or the chart key out of its sentence would still match
+    // the `matches!` above, which is exactly the mutation this guards
+    // against — the error's wording is what an operator reads, and
+    // ADR-0845's own rule is that it names both.
+    let printed = err.to_string();
+    assert!(printed.contains("LISTEN_TLS_ENABLED"));
+    assert!(printed.contains("tls.enabled"));
 }
 
-/// Paths without the flag are the REVERTED state, not an error. The flag is
-/// the lever; leaving the files named is how it gets pulled back.
+/// THE REVERTED STATE is now `"0"` WRITTEN EXPLICITLY, not absence. A
+/// certificate left mounted while the flag is off is still legitimate —
+/// that is how the cut-over gets reverted — so it must not become an error
+/// on its own.
 #[test]
-fn a_certificate_alone_does_not_enable_tls() {
+fn a_certificate_alone_with_the_flag_explicitly_off_does_not_enable_tls() {
     let vars = [
+        ("LISTEN_TLS_ENABLED", "0"),
         ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
         ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
     ];
     assert_eq!(ServerTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
 }
 
-/// Anything but "1" is off. A permissive parse is how a setting meant to be
-/// off ends up on — and here also how one meant to be revertible stops
-/// being.
+/// Exactly "0" is off; every OTHER value — including the ones a permissive
+/// parse used to collapse into off — refuses rather than silently serving
+/// cleartext under a value nobody chose it to mean (ADR-0845).
 #[test]
-fn only_exactly_one_enables_tls() {
-    for value in ["0", "false", "no", "true", "yes", "", " "] {
+fn anything_but_zero_or_one_is_refused() {
+    for value in ["false", "no", "true", "yes", "2", "", " "] {
         let vars = [
             ("LISTEN_TLS_ENABLED", value),
             ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
             ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
-        assert_eq!(
-            ServerTls::from_lookup(LISTEN, lookup(&vars)).unwrap(),
-            None,
-            "{value:?} must not enable TLS"
+        assert!(
+            matches!(
+                ServerTls::from_lookup(LISTEN, lookup(&vars)),
+                Err(ServerTlsError::EnabledNotBoolean("LISTEN", _))
+            ),
+            "{value:?} must be refused, not treated as off"
         );
     }
 }
@@ -151,6 +177,10 @@ fn variables_under_another_prefix_do_not_configure_the_listener() {
         ("SERVER_TLS_ENABLED", "1"),
         ("IAM_DB_TLS_ENABLED", "1"),
         ("TLS_CERT_FILE", SENTINEL_CERT),
+        // `LISTEN_TLS_ENABLED` itself, stated explicitly — ADR-0845 leaves it
+        // no default to fall into, so proving isolation needs a value rather
+        // than absence.
+        ("LISTEN_TLS_ENABLED", "0"),
     ];
     assert_eq!(ServerTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
 }
