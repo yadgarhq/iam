@@ -79,7 +79,28 @@ exec "$2""#;
 ///
 /// Not under `/etc`, and deliberately so: see the module doc for why
 /// `YADGAR_KEYS_DIR` needs no mount namespace of its own.
-pub fn fresh_keys_dir() -> PathBuf {
+///
+/// Owns its directory and removes it on `Drop`, the same way [`Booted`] owns
+/// and removes its root — a test that returns early, panics, or just ends
+/// must not leave this behind in the system temp dir for every run.
+/// `Deref<Target = Path>` so a `&KeysDir` passes anywhere a `&Path` already
+/// did.
+pub struct KeysDir(PathBuf);
+
+impl std::ops::Deref for KeysDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for KeysDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub fn fresh_keys_dir() -> KeysDir {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "yadgar-iam-exit-chain-keys-{}-{}",
@@ -91,7 +112,7 @@ pub fn fresh_keys_dir() -> PathBuf {
         .expect("the encryption key fixture must be written");
     std::fs::write(dir.join("blind-index.key"), [0x22u8; 32])
         .expect("the blind-index key fixture must be written");
-    dir
+    KeysDir(dir)
 }
 
 /// The environment the chart's `deployment.yaml` renders for a cleartext

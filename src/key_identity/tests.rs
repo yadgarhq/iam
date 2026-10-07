@@ -303,7 +303,8 @@ async fn a_wrong_key_ends_the_serve_and_exits_non_zero() {
     .await;
     assert!(matches!(ended, Ended::KeyIdentityRefused(_)));
 
-    // AND THE PROCESS EXITS NON-ZERO: `main` returns this `Err`, which is exit 1.
+    // AND THE PROCESS EXITS NON-ZERO: `run` returns this `Err` and `main` exits
+    // `ExitCode::FAILURE` (1).
     assert!(
         ended.into_exit(false).is_err(),
         "a mismatch must not end the process successfully"

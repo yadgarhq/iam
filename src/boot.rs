@@ -279,8 +279,7 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
         // the chain walk. `BalanceError`'s other messages are already complete
         // paragraphs explaining that an empty bundle trusts nobody and that a
         // missing one is not a reason to connect in cleartext — `Tls` is not
-        // one of them, and Debug would print the struct and throw all of that
-        // away regardless.
+        // one of them.
         .map_err(|e| refusal(&e))?;
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),

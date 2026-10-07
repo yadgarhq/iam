@@ -100,3 +100,38 @@ fn an_unparsable_listen_names_the_variable() {
         "the operator got the Debug of the parse error: {line}"
     );
 }
+
+/// `METRICS_LISTEN` is parsed in `boot::metrics`, after the shared document is
+/// read, so this also needs the document mounted.
+#[test]
+fn an_unparsable_metrics_listen_names_the_variable() {
+    let keys_dir = fresh_keys_dir();
+    let mut vars = cleartext_env(&keys_dir);
+    vars.retain(|(k, _)| *k != "METRICS_LISTEN");
+    vars.push(("METRICS_LISTEN", "notanaddr".to_string()));
+    let (status, stderr) = run_to_exit(&vars);
+    let line = refusal_line(status, &stderr);
+    assert!(
+        line.contains("METRICS_LISTEN is not a host:port address"),
+        "the refusal must name the variable: {line}"
+    );
+}
+
+/// Both response floors are parsed in `boot::response_floors`, later still —
+/// after the mounted document, the dial and the broker credential decision —
+/// so each needs the document mounted too.
+#[test]
+fn an_unparsable_response_floor_names_the_variable() {
+    for key in ["LOGIN_RESPONSE_FLOOR_MS", "REDEEM_RESPONSE_FLOOR_MS"] {
+        let keys_dir = fresh_keys_dir();
+        let mut vars = cleartext_env(&keys_dir);
+        vars.retain(|(k, _)| *k != key);
+        vars.push((key, "soon".to_string()));
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(&format!("{key} is not a number of milliseconds")),
+            "the refusal must name the variable: {line}"
+        );
+    }
+}

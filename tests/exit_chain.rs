@@ -144,10 +144,10 @@ fn a_rewritten_shared_document_drains_and_exits_zero() {
 /// `drain_within` only CHECKS the serving task once its own `stop` resolves.**
 /// A boot held on an occupied port therefore sits until something ends `stop`;
 /// SIGTERM is what a real rollout sends, and it is what this case sends too.
-/// By the time it arrives the spawned task has long since failed to bind, so
-/// `drain_within` reaps the already-finished `Err` at once, well inside the
-/// budget — `result?` fires before `ended_rx` is ever read, so SIGTERM itself
-/// decides nothing about the exit code here.
+/// Whether SIGTERM arrives before or after the spawned task's bind fails,
+/// tonic binds before it polls shutdown, so `drain_within` always reaps
+/// `Finished(Err)` — `result?` fires before `ended_rx` is ever read, so
+/// SIGTERM itself decides nothing about the exit code here.
 #[test]
 fn a_bound_listen_port_is_printed_as_its_sentence() {
     let keys_dir = fresh_keys_dir();
@@ -184,5 +184,11 @@ fn a_bound_listen_port_is_printed_as_its_sentence() {
     assert!(
         line.contains(&addr.to_string()),
         "the sentence must name the address that could not be bound: {line}"
+    );
+    // The CAUSE, one level below tonic's `transport error`: only the chain
+    // walk reaches it, so this is the assertion that holds `boot::refusal`.
+    assert!(
+        line.contains("already in use"),
+        "the sentence must carry the bind failure's cause, not stop at `transport error`: {line}"
     );
 }
