@@ -96,8 +96,36 @@ use yadgar_iam::rotate;
 use yadgar_iam::serve;
 use yadgar_iam::service::Iam;
 
+/// The process entry point: run the service, and print a refusal as its
+/// SENTENCE.
+///
+/// **NOT `main() -> Result`** (ledger 1258). Rust prints a `main` that
+/// returns `Err` with DEBUG, so a bare `?` on a typed error — `Keys::from_env`
+/// is the first one `run` can reach — arrived as its variant name,
+/// `Unconfigured`, and a refusal already converted to its sentence arrived as
+/// a quoted, escaped string: `Error: "LISTEN is not a host:port address: …"`.
+/// ADR-0569 asks a refusal to name the knob and where it is set; an operator
+/// reading a crash loop must get that as plain text. `tests/boot_message.rs`
+/// runs the binary and holds it.
+///
+/// The exit status is unchanged: an `Err` from `main` exited 1, and so does
+/// `ExitCode::FAILURE`. A drain — after a signal or a rotation — still
+/// returns `Ok(())` and exits 0, which `tests/exit_chain.rs` holds (ledger
+/// 748). A key-identity `Mismatch` (ADR-0764) is the one path that exits
+/// non-zero without the boot itself having refused anything; `into_exit` is
+/// where that verdict is decided, and nothing here changes it.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     boot::logging();
 
     let (listen_tls, server) = boot::listener()?;
@@ -163,8 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be four builder calls
     // scattered across this function, up to a hundred and fifty lines apart,
-    // where nothing could reach them: no test spawns this binary, so deleting any
-    // one of them compiled and passed everything. The list lives in
+    // where nothing could reach them: no test spawned this binary then, so
+    // deleting any one of them compiled and passed everything. The list lives in
     // `rotate::watch_set` now and `tests/assembly.rs` calls it.
     let watch_inputs = rotate::watch_set(
         listen_tls.as_ref(),
@@ -188,7 +216,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let floors = boot::response_floors()?;
 
-    let addr: SocketAddr = boot::env_required("LISTEN")?.parse()?;
+    let addr: SocketAddr = boot::env_required("LISTEN")?
+        .parse()
+        .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
 
     // THE CHECK RUNS AFTER BOOT, and the channel it uses is the SAME lazy one
     // every RPC uses — a clone, not a second dial.
@@ -298,7 +328,20 @@ async fn serve_and_drain(
 
     let overran = match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
         Drain::Finished(result) => {
-            result?;
+            // `refusal` rather than a bare `?` (ledger 733, ledger 740): a
+            // `tonic::transport::Error` — what the serving task returns when
+            // it never managed to accept at all, LISTEN already held by
+            // another socket being the ordinary way — renders its Display as
+            // the two words `transport error`. `src/serve.rs`'s own `builder`
+            // doc makes the identical point about the same type one call
+            // site over. The chain walk is what puts the reason, one level
+            // down, in front of the operator instead.
+            result.map_err(|e| {
+                format!(
+                    "the gRPC server on LISTEN={addr} stopped with an error: {}",
+                    boot::refusal(&e)
+                )
+            })?;
             false
         }
         // EXIT 0 ANYWAY. The restart is the point; a drain that overran is worth
@@ -320,9 +363,10 @@ async fn serve_and_drain(
     // time `drain_within` returns, so the verdict is always there; a lost
     // channel is an ordinary stop rather than an invented refusal.
     //
-    // `.to_string()` for the reason `boot` gives five times over: `Box<dyn
-    // Error>` prints with DEBUG, and this message is a paragraph an operator has
-    // to act on.
+    // `.to_string()` for the reason `boot` gives five times over: it dates
+    // from when `main` returned `Result` and Rust printed a bare `?` here with
+    // Debug. `main` prints Display now (ledger 1258), so this stays as the
+    // paragraph an operator has to act on.
     ended_rx
         .await
         .unwrap_or(key_identity::Ended::Ordinary)

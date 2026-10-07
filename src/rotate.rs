@@ -91,8 +91,8 @@
 //!
 //! It used to be FOUR builder calls scattered across `main.rs` — one beside each
 //! piece of boot that read a file, up to a hundred and fifty lines apart. No test
-//! in this repository spawns the binary, so deleting any one of them compiled,
-//! passed the whole suite, and shipped a process that would never notice that
+//! in this repository spawned the binary then, so deleting any one of them
+//! compiled, passed the whole suite, and shipped a process that would never notice that
 //! file rotating. `tests/tls_rotation.rs` could not catch it either: it rebuilt
 //! the same assembly by hand through the same four methods, so `main.rs` and the
 //! test could disagree while both stayed green — and a builder that quietly added
