@@ -9,7 +9,8 @@ the defect this schema closes.
 
 CLOSURE IS PER CHART. This file declares and closes only what THIS chart owns:
 every block in `chart/values.yaml`, plus `global` (which helm injects into every
-subchart and this chart never reads) and the two EXTRAS templates read that
+subchart; this chart reads only `global.hostname`, in `templates/_hostname.tpl`)
+and the two EXTRAS templates read that
 `values.yaml` does not state. It says nothing about any other chart's key set —
 ADR-0850 is explicit that closure is local.
 
