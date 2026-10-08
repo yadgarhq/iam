@@ -31,38 +31,63 @@ fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Opt
     }
 }
 
-/// THE DEFAULT, and the property the whole change is built around: nothing
-/// configured means the cleartext path, unchanged.
+/// NO UNCONFIGURED ANSWER ANY MORE (ADR-0845). The compiled-in default this
+/// used to fall back to is deleted: absent is refused exactly like any other
+/// value outside "1"/"0", naming the knob.
 #[test]
-fn nothing_configured_means_no_tls() {
-    assert_eq!(UpstreamTls::from_lookup(IAM_DB, lookup(&[])).unwrap(), None);
+fn absent_tls_enabled_is_refused() {
+    let err = UpstreamTls::from_lookup(IAM_DB, lookup(&[])).unwrap_err();
+    // NOT INTERPOLATED into the assert message (CodeQL's cleartext-logging
+    // query reads an enum variant's name — `ClientCertificateWithoutKey` and
+    // `ClientKeyWithoutCertificate` are this error's sibling variants,
+    // holding no secret of any kind, just a `&'static str` prefix — as a
+    // signal that formatting ANY value of the type "logs sensitive data",
+    // even though every field involved is a prefix or a chart key. The
+    // boolean match below is the whole of the proof; a plain `assert!`
+    // needs no diagnostic string to redden informatively, since the panic
+    // already names the file and line.
+    assert!(matches!(err, TlsConfigError::EnabledNotBoolean(IAM_DB, _)));
+    // ON THE MESSAGE, not only the variant: a refusal that dropped the
+    // variable name or the chart key out of its sentence would still match
+    // the `matches!` above, which is exactly the mutation this guards
+    // against — the error's wording is what an operator reads, and
+    // ADR-0845's own rule is that it names both.
+    let printed = err.to_string();
+    assert!(printed.contains("IAM_DB_TLS_ENABLED"));
+    assert!(printed.contains("iamDb.tls.enabled"));
 }
 
-/// A bundle without the flag is the REVERTED state, not an error. The flag
-/// is the lever; leaving the path in place is how it gets pulled back.
+/// THE REVERTED STATE is now `"0"` WRITTEN EXPLICITLY, not absence. A bundle
+/// left mounted while the flag is off is still legitimate — that is how the
+/// cut-over gets reverted — so it must not become an error on its own.
 #[test]
-fn a_ca_bundle_alone_does_not_enable_tls() {
-    let vars = [("IAM_DB_TLS_CA_FILE", SENTINEL_CA)];
+fn a_ca_bundle_alone_with_the_flag_explicitly_off_does_not_enable_tls() {
+    let vars = [
+        ("IAM_DB_TLS_ENABLED", "0"),
+        ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
+    ];
     assert_eq!(
         UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
         None
     );
 }
 
-/// Anything but "1" is off. A permissive parse is how a setting meant to be
-/// off ends up on — and here also how one meant to be revertible stops
-/// being.
+/// Exactly "0" is off; every OTHER value — including the ones a permissive
+/// parse used to collapse into off — refuses rather than silently dialling
+/// cleartext under a value nobody chose it to mean (ADR-0845).
 #[test]
-fn only_exactly_one_enables_tls() {
-    for value in ["0", "false", "no", "true", "yes", "", " "] {
+fn anything_but_zero_or_one_is_refused() {
+    for value in ["false", "no", "true", "yes", "2", "", " "] {
         let vars = [
             ("IAM_DB_TLS_ENABLED", value),
             ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
         ];
-        assert_eq!(
-            UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
-            None,
-            "{value:?} must not enable TLS"
+        assert!(
+            matches!(
+                UpstreamTls::from_lookup(IAM_DB, lookup(&vars)),
+                Err(TlsConfigError::EnabledNotBoolean(IAM_DB, _))
+            ),
+            "{value:?} must be refused, not treated as off"
         );
     }
 }
@@ -209,6 +234,10 @@ fn another_upstreams_variables_do_not_configure_this_one() {
         ("IAM_TLS_ENABLED", "1"),
         ("IAM_TLS_CA_FILE", SENTINEL_CA),
         ("TLS_ENABLED", "1"),
+        // `IAM_DB_TLS_ENABLED` stated explicitly, off — ADR-0845 leaves it no
+        // default to fall into, so proving isolation needs a value rather
+        // than absence.
+        ("IAM_DB_TLS_ENABLED", "0"),
     ];
     assert_eq!(
         UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
@@ -304,12 +333,53 @@ fn an_empty_client_path_is_the_same_as_an_unset_one() {
 #[test]
 fn a_client_certificate_alone_does_not_enable_tls() {
     let vars = [
+        ("IAM_DB_TLS_ENABLED", "0"),
         ("IAM_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
         ("IAM_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
     ];
     assert_eq!(
         UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
         None
+    );
+}
+
+/// THE PRESENTATION WIRING (audit B S-3, ADR-0845 sweep): the hop from
+/// environment to `yadgar_dial::TlsOptions`, one layer past `UpstreamTls`'s
+/// own fields. Everything above proves the struct holds the client
+/// certificate; this proves [`UpstreamTls::options`] actually forwards it
+/// into the identity `connect_tls` builds from, rather than stopping short.
+///
+/// `TlsOptions` publishes no getter for its identity, so this reads its
+/// derived `Debug` string — `identity: None` or `identity: Some(..)` — at the
+/// pinned `dial` tag. A field rename would still read as `None`/`Some`, which
+/// is the property under test rather than the field's name.
+#[test]
+fn the_client_identity_reaches_tlsoptions_when_the_env_sets_it() {
+    let base = [
+        ("IAM_DB_TLS_ENABLED", "1"),
+        ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
+    ];
+
+    let without = UpstreamTls::from_lookup(IAM_DB, lookup(&base))
+        .unwrap()
+        .expect("a flag and a bundle enable TLS");
+    assert!(
+        format!("{:?}", without.options()).contains("identity: None"),
+        "no client certificate configured must leave TlsOptions with no identity"
+    );
+
+    let with_client = [
+        base[0],
+        base[1],
+        ("IAM_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+        ("IAM_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+    ];
+    let with = UpstreamTls::from_lookup(IAM_DB, lookup(&with_client))
+        .unwrap()
+        .expect("a flag and a bundle enable TLS");
+    assert!(
+        format!("{:?}", with.options()).contains("identity: Some"),
+        "a client certificate and key configured must reach TlsOptions as an identity"
     );
 }
 

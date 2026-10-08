@@ -108,3 +108,84 @@ block.
       "operator" "KEDA"
       "toggle" "autoscaling.enabled") }}
 {{- end }}
+
+{{/*
+ADR-0845's K-1 GUARD: `tls.enabled` RENDERS `LISTEN_TLS_ENABLED` UNCONDITIONALLY,
+AND `iamDb.tls.enabled` RENDERS `IAM_DB_TLS_ENABLED` THE SAME WAY (C-SVb).
+`templates/deployment.yaml` used to gate each env on bare truthiness — which
+rendered no variable at all for null or absence — and now renders
+`ternary "1" "0" <key>` unconditionally instead. `ternary` on a non-bool is a
+Go type error naming no key at all (measured on helm 4.3.0; re-measured on
+3.18.4 — same shape), so the guard below has to run BEFORE that expression
+does, in the SAME file this chart already keeps every shape refusal in.
+
+THE SCHEMA PRE-EMPTS THE ABSENT CASE (`tls.required: [enabled]` plus
+`tls.enabled.type: boolean`, and the same for `iamDb.tls`) and K-1 accepts
+that: `required` alone passes a null value, which is exactly what
+`tls: {enabled: null}` and `tls: null` are — Helm deletes a null-valued key
+that a chart in the tree declares and restores no default, so `enabled` or
+the whole block reaches THIS guard as ABSENT rather than failing the schema.
+`tls: {enabled: "true"}` is a third shape the schema's `type: boolean`
+already refuses on its own — kept here as a render case too only because
+K-1 names it explicitly; the schema is what actually stops it reaching
+`ternary`.
+
+ONE SENTENCE PER KEY, NOT PER ARM, because K-1 states the guard this way and
+the three non-absent shapes (block non-map, `enabled` absent, `enabled`
+non-bool) all mean the same thing to an operator: the leaf is not a bare
+`true`/`false`. The sentence names BOTH the chart key and the variable it
+renders, which is ADR-0845's own rule for a binary refusal, carried into the
+chart's.
+*/}}
+{{- if not (and (kindIs "map" .Values.tls) (hasKey .Values.tls "enabled") (kindIs "bool" .Values.tls.enabled)) }}
+{{- fail "iam: tls.enabled must be set to true or false; it renders LISTEN_TLS_ENABLED (ADR-0845, ADR-0797)" }}
+{{- end }}
+{{- if not (and (kindIs "map" .Values.iamDb) (kindIs "map" .Values.iamDb.tls) (hasKey .Values.iamDb.tls "enabled") (kindIs "bool" .Values.iamDb.tls.enabled)) }}
+{{- fail "iam: iamDb.tls.enabled must be set to true or false; it renders IAM_DB_TLS_ENABLED (ADR-0845, ADR-0797)" }}
+{{- end }}
+
+{{/*
+B-U5E, FOLDED INTO C-SVb (K-8 STEP 1, K-3): THE EXPAND HALF OF
+`tls.clientAuth`. The schema declares `tls.clientAuth`, `tls.clientCaSecret`
+and `tls.clientCaSecretKey` (this PR); `templates/deployment.yaml` renders
+`LISTEN_TLS_CLIENT_AUTH`, `LISTEN_TLS_CLIENT_CA_FILE` and the `ca.crt` item
+only when `tls.enabled` is true AND `tls.clientAuth` is PRESENT (coordinator
+ruling 2026-10-07); the binary reads none of it yet — B-U5 is the contract
+that adopts `LISTEN_TLS_CLIENT_AUTH` and enforces the mode.
+
+VALIDATED ONLY WHEN PRESENT, deliberately asymmetric with the `tls.enabled`
+guard above: an ABSENT `tls.clientAuth` must render exactly as origin/main
+(render-neutral is the whole of what an expand promises, K-8), so this block
+does nothing at all until a values file writes the key.
+
+`kindIs "string"` GUARDS BEFORE ANY `eq`/`has`, and that order is load-bearing
+(coordinator ruling): YAML 1.1 reads a bare `off` as the boolean `false`, so
+an adopter who forgets to quote it would otherwise reach `eq`/`has` holding a
+bool rather than the string this chart asks for — refused by name here
+instead.
+
+`off` IS THE ONLY VALUE THIS CHART VERSION ACCEPTS, once written. `optional`
+and `required` are real values B-U5's contract will serve, and refusing them
+HERE — rather than silently rendering them — is what keeps a values file from
+looking enforced during the window the binary does not read it (K-8's own
+phrase). The sentence names the unit that lifts the refusal, so an operator
+who hits it mid-rollout knows it is not a defect.
+*/}}
+{{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+{{- if not (kindIs "string" .Values.tls.clientAuth) }}
+{{- fail (printf (join "" (list
+      "iam: tls.clientAuth must be a quoted string (\"off\", \"optional\" or \"required\") "
+      "and is %s (%s). YAML reads a bare off as false: write `clientAuth: \"off\"`."))
+      (kindOf .Values.tls.clientAuth) (toJson .Values.tls.clientAuth)) }}
+{{- end }}
+{{- if not (has .Values.tls.clientAuth (list "off" "optional" "required")) }}
+{{- fail (printf "iam: tls.clientAuth is %q, which is not off, optional or required." .Values.tls.clientAuth) }}
+{{- end }}
+{{- if ne .Values.tls.clientAuth "off" }}
+{{- fail (printf (join "" (list
+      "iam: tls.clientAuth is %q; this chart version renders the key but the binary does "
+      "not enforce mutual TLS yet (B-U5E, folded into C-SVb; B-U5 lands the contract). Write "
+      "`tls.clientAuth: \"off\"`, or omit the key, until then."))
+      .Values.tls.clientAuth) }}
+{{- end }}
+{{- end }}

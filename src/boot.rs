@@ -58,8 +58,8 @@ pub fn nats_credentials(
     // a variable with no value must not be a different configuration from one
     // that omits it, so both collapse to the empty string here and every arm
     // below tests emptiness rather than presence.
-    let user = env(USER_KEY).unwrap_or_default();
-    let path = env(PASSWORD_FILE_KEY).unwrap_or_default();
+    let user = env(USER_KEY).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): NEITHER user nor password is how a deployment says the broker asks for none (965 census, orphan).
+    let path = env(PASSWORD_FILE_KEY).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): absence here is the same deployment as an empty value — the broker asking for no authentication (965 census, orphan).
 
     if path.is_empty() {
         return match user.is_empty() {
@@ -220,7 +220,7 @@ pub fn logging() {
         // A service nobody can observe is one D67 cannot measure either.
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")), // ADR-0569-EXCEPTION(LIB): the log level is observability, not behaviour (965 census row B8).
         )
         .init();
 }
@@ -260,10 +260,11 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
         .parse()
         .map_err(|e| format!("IAM_DB_PORT is not a port number: {e}"))?;
 
-    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
-    // the cleartext dial this service has always done. `iam-db` can now serve
-    // TLS, also opt-in and also off, so the cut-over is a later change that
-    // turns both ends on together and can be reverted on its own.
+    // NO COMPILED-IN DEFAULT (ADR-0845). `IAM_DB_TLS_ENABLED` must be exactly
+    // "1" or "0"; absent, empty or any other value refuses the boot rather
+    // than guessing cleartext. `iam-db` can now serve TLS, under the same
+    // contract, so the cut-over is a later change that turns both ends on
+    // together and can be reverted on its own by writing "0".
     //
     // `.to_string()` on the way out. It dates from when `main` returned
     // `Result` and Rust printed a bare `?` here with Debug, as
@@ -380,7 +381,7 @@ pub fn response_floors() -> Result<ResponseFloors, Box<dyn std::error::Error>> {
     // back to. Substituting one silently would leave an operator who believes
     // they raised the floor running the old one, and a security control nobody
     // can tell is misconfigured is the failure this floor's own warning exists
-    // to prevent. `service::DEFAULT_LOGIN_RESPONSE_FLOOR` survives as the
+    // to prevent. `service::MEASURED_LOGIN_RESPONSE_FLOOR` survives as the
     // MEASUREMENT the chart's value was calibrated from — documentation, read by
     // no knob path.
     let login_response_floor = Duration::from_millis(

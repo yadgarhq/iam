@@ -49,7 +49,17 @@ def helm(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def template(chart: Path, *arguments: str) -> str:
-    result = helm("template", "iam", str(chart), *arguments)
+    # `-f <chart>/ci/values.yaml` FIRST, ALWAYS, WHEN THE FILE EXISTS
+    # (ADR-0845, C-SVb): `tls.enabled` and `iamDb.tls.enabled` carry no
+    # default any more, so every bare render in this file needs the
+    # baseline this chart's own `ci/values.yaml` states — read relative to
+    # WHICHEVER `chart` directory is passed in, because `chart_with` below
+    # renders a mutated COPY of the chart under a temp path. First, not
+    # last, so a case-specific `--values`/`--set` in `*arguments` still
+    # wins on any key the two happen to share.
+    ci_values = chart / "ci" / "values.yaml"
+    override = ("-f", str(ci_values)) if ci_values.is_file() else ()
+    result = helm("template", "iam", str(chart), *override, *arguments)
     assert result.returncode == 0, result.stderr
     return result.stdout
 
@@ -195,7 +205,15 @@ def test_d_enabled_true_is_the_default_render(tmp_path):
 
 
 def test_d_a_non_boolean_enabled_is_refused():
-    result = helm("template", "iam", str(CHART), "--set-string", "enrolment.enabled=false")
+    result = helm(
+        "template",
+        "iam",
+        str(CHART),
+        "-f",
+        str(CHART / "ci" / "values.yaml"),
+        "--set-string",
+        "enrolment.enabled=false",
+    )
     assert result.returncode != 0
     assert "enrolment.enabled" in result.stderr
 

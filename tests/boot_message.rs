@@ -49,12 +49,17 @@ fn refusal_without_mounts(vars: &[(&str, String)]) -> String {
 }
 
 /// A TYPED error: `KeyError::Unconfigured`, reached by a bare `?` — `run`'s
-/// FIRST typed refusal, and reached before `boot::listener` needs any file
-/// since TLS is unconfigured. Debug of the error would print `Unconfigured`,
-/// the bare variant name with nothing an operator can act on.
+/// first typed refusal once `boot::listener` is past. Debug of the error
+/// would print `Unconfigured`, the bare variant name with nothing an
+/// operator can act on.
+///
+/// `LISTEN_TLS_ENABLED` IS STATED EXPLICITLY, "0" (ADR-0845): `boot::listener`
+/// runs BEFORE the keys are read and now refuses an absent value rather than
+/// treating it as cleartext, so an empty environment would stop at that
+/// refusal before ever reaching the one this test is about.
 #[test]
 fn a_typed_refusal_is_printed_as_its_sentence() {
-    let line = refusal_without_mounts(&[]);
+    let line = refusal_without_mounts(&[("LISTEN_TLS_ENABLED", "0".to_string())]);
     assert!(
         line.contains("YADGAR_KEYS_DIR is not set"),
         "the refusal must name the variable: {line}"

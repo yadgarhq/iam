@@ -54,7 +54,15 @@ mod validate;
 /// every call metric, rather than on a second spelling of the same name.
 pub const SERVICE: &str = "iam";
 
-/// The default response-time floor for [`IamService::login`].
+/// The measured response-time floor for [`IamService::login`].
+///
+/// **NOT A FALLBACK, AND THE OLD `DEFAULT_` NAME SAID IT WAS ONE (965 census,
+/// ADR-0569).** `LOGIN_RESPONSE_FLOOR_MS` carries no compiled-in default to
+/// fall back to — `boot::response_floors` reads it with `env_required` and
+/// refuses the boot when it is absent — so this constant has no runtime
+/// reader at all. Its only reader is `serve/tests.rs`'s
+/// `a_drain_budget_must_outlast_the_slowest_legitimate_call`; it survives as
+/// the MEASUREMENT the chart's shipped value was calibrated from.
 ///
 /// A FLOOR, NOT A TARGET. It is the shortest time `Login` is allowed to answer
 /// in, not the time it is expected to take: a call that already costs more than
@@ -72,9 +80,13 @@ pub const SERVICE: &str = "iam";
 /// Re-measure on the deployment target and raise `LOGIN_RESPONSE_FLOOR_MS` if
 /// the slowest legitimate login there approaches this. `Login` says so itself
 /// when it happens — see `Iam::hold_until_floor`.
-pub const DEFAULT_LOGIN_RESPONSE_FLOOR: Duration = Duration::from_millis(250);
+pub const MEASURED_LOGIN_RESPONSE_FLOOR: Duration = Duration::from_millis(250);
 
-/// The default response-time floor for [`IamService::redeem_enrolment`].
+/// The measured response-time floor for [`IamService::redeem_enrolment`].
+///
+/// **NOT A FALLBACK, for the same reason as [`MEASURED_LOGIN_RESPONSE_FLOOR`]:**
+/// `REDEEM_RESPONSE_FLOOR_MS` carries no compiled-in default either, and this
+/// constant is read only as the measurement behind the chart's shipped value.
 ///
 /// **ITS OWN VALUE, AND NOT `Login`'s, BECAUSE IT DOES MORE WORK.** A redemption
 /// pays TWO Argon2id operations against `Login`'s one — it HASHES the chosen
@@ -86,12 +98,12 @@ pub const DEFAULT_LOGIN_RESPONSE_FLOOR: Duration = Duration::from_millis(250);
 /// on nothing, and it would drown the `Login` warning that means something.
 ///
 /// 750ms IS 250ms SIZED TO THAT WORK — twice the Argon2 and a further round trip
-/// — and it inherits [`DEFAULT_LOGIN_RESPONSE_FLOOR`]'s caveat unchanged: the
+/// — and it inherits [`MEASURED_LOGIN_RESPONSE_FLOOR`]'s caveat unchanged: the
 /// measurement behind it is DEV HARDWARE, so re-measure on the deployment target
 /// and raise `REDEEM_RESPONSE_FLOOR_MS` if the slowest legitimate redemption
 /// there approaches it. A FLOOR SET BELOW THE SLOWEST LEGITIMATE CALL DOES NOT
 /// CLOSE THE ORACLE, IT CLIPS IT.
-pub const DEFAULT_REDEEM_RESPONSE_FLOOR: Duration = Duration::from_millis(750);
+pub const MEASURED_REDEEM_RESPONSE_FLOOR: Duration = Duration::from_millis(750);
 
 /// One RPC's floor, with the two names an operator needs the moment it is
 /// exceeded.
@@ -255,7 +267,7 @@ impl EnrolmentConfig {
         // The marker sits on the READ ITSELF, so `git grep ADR-0569-EXCEPTION`
         // lands on the line that takes the fallback rather than on prose near it.
         let gateway = std::env::var(GATEWAY_ENV).unwrap_or_default(); // ADR-0569-EXCEPTION
-        let ca_path = std::env::var(CA_PEM_ENV).ok();
+        let ca_path = std::env::var(CA_PEM_ENV).ok(); // ADR-0569-EXCEPTION(ABS): absent means this deployment uses a publicly-trusted certificate and system trust applies (965 census row B3); see EmptyCa above for why absent and empty are different instructions.
         Self::load(&gateway, ca_path.as_deref())
     }
 }
@@ -264,9 +276,9 @@ pub struct Iam {
     keys: Keys,
     channel: tonic::transport::Channel,
     invalidator: Invalidator,
-    /// See [`DEFAULT_LOGIN_RESPONSE_FLOOR`] and `Iam::hold_until_floor`.
+    /// See [`MEASURED_LOGIN_RESPONSE_FLOOR`] and `Iam::hold_until_floor`.
     login_floor: Floor,
-    /// See [`DEFAULT_REDEEM_RESPONSE_FLOOR`].
+    /// See [`MEASURED_REDEEM_RESPONSE_FLOOR`].
     redeem_floor: Floor,
     /// `None` when this deployment has not configured enrolment. ONE RPC IS
     /// THEN UNAVAILABLE AND THE REST OF THE SERVICE IS NOT — see

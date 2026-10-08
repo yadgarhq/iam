@@ -209,7 +209,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     watch_inputs.export_not_after();
 
     let invalidator = yadgar_iam::invalidate::Invalidator::connect(
-        std::env::var("NATS_URL").ok().as_deref(),
+        std::env::var("NATS_URL").ok().as_deref(), // ADR-0569-EXCEPTION(ABS): absence means invalidation publishing is off (965 census row B2); `Invalidator::connect` warns and keeps serving.
         nats_credentials,
     )
     .await;
