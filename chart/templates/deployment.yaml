@@ -305,6 +305,14 @@ spec:
             # backstop for exactly that window.
             - name: NATS_URL
               value: {{ .Values.nats.url | quote }}
+            {{- if and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") }}
+            # B-N3E: RENDERED ONLY WHEN `nats.tls.enabled` IS STATED, and only
+            # ever as "0" — `templates/render-checks.yaml` refuses `true` until
+            # B-N3. This binary does not read the variable yet; it is on the
+            # wire so the stated value is visible in the manifest.
+            - name: NATS_TLS_ENABLED
+              value: {{ ternary "1" "0" .Values.nats.tls.enabled | quote }}
+            {{- end }}
             {{- if .Values.nats.passwordSecret }}
             # RENDERED ONLY WHEN THE BROKER ASKS FOR A CREDENTIAL, so a
             # deployment that has not cut over sends the binary nothing at all

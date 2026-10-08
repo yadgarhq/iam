@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "yadgar/iam",
-  "$comment": "Closure is PER CHART (ADR-0850): this file closes the key set this chart owns and nothing upstream or downstream of it. `additionalProperties: false` sits at the root and at every declared block, so a misspelled key anywhere in the tree is refused by name instead of silently dropped or silently accepted. OPEN (no `properties`, no closure): `global`, because helm injects it into every subchart and the parent owns its closure; this chart reads only `global.hostname`, through `templates/_hostname.tpl` (`.context.Values.global`, ADR-0808); `resources` and `rollingUpdate`, because the shape they take is the Kubernetes API's and this chart only forwards it through `toYaml`/`with`. EXTRAS (leaves `chart/values.yaml` never states, read straight off the templates): `image.digest`, rewritten at package time by ci-release (D65), read in `templates/deployment.yaml`; `networkPolicy.scrapeFrom.namespace`, read in `templates/networkpolicy.yaml`, with `values.yaml` shipping the parent block `scrapeFrom: {}` empty; `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey` (B-U5E expand, folded into C-SVb: `templates/deployment.yaml` renders them only when present and the binary reads none of them yet — B-U5 is what requires them and types `clientAuth`). Types, toggle shapes and `required` are NOT this file's job (ADR-0847): `render-checks.yaml` owns them, and `autoscaling`/`autoscaling.enabled`'s `kindIs` guards (ledger 1135) are the worked example — a schema `type` on either would refuse the chart's own default render the day the value changed shape, which is why every leaf here is `{}`. Two exceptions. `tls.enabled` and `iamDb.tls.enabled` (ADR-0845, C-SVb) keep `type: boolean` and their parent blocks keep `required: [enabled]`: `required` alone passes a null value through, so the leaf needs its type too (K-1) — `templates/render-checks.yaml` still carries the `hasKey`/`kindIs` guard that produces ADR-0845's own named sentence, because a schema refusal and a render-check refusal report differently and both are asserted.",
+  "$comment": "Closure is PER CHART (ADR-0850): this file closes the key set this chart owns and nothing upstream or downstream of it. `additionalProperties: false` sits at the root and at every declared block, so a misspelled key anywhere in the tree is refused by name instead of silently dropped or silently accepted. OPEN (no `properties`, no closure): `global`, because helm injects it into every subchart and the parent owns its closure; this chart reads only `global.hostname`, through `templates/_hostname.tpl` (`.context.Values.global`, ADR-0808); `resources` and `rollingUpdate`, because the shape they take is the Kubernetes API's and this chart only forwards it through `toYaml`/`with`. EXTRAS (leaves `chart/values.yaml` never states, read straight off the templates): `image.digest`, rewritten at package time by ci-release (D65), read in `templates/deployment.yaml`; `networkPolicy.scrapeFrom.namespace`, read in `templates/networkpolicy.yaml`, with `values.yaml` shipping the parent block `scrapeFrom: {}` empty; `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey` (B-U5E expand, folded into C-SVb: `templates/deployment.yaml` renders them only when present and the binary reads none of them yet — B-U5 is what requires them and types `clientAuth`); `nats.tls.enabled` (B-N3E, the K-8 expand for the broker hop, ADR-0852: `templates/deployment.yaml` renders `NATS_TLS_ENABLED` only when it is present, `templates/render-checks.yaml` refuses `true`, and the binary does not read it until B-N3 makes it required). Types, toggle shapes and `required` are NOT this file's job (ADR-0847): `render-checks.yaml` owns them, and `autoscaling`/`autoscaling.enabled`'s `kindIs` guards (ledger 1135) are the worked example — a schema `type` on either would refuse the chart's own default render the day the value changed shape, which is why every leaf here is `{}`. Three exceptions. `nats.tls` and `nats.tls.enabled` (B-N3E) carry `type: object` and `type: boolean` with NO `required`, the shape gateway#104 ruled for both repos: a null, a quoted string or a non-map is refused by the schema, and the key stays optional until B-N3. `tls.enabled` and `iamDb.tls.enabled` (ADR-0845, C-SVb) keep `type: boolean` and their parent blocks keep `required: [enabled]`: `required` alone passes a null value through, so the leaf needs its type too (K-1) — `templates/render-checks.yaml` still carries the `hasKey`/`kindIs` guard that produces ADR-0845's own named sentence, because a schema refusal and a render-check refusal report differently and both are asserted.",
   "properties": {
     "image": {
       "properties": {
@@ -72,7 +72,16 @@
         "url": {},
         "passwordSecret": {},
         "passwordSecretKey": {},
-        "user": {}
+        "user": {},
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },

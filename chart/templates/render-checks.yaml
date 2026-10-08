@@ -145,6 +145,23 @@ chart's.
 {{- end }}
 
 {{/*
+B-N3E, THE K-8 EXPAND FOR THE BROKER HOP (ADR-0852), the twin of gateway#104.
+`nats.tls.enabled` is OPTIONAL in this chart version: absent renders nothing,
+so every values file written before this key existed renders as it did.
+PRESENCE IS `enabled`, never the `tls` map, so a `tls: {}` (or, from B-N3, a
+map holding only CA keys) does not state the switch. Present, it is validated
+here (the same map / `hasKey` / `kindIs "bool"` shape as the guards above; the
+schema's `type: boolean` refuses a null or a string first), and `true` is
+refused: the binary reads `NATS_TLS_ENABLED` only from B-N3 and the broker
+serves no TLS until B-L1. B-N3 makes the key required and lifts the `true`
+refusal. `templates/deployment.yaml` renders the variable under the same
+map-and-`hasKey` test (a template variable does not cross files).
+*/}}
+{{- $natsTlsStated := and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") -}}
+{{- if and $natsTlsStated (not (kindIs "bool" .Values.nats.tls.enabled)) }}{{ fail "iam: nats.tls.enabled must be true or false when it is set; it renders NATS_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
+{{- if and $natsTlsStated (kindIs "bool" .Values.nats.tls.enabled) .Values.nats.tls.enabled }}{{ fail "iam: nats.tls.enabled: true is refused by this chart version: it declares the key, but the binary reads NATS_TLS_ENABLED only from B-N3 and the broker serves no TLS until B-L1. Set it to false (ADR-0845, ADR-0852)" }}{{ end }}
+
+{{/*
 B-U5E, FOLDED INTO C-SVb (K-8 STEP 1, K-3): THE EXPAND HALF OF
 `tls.clientAuth`. The schema declares `tls.clientAuth`, `tls.clientCaSecret`
 and `tls.clientCaSecretKey` (this PR); `templates/deployment.yaml` renders

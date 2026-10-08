@@ -377,6 +377,22 @@ nats:
   # with one and not the other.
   user: iam
 
+  # TLS on the broker hop (ADR-0852, ADR-0845): `nats.tls.enabled`. THIS CHART
+  # VERSION IS THE K-8 EXPAND. It declares the key in the schema and states no
+  # value for it here, deliberately, so nothing about the hop changes yet:
+  #
+  #   - left out, nothing renders, and the manifest is what it was before;
+  #   - `false` renders `NATS_TLS_ENABLED="0"`;
+  #   - `true` is REFUSED at render. The binary reads `NATS_TLS_ENABLED` only
+  #     from B-N3, and the broker serves no TLS until B-L1, so a `true` here
+  #     would look encrypted while the hop stays cleartext.
+  #
+  # B-N3 makes `enabled` required with no default (ADR-0845), lifts the `true`
+  # refusal, and adds the CA keys and mount. State `false` now, so that step
+  # needs no values change. The hop will present iam's existing client leaf,
+  # `iam-client-tls` (ADR-0852 design item 7); which key names it is B-N3's
+  # choice, because today that leaf mounts only under `iamDb.tls`.
+
 login:
   # The shortest time Login may answer in, in milliseconds. It floors the WHOLE
   # call, success and failure alike, so the response time stops being a function
