@@ -50,10 +50,11 @@ REFUSE_TRUE = (
     "until B-L1. Set it to false (ADR-0845, ADR-0852)"
 )
 
-# The two switches every render needs (ADR-0845), so only `nats.tls` is under
-# test. Stated here rather than read from `chart/ci/values.yaml`, because that
-# file states `nats.tls.enabled` too and the ABSENT case must not see it.
-SWITCHES = {"tls": {"enabled": True}, "iamDb": {"tls": {"enabled": True}}}
+# The two switches every render needs (ADR-0845), and the client-auth mode
+# (ADR-0854, B-U5), so only `nats.tls` is under test. Stated here rather than
+# read from `chart/ci/values.yaml`, because that file states
+# `nats.tls.enabled` too and the ABSENT case must not see it.
+SWITCHES = {"tls": {"enabled": True, "clientAuth": "off"}, "iamDb": {"tls": {"enabled": True}}}
 
 
 def overlay(tmp_path: Path, nats_tls=..., **nats) -> Path:

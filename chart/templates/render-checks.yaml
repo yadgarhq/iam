@@ -162,47 +162,50 @@ map-and-`hasKey` test (a template variable does not cross files).
 {{- if and $natsTlsStated (kindIs "bool" .Values.nats.tls.enabled) .Values.nats.tls.enabled }}{{ fail "iam: nats.tls.enabled: true is refused by this chart version: it declares the key, but the binary reads NATS_TLS_ENABLED only from B-N3 and the broker serves no TLS until B-L1. Set it to false (ADR-0845, ADR-0852)" }}{{ end }}
 
 {{/*
-B-U5E, FOLDED INTO C-SVb (K-8 STEP 1, K-3): THE EXPAND HALF OF
-`tls.clientAuth`. The schema declares `tls.clientAuth`, `tls.clientCaSecret`
-and `tls.clientCaSecretKey` (this PR); `templates/deployment.yaml` renders
-`LISTEN_TLS_CLIENT_AUTH`, `LISTEN_TLS_CLIENT_CA_FILE` and the `ca.crt` item
-only when `tls.enabled` is true AND `tls.clientAuth` is PRESENT (coordinator
-ruling 2026-10-07); the binary reads none of it yet — B-U5 is the contract
-that adopts `LISTEN_TLS_CLIENT_AUTH` and enforces the mode.
+B-U5, THE CONTRACT HALF OF `tls.clientAuth` (K-8 step 3; ADR-0854, which
+extends ADR-0845 to the client-auth mode). The binary adopts
+`yadgar_lifecycle::serve_tls` and refuses an absent `LISTEN_TLS_CLIENT_AUTH`
+whether TLS is on or off, so this chart has no default for the key and
+refuses its absence. `templates/deployment.yaml` renders the variable
+UNCONDITIONALLY, outside `tls.enabled`; the CA env, mount and volume stay
+under `tls.enabled` and render only when `tls.clientCaSecret` names a Secret.
 
-VALIDATED ONLY WHEN PRESENT, deliberately asymmetric with the `tls.enabled`
-guard above: an ABSENT `tls.clientAuth` must render exactly as origin/main
-(render-neutral is the whole of what an expand promises, K-8), so this block
-does nothing at all until a values file writes the key.
+THE SCHEMA OWNS ONLY ABSENCE (`tls.required`). The leaf carries no `type` or
+`enum` (coordinator ruling R1, ADR-0847), so a bare `off`, any other
+non-string and an unknown mode all reach THIS file and are refused here by
+name. The guard is the K-1 shape — map first, then `hasKey`, then
+`kindIs "string"` on the raw value BEFORE any `has`/`ne` (YAML 1.1 reads a
+bare `off` as the boolean `false`, and Go's `eq` on a bool and a string is a
+type error naming no key) — so the sentence tells the operator to quote it.
 
-`kindIs "string"` GUARDS BEFORE ANY `eq`/`has`, and that order is load-bearing
-(coordinator ruling): YAML 1.1 reads a bare `off` as the boolean `false`, so
-an adopter who forgets to quote it would otherwise reach `eq`/`has` holding a
-bool rather than the string this chart asks for — refused by name here
-instead.
-
-`off` IS THE ONLY VALUE THIS CHART VERSION ACCEPTS, once written. `optional`
-and `required` are real values B-U5's contract will serve, and refusing them
-HERE — rather than silently rendering them — is what keeps a values file from
-looking enforced during the window the binary does not read it (K-8's own
-phrase). The sentence names the unit that lifts the refusal, so an operator
-who hits it mid-rollout knows it is not a defect.
+THE EXPAND'S "NOT ENFORCED YET" REFUSAL OF `optional` / `required` IS LIFTED:
+the binary verifies now. Two refusals replace it, both cross-key, which is
+why they are here and not in the schema: a verifying mode with `tls.enabled`
+false (a cleartext listener cannot verify a client certificate — the binary
+refuses the same shape), and a verifying mode with no `tls.clientCaSecret`
+(no authority to verify against, and no `LISTEN_TLS_CLIENT_CA_FILE` to
+render). Absent and `""` are the same deployment for the Secret.
 */}}
-{{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
-{{- if not (kindIs "string" .Values.tls.clientAuth) }}
-{{- fail (printf (join "" (list
-      "iam: tls.clientAuth must be a quoted string (\"off\", \"optional\" or \"required\") "
-      "and is %s (%s). YAML reads a bare off as false: write `clientAuth: \"off\"`."))
-      (kindOf .Values.tls.clientAuth) (toJson .Values.tls.clientAuth)) }}
+{{- if not (and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") (kindIs "string" .Values.tls.clientAuth)) }}
+{{- fail (join "" (list
+      "iam: tls.clientAuth must be set to a quoted string, \"off\", \"optional\" or "
+      "\"required\"; it renders LISTEN_TLS_CLIENT_AUTH and has no default. YAML reads a "
+      "bare off as false: write `clientAuth: \"off\"` (ADR-0854, ADR-0845, ADR-0797)")) }}
 {{- end }}
 {{- if not (has .Values.tls.clientAuth (list "off" "optional" "required")) }}
 {{- fail (printf "iam: tls.clientAuth is %q, which is not off, optional or required." .Values.tls.clientAuth) }}
 {{- end }}
-{{- if ne .Values.tls.clientAuth "off" }}
+{{- if and (ne .Values.tls.clientAuth "off") (not .Values.tls.enabled) }}
 {{- fail (printf (join "" (list
-      "iam: tls.clientAuth is %q; this chart version renders the key but the binary does "
-      "not enforce mutual TLS yet (B-U5E, folded into C-SVb; B-U5 lands the contract). Write "
-      "`tls.clientAuth: \"off\"`, or omit the key, until then."))
+      "iam: tls.clientAuth is %q but tls.enabled is false: a cleartext listener cannot "
+      "verify a client certificate. Set tls.enabled to true, or tls.clientAuth to \"off\" "
+      "(ADR-0854)."))
       .Values.tls.clientAuth) }}
 {{- end }}
+{{- if and (ne .Values.tls.clientAuth "off") (not .Values.tls.clientCaSecret) }}
+{{- fail (printf (join "" (list
+      "iam: tls.clientAuth is %q but tls.clientCaSecret names no Secret, so there is no "
+      "authority to verify a client certificate against. Name the Secret holding the CA "
+      "bundle in tls.clientCaSecret; it renders LISTEN_TLS_CLIENT_CA_FILE (ADR-0854)."))
+      .Values.tls.clientAuth) }}
 {{- end }}

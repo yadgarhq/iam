@@ -19,8 +19,13 @@
 # `scripts/tests/test_render_checks.py` pass this same file to every bare
 # `helm template`/`helm lint` they run, so the suite and the hook measure one
 # chart rather than two.
+#
+# `tls.clientAuth` (B-U5, ADR-0854; K-8 step 3) has no default either, and is
+# stated at `"off"` — the value the parent fixture (B-P1) states for every
+# server — QUOTED, because YAML reads a bare off as false.
 tls:
   enabled: true
+  clientAuth: "off"
 iamDb:
   tls:
     enabled: true

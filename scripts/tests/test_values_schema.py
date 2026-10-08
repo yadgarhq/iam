@@ -31,6 +31,12 @@ that render them either — `required` alone passes a null value through
 is this pair, excluded from the untyped-leaf census for the reason stated on
 it.
 
+AND `tls.clientAuth` (ADR-0854, B-U5): `tls` carries it in `required`, for the
+same reason as the pair, but the leaf stays an untyped `{}` (coordinator ruling
+R1, ADR-0847) — a `type` or `enum` would pre-empt the render check's named
+sentences for a bare `off`, a non-string and an unknown mode.
+`REQUIRED_NO_DEFAULT_MODES` below.
+
 Run: python3 -m pytest scripts/tests/ -q
 """
 
@@ -61,11 +67,12 @@ OPEN_PATHS = ("global", "resources", "rollingUpdate")
 # `networkPolicy.scrapeFrom.namespace` is read by `networkpolicy.yaml`, and
 # `values.yaml` ships the parent block empty (`scrapeFrom: {}`).
 #
-# `tls.clientAuth`, `tls.clientCaSecret` and `tls.clientCaSecretKey` join this
-# set for the B-U5E expand (folded into C-SVb): the schema declares them,
-# `templates/render-checks.yaml` validates them when present, and the binary
-# reads none of them yet — there is nothing for `values.yaml` to default,
-# same shape as `image.digest` above (a template reads it; nothing ships it).
+# `tls.clientCaSecret` and `tls.clientCaSecretKey` join this set (B-U5E
+# expand, kept by B-U5): optional, read only when `tls.enabled` is true and
+# `clientCaSecret` names a Secret, and there is nothing for `values.yaml` to
+# default — same shape as `image.digest` above (a template reads it; nothing
+# ships it). `tls.clientAuth` LEFT this set for `REQUIRED_NO_DEFAULT_MODES`
+# when B-U5 made it required.
 #
 # `nats.tls.enabled` joins them for the B-N3E expand (K-8, ADR-0852): declared
 # (`type: boolean`, not required) and read only when present, with no value in
@@ -75,7 +82,6 @@ OPEN_PATHS = ("global", "resources", "rollingUpdate")
 EXTRAS = (
     "image.digest",
     "networkPolicy.scrapeFrom.namespace",
-    "tls.clientAuth",
     "tls.clientCaSecret",
     "tls.clientCaSecretKey",
     "nats.tls.enabled",
@@ -91,6 +97,16 @@ EXTRAS = (
 # omits by design with NO constraint attached; these two are omitted by
 # design AND an adopter MUST choose one of exactly two values.
 REQUIRED_NO_DEFAULT = ("tls.enabled", "iamDb.tls.enabled")
+
+# `tls.clientAuth` (B-U5, ADR-0854 extending ADR-0845): required with no
+# default like the switches above, but a MODE rather than a switch, and its
+# shape is the render check's to refuse BY NAME (coordinator ruling R1,
+# ADR-0847): the leaf stays an untyped `{}` and only `required` is the
+# schema's. A `type: string` would refuse a bare `off` (read as false) with
+# helm's wording instead of the sentence telling the adopter to quote it; an
+# `enum` would do the same to an unknown mode. Same exclusions as
+# `REQUIRED_NO_DEFAULT`, for the same reasons.
+REQUIRED_NO_DEFAULT_MODES = ("tls.clientAuth",)
 
 
 def schema() -> dict:
@@ -264,13 +280,36 @@ def every_schema_leaf_is_known_failures(doc: dict, values: dict) -> list[str]:
         | set(EXTRAS)
         | set(OPEN_PATHS)
         | set(REQUIRED_NO_DEFAULT)
+        | set(REQUIRED_NO_DEFAULT_MODES)
     )
     failures = []
     for path in schema_leaves(doc.get("properties", {})):
         if path not in known:
             failures.append(
                 f"{path} is a schema leaf that is in none of: values.yaml, EXTRAS, "
-                "OPEN_PATHS, REQUIRED_NO_DEFAULT"
+                "OPEN_PATHS, REQUIRED_NO_DEFAULT, REQUIRED_NO_DEFAULT_MODES"
+            )
+    return failures
+
+
+def required_no_default_mode_failures(doc: dict) -> list[str]:
+    """The mode half of K-1: each leaf in `REQUIRED_NO_DEFAULT_MODES` is in its
+    parent's `required` list AND stays the untyped `{}` (ruling R1). A `type`
+    or `enum` added here would pre-empt the render check's named sentences, so
+    it is refused as surely as a dropped `required`."""
+    failures = []
+    for path in REQUIRED_NO_DEFAULT_MODES:
+        node = node_at(doc, path)
+        if node != {}:
+            failures.append(
+                f"{path} must be the untyped leaf {{}} so the render check names the "
+                f"refusal (ruling R1, ADR-0847): {node!r}"
+            )
+        parent_path, _, leaf = path.rpartition(".")
+        parent = node_at(doc, parent_path) if parent_path else doc
+        if parent is None or leaf not in (parent.get("required") or []):
+            failures.append(
+                f"'{path}' is not in its parent block '{parent_path}'s `required` list"
             )
     return failures
 
@@ -330,6 +369,28 @@ def test_the_required_no_default_leaves_are_typed_boolean_and_required():
     assert failures == [], "\n".join(failures)
 
 
+def test_the_required_no_default_modes_are_untyped_and_required():
+    failures = required_no_default_mode_failures(schema())
+    assert failures == [], "\n".join(failures)
+
+
+def test_mutation_dropping_client_auth_from_required_reddens():
+    mutated = copy.deepcopy(schema())
+    mutated["properties"]["tls"]["required"] = ["enabled"]
+    assert required_no_default_mode_failures(mutated) != []
+
+
+def test_mutation_adding_a_client_auth_type_or_enum_reddens():
+    for node in (
+        {"type": "string"},
+        {"enum": ["off", "optional", "required"]},
+        {"type": "string", "enum": ["off", "optional", "required"]},
+    ):
+        mutated = copy.deepcopy(schema())
+        mutated["properties"]["tls"]["properties"]["clientAuth"] = node
+        assert required_no_default_mode_failures(mutated) != []
+
+
 def test_every_required_no_default_key_has_no_default_in_values_yaml():
     """The other half of what `REQUIRED_NO_DEFAULT` claims: `values.yaml`
     really does not set it. A key that crept back into `values.yaml` would
@@ -338,7 +399,7 @@ def test_every_required_no_default_key_has_no_default_in_values_yaml():
     would catch it.
     """
     values = chart_values()
-    for path in REQUIRED_NO_DEFAULT:
+    for path in REQUIRED_NO_DEFAULT + REQUIRED_NO_DEFAULT_MODES:
         node = values
         present = True
         for step in path.split("."):
@@ -594,71 +655,220 @@ def test_dropping_tls_required_degrades_the_bare_lint_message(tmp_path):
     )
 
 
-# ── B-U5E (folded into C-SVb): the `tls.clientAuth` expand ──────────────────
+# ── B-U5: the `tls.clientAuth` CONTRACT (ADR-0854, extending ADR-0845) ──────
 #
-# VALIDATED ONLY WHEN PRESENT. An absent key must render EXACTLY as
-# origin/main's shape — asserted directly below rather than through a
-# two-chart golden comparison, because `tls.clientAuth` does not exist on
-# this chart's own `values.yaml` at all; "render the same" here means
-# "render with none of the three new env/volume additions".
-CLIENT_AUTH_NOT_ENFORCED_SENTENCE = (
-    "this chart version renders the key but the binary does not enforce mutual "
-    "TLS yet"
+# REQUIRED, NO DEFAULT. The binary refuses an absent `LISTEN_TLS_CLIENT_AUTH`
+# whether TLS is on or off, so the chart refuses an absent `tls.clientAuth`
+# and renders the variable UNCONDITIONALLY — outside `tls.enabled`. The
+# expand's "not enforced yet" refusal of `optional`/`required` is lifted.
+#
+# NO GOLDEN AGAINST origin/main (ADR-0874): render neutrality for
+# `clientAuth: "off"` is measured at review through the parent render (K-8),
+# not asserted here.
+#
+# WHICH REFUSAL FIRES IS MEASURED, NOT ASSUMED, on helm 4.3.0 and 3.18.4.
+# The schema's `required` refuses an ABSENT key, so that case asserts the
+# schema's stable wrapper plus the key. Everything else is the render
+# check's, by NAME (coordinator ruling R1: the leaf carries no `type` or
+# `enum`, so nothing pre-empts it): a bare `off`, any other non-string, an
+# unknown mode, and the two cross-key refusals — a verifying mode with TLS
+# off, and one with no CA Secret. Those cases assert the exact sentence, and
+# none passes `--skip-schema-validation`: the schema runs and lets them by.
+
+CLIENT_AUTH_NOT_A_STRING_SENTENCE = (
+    'iam: tls.clientAuth must be set to a quoted string, "off", "optional" or '
+    '"required"; it renders LISTEN_TLS_CLIENT_AUTH and has no default. YAML reads a '
+    'bare off as false: write `clientAuth: "off"` (ADR-0854, ADR-0845, ADR-0797)'
+)
+CLIENT_AUTH_UNKNOWN_SENTENCE = (
+    'iam: tls.clientAuth is "{mode}", which is not off, optional or required.'
 )
 
+CLIENT_AUTH_WITHOUT_TLS_SENTENCE = (
+    'iam: tls.clientAuth is "{mode}" but tls.enabled is false: a cleartext listener '
+    "cannot verify a client certificate. Set tls.enabled to true, or tls.clientAuth "
+    'to "off" (ADR-0854).'
+)
+CLIENT_AUTH_WITHOUT_CA_SENTENCE = (
+    'iam: tls.clientAuth is "{mode}" but tls.clientCaSecret names no Secret, so there '
+    "is no authority to verify a client certificate against. Name the Secret holding "
+    "the CA bundle in tls.clientCaSecret; it renders LISTEN_TLS_CLIENT_CA_FILE "
+    "(ADR-0854)."
+)
 
-def test_client_auth_absent_renders_exactly_as_before():
-    result = render(CHART, "--set", "tls.enabled=true")
-    assert result.returncode == 0, result.stderr
-    for absent in ("LISTEN_TLS_CLIENT_AUTH", "LISTEN_TLS_CLIENT_CA_FILE", "client-ca"):
-        assert absent not in result.stdout, (
-            f"{absent} rendered with tls.clientAuth absent; the expand must be "
-            f"render-neutral (K-8 step 1)"
-        )
+# Every switch a bare render needs EXCEPT `tls.clientAuth`, so the absent case
+# sees no value from `chart/ci/values.yaml`.
+SWITCHES_WITHOUT_CLIENT_AUTH = {
+    "tls": {"enabled": True},
+    "iamDb": {"tls": {"enabled": True}},
+    "nats": {"tls": {"enabled": False}},
+}
 
 
-def test_client_auth_bad_mode_refuses(tmp_path):
-    overlay = values_file(tmp_path / "bad-mode.yaml", 'tls: {enabled: true, clientAuth: "bogus"}\n')
-    result = render(CHART, "--values", str(overlay))
+def bare(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Rendered WITHOUT `chart/ci/values.yaml`, over the arguments only."""
+    return helm("template", "x", str(CHART), *arguments)
+
+
+def test_ci_values_state_client_auth_off():
+    """K-8 step 3: the module's own offline gates render with the key stated,
+    quoted, at the value B-P1 states for every server."""
+    ci = yaml.safe_load(CI_VALUES.read_text())
+    assert ci["tls"]["clientAuth"] == "off"
+
+
+def test_client_auth_absent_is_refused_by_the_schema_naming_key_and_path(tmp_path):
+    overlay = values_file(tmp_path / "absent.yaml", SWITCHES_WITHOUT_CLIENT_AUTH)
+    result = bare("-f", str(overlay))
+    assert result.returncode != 0, "an absent tls.clientAuth must refuse rather than render"
+    assert SCHEMA_WRAPPER in result.stderr, result.stderr
+    assert "clientAuth" in result.stderr, result.stderr
+    assert "tls" in result.stderr, result.stderr
+
+
+def test_client_auth_absent_is_refused_by_bare_lint_too():
+    """The shape an adopter who has not read `chart/ci/values.yaml` runs."""
+    result = helm(
+        "lint",
+        "--strict",
+        str(CHART),
+        "--set",
+        "tls.enabled=true",
+        "--set",
+        "iamDb.tls.enabled=true",
+    )
     assert result.returncode != 0
-    assert 'tls.clientAuth is "bogus", which is not off, optional or required.' in result.stderr
+    assert "clientAuth" in result.stdout + result.stderr
 
 
-def test_client_auth_optional_and_required_both_refuse_with_the_not_enforced_yet_sentence(
-    tmp_path,
-):
-    for mode in ("optional", "required"):
+def test_client_auth_unknown_mode_is_refused_by_name(tmp_path):
+    """MUTATION: an `enum` re-added to the schema turns this red — helm's own
+    wording would fire instead of the sentence."""
+    for mode in ("bogus", "Required", "on"):
         overlay = values_file(
-            tmp_path / f"{mode}.yaml", f'tls: {{enabled: true, clientAuth: "{mode}"}}\n'
+            tmp_path / f"{mode}.yaml", {"tls": {"enabled": True, "clientAuth": mode}}
         )
         result = render(CHART, "--values", str(overlay))
-        assert result.returncode != 0, f"clientAuth: {mode} must refuse (B-U5 is not merged)"
-        assert CLIENT_AUTH_NOT_ENFORCED_SENTENCE in result.stderr, result.stderr
-        assert mode in result.stderr, result.stderr
+        assert result.returncode != 0, f"clientAuth: {mode} must refuse"
+        assert CLIENT_AUTH_UNKNOWN_SENTENCE.format(mode=mode) in result.stderr, result.stderr
+        assert SCHEMA_WRAPPER not in result.stderr, result.stderr
 
 
 def test_client_auth_unquoted_off_is_refused_by_name(tmp_path):
     """UNQUOTED, DELIBERATELY: YAML 1.1 reads a bare `off` as the boolean
-    `false`, which the `kindIs "string"` guard then (correctly) refuses by
-    name rather than silently misreading it as a mode.
-    """
+    `false`. The render check's `kindIs "string"` guard refuses it with the
+    sentence telling the adopter to quote it (convention item 1).
+
+    MUTATION: a `type: string` re-added to the schema turns this red."""
     overlay = values_file(tmp_path / "unquoted-off.yaml", "tls: {enabled: true, clientAuth: off}\n")
     result = render(CHART, "--values", str(overlay))
     assert result.returncode != 0
-    assert "tls.clientAuth must be a quoted string" in result.stderr
-    assert "write `clientAuth: \"off\"`" in result.stderr.lower() or "clientAuth" in result.stderr
+    assert CLIENT_AUTH_NOT_A_STRING_SENTENCE in result.stderr, result.stderr
+    assert SCHEMA_WRAPPER not in result.stderr, result.stderr
 
 
-def test_client_auth_off_renders_the_variable_the_binary_does_not_yet_read(tmp_path):
-    overlay = values_file(
-        tmp_path / "off.yaml", 'tls: {enabled: true, clientAuth: "off"}\n'
-    )
+def test_client_auth_non_string_is_refused_by_name(tmp_path):
+    """Any other non-string — a number, a list, a map — meets the same
+    sentence."""
+    for shape in ("3", "[off]", "{mode: off}", "true"):
+        overlay = values_file(
+            tmp_path / "non-string.yaml", f"tls: {{enabled: true, clientAuth: {shape}}}\n"
+        )
+        result = render(CHART, "--values", str(overlay))
+        assert result.returncode != 0, f"clientAuth: {shape} must refuse"
+        assert CLIENT_AUTH_NOT_A_STRING_SENTENCE in result.stderr, result.stderr
+        assert SCHEMA_WRAPPER not in result.stderr, result.stderr
+
+
+def test_client_auth_off_with_tls_on_renders_the_variable(tmp_path):
+    overlay = values_file(tmp_path / "off.yaml", 'tls: {enabled: true, clientAuth: "off"}\n')
     result = render(CHART, "--values", str(overlay))
     assert result.returncode == 0, result.stderr
     assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
-    # NO CA ENV OR ITEM: `clientCaSecret` was not named alongside `clientAuth`.
+    # NO CA ENV OR ITEM: `clientCaSecret` was not named.
     assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
     assert "client-ca" not in result.stdout
+
+
+def test_client_auth_off_with_tls_off_still_renders_the_variable(tmp_path):
+    """THE CONTRACT'S CENTRAL RENDER. The binary reads `LISTEN_TLS_CLIENT_AUTH`
+    whether `LISTEN_TLS_ENABLED` is "1" or "0" and refuses it absent, so the
+    variable renders OUTSIDE `tls.enabled`. Nested inside it, a cleartext
+    deployment would render no variable and refuse to boot.
+
+    MUTATION: moving the variable back under `{{- if .Values.tls.enabled }}`
+    turns this red.
+    """
+    overlay = values_file(
+        tmp_path / "off-cleartext.yaml", 'tls: {enabled: false, clientAuth: "off"}\n'
+    )
+    result = render(CHART, "--values", str(overlay))
+    assert result.returncode == 0, result.stderr
+    assert env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
+    assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+    assert "client-ca" not in result.stdout
+
+
+def test_optional_and_required_render_with_tls_and_a_ca_secret(tmp_path):
+    """THE EXPAND'S "NOT ENFORCED YET" REFUSAL IS LIFTED: the binary verifies
+    now, so both verifying modes render, with the CA env, the mount and the
+    `ca.crt` item."""
+    for mode in ("optional", "required"):
+        overlay = values_file(
+            tmp_path / f"{mode}.yaml",
+            {
+                "tls": {
+                    "enabled": True,
+                    "clientAuth": mode,
+                    "clientCaSecret": "iam-client-ca",
+                    "clientCaSecretKey": "ca.crt",
+                }
+            },
+        )
+        result = render(CHART, "--values", str(overlay))
+        assert result.returncode == 0, result.stderr
+        assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == f'value: "{mode}"'
+        assert (
+            env_value(result.stdout, "LISTEN_TLS_CLIENT_CA_FILE")
+            == "value: /var/run/config/client-ca/ca.crt"
+        )
+        assert "mountPath: /var/run/config/client-ca" in result.stdout
+        assert "secretName: iam-client-ca" in result.stdout
+        assert "path: ca.crt" in result.stdout
+
+
+def test_a_verifying_mode_with_tls_off_is_refused_by_name(tmp_path):
+    for mode in ("optional", "required"):
+        overlay = values_file(
+            tmp_path / f"{mode}-cleartext.yaml",
+            {
+                "tls": {
+                    "enabled": False,
+                    "clientAuth": mode,
+                    "clientCaSecret": "iam-client-ca",
+                    "clientCaSecretKey": "ca.crt",
+                }
+            },
+        )
+        result = render(CHART, "--values", str(overlay))
+        assert result.returncode != 0, f"clientAuth: {mode} with tls off must refuse"
+        assert CLIENT_AUTH_WITHOUT_TLS_SENTENCE.format(mode=mode) in result.stderr, result.stderr
+
+
+def test_a_verifying_mode_without_a_ca_secret_is_refused_by_name(tmp_path):
+    """An absent and an empty `clientCaSecret` are the same deployment."""
+    for mode in ("optional", "required"):
+        for tls in (
+            {"enabled": True, "clientAuth": mode},
+            {"enabled": True, "clientAuth": mode, "clientCaSecret": ""},
+        ):
+            overlay = values_file(tmp_path / f"{mode}-no-ca.yaml", {"tls": tls})
+            result = render(CHART, "--values", str(overlay))
+            assert result.returncode != 0, f"clientAuth: {mode} with no CA must refuse"
+            assert (
+                CLIENT_AUTH_WITHOUT_CA_SENTENCE.format(mode=mode) in result.stderr
+            ), result.stderr
 
 
 def test_client_ca_secret_renders_its_env_mount_and_item_only_when_named(tmp_path):
@@ -675,34 +885,24 @@ def test_client_ca_secret_renders_its_env_mount_and_item_only_when_named(tmp_pat
     assert "secretName: iam-client-ca" in result.stdout
 
 
-def test_client_ca_secret_named_with_client_auth_absent_renders_nothing(tmp_path):
-    """THE INCONSISTENCY A REVIEW CAUGHT: the CA env, mount and volume used to
-    gate on `tls.clientCaSecret` alone, so naming a Secret with no
-    `tls.clientAuth` rendered the mount and the volume while
-    `LISTEN_TLS_CLIENT_AUTH`/`LISTEN_TLS_CLIENT_CA_FILE` stayed absent — a
-    pod with a CA bundle mounted and no env pointing at it. All three now
-    gate on the SAME `and (kindIs "map" .Values.tls) .Values.tls.enabled
-    (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret`.
-    """
+def test_client_ca_secret_with_tls_off_renders_no_ca(tmp_path):
+    """The CA env, mount and volume stay nested under `tls.enabled`: a
+    cleartext listener reads no CA, so none is mounted."""
     overlay = values_file(
-        tmp_path / "ca-no-client-auth.yaml",
-        "tls: {enabled: true, clientCaSecret: iam-client-ca, clientCaSecretKey: ca.crt}\n",
+        tmp_path / "ca-cleartext.yaml",
+        'tls: {enabled: false, clientAuth: "off", clientCaSecret: iam-client-ca, '
+        "clientCaSecretKey: ca.crt}\n",
     )
     result = render(CHART, "--values", str(overlay))
     assert result.returncode == 0, result.stderr
-    for absent in ("LISTEN_TLS_CLIENT_AUTH", "LISTEN_TLS_CLIENT_CA_FILE", "client-ca"):
-        assert absent not in result.stdout, (
-            f"{absent} rendered with tls.clientAuth absent; naming clientCaSecret "
-            f"alone must not be enough"
-        )
+    assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+    for absent in ("LISTEN_TLS_CLIENT_CA_FILE", "client-ca"):
+        assert absent not in result.stdout, f"{absent} rendered with tls.enabled false"
 
 
 def test_client_ca_secret_empty_string_renders_nothing(tmp_path):
-    """A values override that nulls `clientCaSecret` renders it as `""`
-    (ADR-0845's own rule for a chart key: absent and empty are the same
-    deployment), and `""` is falsy, so the CA env, mount and volume must
-    all stay absent exactly as when the key is omitted.
-    """
+    """`""` is falsy, so the CA env, mount and volume all stay absent exactly
+    as when the key is omitted — never a `secretName: ""`."""
     overlay = values_file(
         tmp_path / "ca-empty.yaml",
         'tls: {enabled: true, clientAuth: "off", clientCaSecret: ""}\n',
@@ -711,9 +911,7 @@ def test_client_ca_secret_empty_string_renders_nothing(tmp_path):
     assert result.returncode == 0, result.stderr
     assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
     for absent in ("LISTEN_TLS_CLIENT_CA_FILE", "client-ca"):
-        assert absent not in result.stdout, (
-            f"{absent} rendered with tls.clientCaSecret empty"
-        )
+        assert absent not in result.stdout, f"{absent} rendered with tls.clientCaSecret empty"
 
 
 def test_root_typo_is_refused_by_name_at_the_root(tmp_path):

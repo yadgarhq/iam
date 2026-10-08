@@ -74,6 +74,23 @@ tls:
   # The key inside that Secret holding the private key, mounted as
   # `tls-key.pem`. Named for the same reason.
   keySecretKey: tls.key
+  # CLIENT AUTHENTICATION — `clientAuth`, REQUIRED, NO DEFAULT HERE (ADR-0854,
+  # extending ADR-0845; B-U5). A quoted string: `"off"`, `"optional"` or
+  # `"required"` (YAML reads a bare off as false, which is refused by name). It
+  # renders `LISTEN_TLS_CLIENT_AUTH` whether `enabled` is true or false, because
+  # the binary refuses to boot without it either way. `"off"` verifies no
+  # caller; `"optional"` verifies a certificate a caller presents and serves
+  # one that presents none — a staging step, not a control; `"required"`
+  # refuses every caller without a certificate the authority below signed.
+  # `optional` and `required` need `enabled: true`.
+  #
+  # `clientCaSecret` / `clientCaSecretKey` — the Secret, and the key inside
+  # it, holding the authority callers' certificates are verified against.
+  # Mounted as a DIRECTORY at `/var/run/config/client-ca` and rendered as
+  # `LISTEN_TLS_CLIENT_CA_FILE` only when `enabled` is true and
+  # `clientCaSecret` names a Secret; `optional` and `required` refuse at
+  # render without one. Not stated here: `chart/ci/values.yaml` writes
+  # `clientAuth: "off"` for the offline gates, and a deployment writes its own.
 
 # HOW A RENEWED CERTIFICATE ACTUALLY REACHES THE PROCESS.
 #
@@ -84,6 +101,7 @@ tls:
 # would go on serving its day-0 leaf until something restarted it.
 #
 # So iam hashes the TLS files it read at boot — the serving certificate, its key,
+# the client CA its callers are verified against when `tls.clientAuth` verifies,
 # the CA bundle iam-db is verified against, the client certificate and key iam
 # presents to iam-db (ADR-0516), and the CA every enrolment token carries (D73) —
 # and when one of them changes it logs which, and the old and new fingerprint,
@@ -217,12 +235,13 @@ iamDb:
     # A NetworkPolicy protects this hop on kind too. ADR-0594, as amended by
     # ADR-0686, ranks mutual TLS and an ingress NetworkPolicy as EQUAL
     # controls — but only where both sides hold a leaf this deployment issued
-    # AND verifies. On this hop that is not yet true: `iam-db`'s `serve.rs`
-    # presents server TLS only and leaves `client_ca_root` unbuilt, so this
-    # certificate is not checked. Today the NetworkPolicy is the only BUILT
-    # control on this hop; the certificate stays load-bearing for
-    # availability, per the rest of this note, once the server side of
-    # mutual TLS lands.
+    # AND verifies. The server side is built by `iam-db`'s B-U5 (ADR-0846):
+    # its listener verifies this certificate when `iam-db`'s
+    # `tls.clientAuth` is `optional` or `required`. With `off` — the value
+    # every server is stated at first (B-P1) — it is not checked, and the
+    # NetworkPolicy is the only ENFORCED control on this hop. The certificate
+    # stays load-bearing for availability, per the rest of this note, from
+    # the day `iam-db`'s mode verifies.
     #
     # EMPTY, AND THAT IS ITS OWN LEVER. Turning `enabled` on above encrypts the
     # hop and presents NO identity, exactly as before. Naming a Secret here is a

@@ -2789,7 +2789,6 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
- "rustls-pki-types",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
@@ -2809,15 +2808,17 @@ dependencies = [
 [[package]]
 name = "yadgar-lifecycle"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/lifecycle.git?tag=v0.2.17#45789e8d3f7374b2c3d4e5d0b7e7f17603de1a34"
+source = "git+https://github.com/yadgarhq/lifecycle.git?tag=v0.2.20#7c1ee65a6b9a49ec04aa60db05e10c9a4af6492a"
 dependencies = [
  "metrics",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_norway",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "x509-parser",
 ]

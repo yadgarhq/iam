@@ -47,9 +47,9 @@ use rcgen::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::{http, Service};
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use yadgar_iam::serve::{self, ServerTls, ServerTlsError};
+use yadgar_iam::serve::{self, ServeTlsError, ServerTls};
 
 /// The name the test certificates are issued for, and the name the rig listens
 /// on.
@@ -61,7 +61,12 @@ const SERVED_NAME: &str = "localhost";
 const SENTINEL_NAME: &str = "iam-served-this-and-nothing-else.invalid";
 
 /// A certificate authority and one certificate it issued.
+///
+/// The ISSUER is kept, not only its PEM, so a case can mint a CLIENT leaf
+/// under the same authority (B-U5): a listener with `clientAuth: required`
+/// verifies a caller against a CA, and the rig has to hold one to sign with.
 struct Pki {
+    ca: CertifiedIssuer<'static, KeyPair>,
     ca_pem: String,
     cert_pem: String,
     key_pem: String,
@@ -87,9 +92,24 @@ fn pki(san: &str) -> Pki {
 
     Pki {
         ca_pem: ca.pem(),
+        ca,
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
     }
+}
+
+/// A CLIENT leaf `ca` issued: the `clientAuth` extended key usage, the name a
+/// caller of this service carries (`iam-caller`, as `chart/values.yaml` names
+/// it), and its key. Returned as `(certificate, key)` PEM.
+fn client_leaf(ca: &CertifiedIssuer<'static, KeyPair>) -> (String, String) {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["iam-caller".to_string()]).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "iam-caller");
+    let cert = params.signed_by(&key, ca).unwrap();
+    (cert.pem(), key.serialize_pem())
 }
 
 /// A file that deletes itself, so a certificate and a key can be handed over as
@@ -209,23 +229,39 @@ impl Drop for TempPem {
     }
 }
 
-/// Build the settings the way a DEPLOYMENT builds them — out of the three
-/// variables — rather than by assembling the struct directly. A test that
-/// bypassed `from_lookup` would leave the reading of those names unproven.
+/// Build the settings the way a DEPLOYMENT builds them — out of the variables
+/// the chart renders — rather than by assembling the struct directly. A test
+/// that bypassed `serve::from_lookup` would leave the reading of those names,
+/// and THIS service's chart key, unproven.
+///
+/// `LISTEN_TLS_CLIENT_AUTH` is `off` here: every case that is not about client
+/// authentication states the value a deployment with mutual TLS off writes,
+/// because an absent one refuses the boot (ADR-0854).
 fn configured(cert: &Path, key: &Path) -> ServerTls {
-    let vars: Vec<(String, String)> = vec![
+    configured_with(cert, key, "off", None)
+}
+
+/// [`configured`], with the client-authentication mode and, when it verifies,
+/// the client CA file a deployment mounts.
+fn configured_with(cert: &Path, key: &Path, mode: &str, client_ca: Option<&Path>) -> ServerTls {
+    let mut vars: Vec<(String, String)> = vec![
         ("LISTEN_TLS_ENABLED".to_string(), "1".to_string()),
         (
             "LISTEN_TLS_CERT_FILE".to_string(),
             cert.display().to_string(),
         ),
         ("LISTEN_TLS_KEY_FILE".to_string(), key.display().to_string()),
+        ("LISTEN_TLS_CLIENT_AUTH".to_string(), mode.to_string()),
     ];
-    ServerTls::from_lookup(serve::LISTEN, move |k| {
-        vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
-    })
-    .expect("a flag, a certificate and a key are a complete configuration")
-    .expect("the flag is set, so this is the TLS path")
+    if let Some(ca) = client_ca {
+        vars.push((
+            "LISTEN_TLS_CLIENT_CA_FILE".to_string(),
+            ca.display().to_string(),
+        ));
+    }
+    serve::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        .expect("a flag, a certificate, a key and a mode are a complete configuration")
+        .expect("the flag is set, so this is the TLS path")
 }
 
 /// Stand the service's own listener up on every address `SERVED_NAME` resolves
@@ -519,7 +555,7 @@ async fn a_certificate_path_that_cannot_be_read_is_an_error() {
 
     let outcome = serve::builder(Some(&tls));
     assert!(
-        matches!(outcome, Err(ServerTlsError::CertUnreadable { .. })),
+        matches!(outcome, Err(ServeTlsError::Unreadable { .. })),
         "a certificate path that does not exist must be refused, not served in cleartext"
     );
     assert!(
@@ -543,7 +579,7 @@ async fn a_key_path_that_cannot_be_read_is_an_error() {
 
     let outcome = serve::builder(Some(&tls));
     assert!(
-        matches!(outcome, Err(ServerTlsError::KeyUnreadable { .. })),
+        matches!(outcome, Err(ServeTlsError::Unreadable { .. })),
         "a key path that does not exist must be refused, not served in cleartext"
     );
     assert!(
@@ -556,40 +592,37 @@ async fn a_key_path_that_cannot_be_read_is_an_error() {
     );
 }
 
-/// A file that exists and holds no certificate. The PEM reader returns an EMPTY
-/// LIST rather than an error for this, so "parsed successfully" can mean "parsed
-/// nothing" — and a listener with no certificate is not a listener.
+/// A file that exists and holds no certificate — or a key file holding no key.
+/// Neither is a listener. The acceptor is built eagerly in `builder`, so both
+/// refuse at boot as an unusable identity naming BOTH files, never as a
+/// cleartext server.
+///
+/// THE PER-FILE PEM CHECK THIS REPOSITORY USED TO RUN IS GONE (B-U5): it was
+/// part of the local `ServerTls` copy ADR-0846 deletes. The refusal still names
+/// both paths, so the operator is told which pair to look at.
 #[tokio::test]
-async fn a_certificate_file_with_no_certificate_in_it_is_an_error() {
+async fn a_certificate_or_key_file_with_nothing_in_it_is_an_error() {
     let p = pki(SERVED_NAME);
-    let key = TempPem::with(&p.key_pem);
-
-    for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
-        let cert = TempPem::with(contents);
-        let tls = configured(cert.path(), key.path());
-        let outcome = serve::builder(Some(&tls));
-        assert!(
-            matches!(outcome, Err(ServerTlsError::CertEmpty { .. })),
-            "a certificate file containing {contents:?} must be refused"
-        );
-    }
-}
-
-/// A key file that decodes to nothing. Same shape, and the message has to name
-/// the key rather than the certificate.
-#[tokio::test]
-async fn a_key_file_with_no_key_in_it_is_an_error() {
-    let p = pki(SERVED_NAME);
-    let cert = TempPem::with(&p.cert_pem);
-
-    for contents in ["", "   ", "\n", "there is no private key in this file\n"] {
-        let key = TempPem::with(contents);
-        let tls = configured(cert.path(), key.path());
-        let outcome = serve::builder(Some(&tls));
-        assert!(
-            matches!(outcome, Err(ServerTlsError::KeyUnparsable { .. })),
-            "a key file containing {contents:?} must be refused"
-        );
+    for contents in ["", "   ", "\n", "there is no PEM in this file\n"] {
+        for empty_side in ["certificate", "key"] {
+            let (cert, key) = if empty_side == "certificate" {
+                (TempPem::with(contents), TempPem::with(&p.key_pem))
+            } else {
+                (TempPem::with(&p.cert_pem), TempPem::with(contents))
+            };
+            let tls = configured(cert.path(), key.path());
+            let outcome = serve::builder(Some(&tls));
+            assert!(
+                matches!(outcome, Err(ServeTlsError::Unusable { .. })),
+                "a serving file with nothing usable in it must be refused at boot"
+            );
+            let message = outcome.err().unwrap().to_string();
+            assert!(
+                message.contains(cert.path().to_str().unwrap())
+                    && message.contains(key.path().to_str().unwrap()),
+                "the refusal must name both serving files"
+            );
+        }
     }
 }
 
@@ -608,54 +641,30 @@ async fn a_certificate_and_a_key_that_do_not_match_are_an_error() {
 
     let outcome = serve::builder(Some(&tls));
     assert!(
-        matches!(outcome, Err(ServerTlsError::Rejected { .. })),
+        matches!(outcome, Err(ServeTlsError::Unusable { .. })),
         "a key that does not match the certificate must be refused at boot"
     );
     let message = outcome.err().unwrap().to_string();
     assert!(
         message.contains(cert.path().to_str().unwrap())
             && message.contains(key.path().to_str().unwrap()),
-        "the message must name BOTH files, because either could be the wrong one: {message}"
+        "the message must name BOTH files, because either could be the wrong one"
     );
 }
 
 /// THE REFUSAL ABOVE HAS TO SAY WHAT WAS WRONG, and the case above cannot tell.
 ///
-/// It asserts the variant and the two PATHS, which are `serve.rs`'s own fields —
-/// so it passes whether `detail` was built by walking the error's `source()`
-/// chain or by a bare `e.to_string()`. On that one property it is a certifying
-/// fixture, green under both, and that is the exact defect telemetry#12
-/// corrected in the shared unit `serve::builder` now calls.
+/// `ServeTlsError::Unusable`'s own `Display` names the two paths and stops; the
+/// reason is its `#[source]`, tonic's `transport error`, and one more hop below
+/// that, `rustls::Error`'s `keys may not be consistent`. The lifecycle crate
+/// keeps the source rather than flattening it, so the BINARY's one flattener
+/// (ADR-0591) renders it — `boot::refusal`, which `boot::listener` calls on the
+/// builder's error. This case asserts that walk reaches the reason;
+/// `tests/boot_message.rs` asserts the binary prints it.
 ///
-/// **TWO LAYERS AND ONE `source()` HOP, read out of the dependencies rather than
-/// inferred from rendered output.** The head is `tonic::transport::Error`: its
-/// `Display` is `f.write_str(self.description())` (tonic 0.14.6
-/// `src/transport/error.rs:79-83`), and `description()` returns the literal
-/// `"transport error"` for `Kind::Transport` (`:52-54`) without ever consulting
-/// the source. One hop down is `rustls::Error`, which is a LEAF — `impl
-/// std::error::Error for Error {}`, the default `source()` returning `None`
-/// (rustls 0.23.43 `src/error.rs:1022`) — and whose `InconsistentKeys` arm
-/// renders `keys may not be consistent: {why:?}` (`:1003-1005`).
-///
-/// **`KeyMismatch` IS NOT A THIRD LAYER, and an earlier version of this comment
-/// said it was.** It is the `{why:?}` INSIDE rustls's single `Display` string —
-/// the `Debug` of a `#[non_exhaustive]`, `Copy` enum (`:121-133`). The colon in
-/// front of it is rustls's own punctuation, not a join this walk performed.
-/// Reading a layer boundary out of a colon in rendered output is exactly the
-/// mistake ADR-0591 exists to stop, and the correction came from reading the two
-/// crates rather than from anything CI reported.
-///
-/// So the assertion below is on the DELIBERATE `Display` string and NOT on that
-/// `Debug`: a `#[non_exhaustive]` enum's `Debug` is the least stable text in the
-/// chain, and pinning it would redden five repositories at once for a change
-/// that is not a defect. Both spellings discriminate identically — neither
-/// appears anywhere in tonic's two words — so nothing is given up by choosing
-/// the stable one.
-///
-/// A `detail` carrying `keys may not be consistent` therefore crossed the one
-/// hop and cannot have come from the head alone. Reverting the call site to
-/// `e.to_string()` leaves `detail` as exactly `transport error` and turns this
-/// red.
+/// The assertion is on rustls's deliberate `Display` string and NOT on the
+/// `Debug` of its `#[non_exhaustive]` `KeyMismatch` enum, which is the least
+/// stable text in the chain.
 #[tokio::test]
 async fn the_refusal_names_the_reason_rather_than_just_transport_error() {
     let one = pki(SERVED_NAME);
@@ -664,18 +673,217 @@ async fn the_refusal_names_the_reason_rather_than_just_transport_error() {
     let key = TempPem::with(&other.key_pem);
     let tls = configured(cert.path(), key.path());
 
-    let Err(ServerTlsError::Rejected { detail, .. }) = serve::builder(Some(&tls)) else {
+    let Err(err) = serve::builder(Some(&tls)) else {
         panic!("a key that does not match the certificate must be refused at boot");
     };
+    let rendered = yadgar_iam::boot::refusal(&err);
 
     assert!(
-        detail.contains("keys may not be consistent"),
-        "the detail must carry the layer UNDER tonic's `transport error`, which is \
-         the only part naming what was wrong; got: {detail:?}"
+        rendered.contains("keys may not be consistent"),
+        "the refusal must carry the layer UNDER tonic's `transport error`, which is \
+         the only part naming what was wrong"
     );
-    assert_ne!(
-        detail.trim(),
-        "transport error",
-        "the head of the chain alone says nothing an operator can act on"
+    assert!(
+        !err.to_string().contains("keys may not be consistent"),
+        "the head alone does not carry the reason, so the walk above is what reached it"
+    );
+}
+
+// ── B-U5: the contract — client authentication through THIS service's wiring ──
+//
+// Every case below goes through `serve::from_lookup`, which reads under
+// `serve::LISTEN` and `serve::CHART_KEY` — the two arguments this repository
+// hands to `yadgar_lifecycle::serve_tls`. A case that called the lifecycle
+// crate with its own literals would re-test that crate and prove nothing about
+// what this service passes it. The crate's own matrix (`lifecycle/tests/`)
+// covers every mode against every kind of leaf; these cases assert that THIS
+// listener is wired to it.
+//
+// ASSERT MESSAGES ARE STATIC. CodeQL's cleartext-logging query reads an error
+// enum carrying Key- and Certificate-named variants as sensitive, so no message
+// below interpolates a refusal; the `contains` checks are the proof.
+
+/// The refusal `serve::from_lookup` returns for `vars`, as an operator reads it.
+fn refusal(vars: &[(&str, &str)]) -> String {
+    let owned: Vec<(String, String)> = vars
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    match serve::from_lookup(move |k| owned.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())) {
+        Ok(_) => panic!("this configuration must refuse the boot"),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// ADR-0854 (X-ADR-1, extending ADR-0845): `LISTEN_TLS_CLIENT_AUTH` has no
+/// default. Absent refuses whether TLS is on or off, naming the variable an
+/// operator reads in the crash log AND the chart key they edit.
+///
+/// MUTATION: `serve::CHART_KEY` set to anything but `tls` turns this red on the
+/// chart key.
+#[test]
+fn an_absent_client_auth_refuses_naming_the_variable_and_the_chart_key() {
+    for enabled in ["1", "0"] {
+        let message = refusal(&[
+            ("LISTEN_TLS_ENABLED", enabled),
+            ("LISTEN_TLS_CERT_FILE", "/nonexistent/tls.pem"),
+            ("LISTEN_TLS_KEY_FILE", "/nonexistent/tls-key.pem"),
+        ]);
+        assert!(
+            message.contains("LISTEN_TLS_CLIENT_AUTH"),
+            "an absent client-auth mode must be refused naming LISTEN_TLS_CLIENT_AUTH"
+        );
+        assert!(
+            message.contains("`tls.clientAuth`"),
+            "an absent client-auth mode must be refused naming the chart key tls.clientAuth"
+        );
+    }
+}
+
+/// ADR-0845, asserted again at adoption (K-1): the switch itself has no
+/// default either, and the lifted type names this chart's key for it.
+#[test]
+fn an_absent_tls_enabled_refuses_naming_the_variable_and_the_chart_key() {
+    let message = refusal(&[("LISTEN_TLS_CLIENT_AUTH", "off")]);
+    assert!(
+        message.contains("LISTEN_TLS_ENABLED"),
+        "an absent switch must be refused naming LISTEN_TLS_ENABLED"
+    );
+    assert!(
+        message.contains("`tls.enabled`"),
+        "an absent switch must be refused naming the chart key tls.enabled"
+    );
+}
+
+/// EXACT and case-sensitive: `Required` or `on` meaning something is how a typo
+/// becomes a posture.
+#[test]
+fn a_client_auth_outside_the_three_values_refuses_by_name() {
+    for value in ["Required", "on", "true", "mtls"] {
+        let message = refusal(&[
+            ("LISTEN_TLS_ENABLED", "0"),
+            ("LISTEN_TLS_CLIENT_AUTH", value),
+        ]);
+        assert!(
+            message.contains("LISTEN_TLS_CLIENT_AUTH") && message.contains("`tls.clientAuth`"),
+            "an unknown client-auth mode must be refused naming the variable and the chart key"
+        );
+    }
+}
+
+/// A verifying mode with no authority to verify against is a deployment
+/// mistake, refused at boot naming the CA variable and the chart key that
+/// mounts it — never a listener that accepts every caller.
+#[test]
+fn a_verifying_mode_without_a_client_ca_refuses_naming_it() {
+    for mode in ["optional", "required"] {
+        let message = refusal(&[
+            ("LISTEN_TLS_ENABLED", "1"),
+            ("LISTEN_TLS_CERT_FILE", "/nonexistent/tls.pem"),
+            ("LISTEN_TLS_KEY_FILE", "/nonexistent/tls-key.pem"),
+            ("LISTEN_TLS_CLIENT_AUTH", mode),
+        ]);
+        assert!(
+            message.contains("LISTEN_TLS_CLIENT_CA_FILE"),
+            "a verifying mode with no CA must be refused naming LISTEN_TLS_CLIENT_CA_FILE"
+        );
+        assert!(
+            message.contains("`tls.clientCaSecret`"),
+            "a verifying mode with no CA must be refused naming tls.clientCaSecret"
+        );
+    }
+}
+
+/// A client that presents `leaf` (certificate, key) and trusts `ca_pem`.
+fn presenting(ca_pem: &str, leaf: &(String, String)) -> ClientTlsConfig {
+    trusting(ca_pem, SERVED_NAME).identity(Identity::from_pem(&leaf.0, &leaf.1))
+}
+
+/// A listener serving `p`'s leaf, verifying callers in `mode` against `p`'s
+/// own authority — one CA issuing both sides, as in the reference deployment.
+/// The three files are returned so they outlive the listener's boot.
+async fn serve_verifying(p: &Pki, mode: &str) -> (u16, [TempPem; 3]) {
+    let cert = TempPem::with(&p.cert_pem);
+    let key = TempPem::with(&p.key_pem);
+    let ca = TempPem::with(&p.ca_pem);
+    let tls = configured_with(cert.path(), key.path(), mode, Some(ca.path()));
+    let port = serve(Some(&tls)).await;
+    (port, [cert, key, ca])
+}
+
+/// `off` is what B-P1 states for every server, and it must keep serving a
+/// caller that presents no certificate — the behaviour every hop has today.
+#[tokio::test]
+async fn off_serves_a_client_presenting_no_certificate() {
+    let p = pki(SERVED_NAME);
+    let cert = TempPem::with(&p.cert_pem);
+    let key = TempPem::with(&p.key_pem);
+    let port = serve(Some(&configured_with(cert.path(), key.path(), "off", None))).await;
+
+    assert_eq!(
+        reach(port, Some(trusting(&p.ca_pem, SERVED_NAME))).await,
+        Ok(())
+    );
+}
+
+/// THE PROPERTY B-U5 EXISTS FOR (ADR-0852): `required` refuses a caller that
+/// presents no certificate, at the request.
+///
+/// MUTATION: the mode below set to `optional` turns this red — the same
+/// listener then serves the caller.
+#[tokio::test]
+async fn required_refuses_a_client_presenting_no_certificate() {
+    let p = pki(SERVED_NAME);
+    let (port, _files) = serve_verifying(&p, "required").await;
+
+    assert!(
+        reach(port, Some(trusting(&p.ca_pem, SERVED_NAME)))
+            .await
+            .is_err(),
+        "a required listener must refuse a caller that presents no certificate"
+    );
+}
+
+/// And the other half, so the case above cannot pass because the listener
+/// refuses everyone: a caller presenting a leaf the authority signed is served.
+#[tokio::test]
+async fn required_accepts_a_client_presenting_a_certificate_the_ca_signed() {
+    let p = pki(SERVED_NAME);
+    let (port, _files) = serve_verifying(&p, "required").await;
+    let leaf = client_leaf(&p.ca);
+
+    assert_eq!(
+        reach(port, Some(presenting(&p.ca_pem, &leaf))).await,
+        Ok(())
+    );
+}
+
+/// A leaf from an authority this listener does not trust is what an impostor
+/// presents, and `required` refuses it.
+#[tokio::test]
+async fn required_refuses_a_client_certificate_another_authority_signed() {
+    let p = pki(SERVED_NAME);
+    let (port, _files) = serve_verifying(&p, "required").await;
+    let stranger = pki(SERVED_NAME);
+    let leaf = client_leaf(&stranger.ca);
+
+    assert!(
+        reach(port, Some(presenting(&p.ca_pem, &leaf)))
+            .await
+            .is_err(),
+        "a required listener must refuse a leaf its client CA did not sign"
+    );
+}
+
+/// `optional` is the staging step between `off` and `required`: a caller with
+/// no certificate is still served.
+#[tokio::test]
+async fn optional_serves_a_client_presenting_no_certificate() {
+    let p = pki(SERVED_NAME);
+    let (port, _files) = serve_verifying(&p, "optional").await;
+
+    assert_eq!(
+        reach(port, Some(trusting(&p.ca_pem, SERVED_NAME))).await,
+        Ok(())
     );
 }
