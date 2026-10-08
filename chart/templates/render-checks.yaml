@@ -170,13 +170,13 @@ refuses its absence. `templates/deployment.yaml` renders the variable
 UNCONDITIONALLY, outside `tls.enabled`; the CA env, mount and volume stay
 under `tls.enabled` and render only when `tls.clientCaSecret` names a Secret.
 
-THE SCHEMA REFUSES FIRST (`type: string`, the three-value `enum`, and
-`tls.required`): an absent key, a bare `off` and an unknown mode never reach
-this file. The guard below is the K-1 shape kept anyway — map first, then
-`hasKey`, then `kindIs "string"` on the raw value BEFORE any `has`/`ne`
-(YAML 1.1 reads a bare `off` as the boolean `false`, and Go's `eq` on a bool
-and a string is a type error naming no key) — so the sentence an operator
-reads names the key and the variable even if a schema is not in the path.
+THE SCHEMA OWNS ONLY ABSENCE (`tls.required`). The leaf carries no `type` or
+`enum` (coordinator ruling R1, ADR-0847), so a bare `off`, any other
+non-string and an unknown mode all reach THIS file and are refused here by
+name. The guard is the K-1 shape — map first, then `hasKey`, then
+`kindIs "string"` on the raw value BEFORE any `has`/`ne` (YAML 1.1 reads a
+bare `off` as the boolean `false`, and Go's `eq` on a bool and a string is a
+type error naming no key) — so the sentence tells the operator to quote it.
 
 THE EXPAND'S "NOT ENFORCED YET" REFUSAL OF `optional` / `required` IS LIFTED:
 the binary verifies now. Two refusals replace it, both cross-key, which is

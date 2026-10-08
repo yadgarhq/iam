@@ -31,9 +31,11 @@ that render them either — `required` alone passes a null value through
 is this pair, excluded from the untyped-leaf census for the reason stated on
 it.
 
-THE THIRD (ADR-0854, B-U5): `tls.clientAuth` carries `type: string` and the
-`enum` `off`/`optional`/`required`, and `tls` carries it in `required` —
-`REQUIRED_NO_DEFAULT_MODES` below, for the same reason as the pair.
+AND `tls.clientAuth` (ADR-0854, B-U5): `tls` carries it in `required`, for the
+same reason as the pair, but the leaf stays an untyped `{}` (coordinator ruling
+R1, ADR-0847) — a `type` or `enum` would pre-empt the render check's named
+sentences for a bare `off`, a non-string and an unknown mode.
+`REQUIRED_NO_DEFAULT_MODES` below.
 
 Run: python3 -m pytest scripts/tests/ -q
 """
@@ -97,11 +99,13 @@ EXTRAS = (
 REQUIRED_NO_DEFAULT = ("tls.enabled", "iamDb.tls.enabled")
 
 # `tls.clientAuth` (B-U5, ADR-0854 extending ADR-0845): required with no
-# default like the switches above, but a MODE rather than a switch — so the
-# leaf carries `type: string` and the three-value `enum` instead of
-# `type: boolean`. Same exclusions as `REQUIRED_NO_DEFAULT`, for the same
-# reasons.
-CLIENT_AUTH_MODES = ["off", "optional", "required"]
+# default like the switches above, but a MODE rather than a switch, and its
+# shape is the render check's to refuse BY NAME (coordinator ruling R1,
+# ADR-0847): the leaf stays an untyped `{}` and only `required` is the
+# schema's. A `type: string` would refuse a bare `off` (read as false) with
+# helm's wording instead of the sentence telling the adopter to quote it; an
+# `enum` would do the same to an unknown mode. Same exclusions as
+# `REQUIRED_NO_DEFAULT`, for the same reasons.
 REQUIRED_NO_DEFAULT_MODES = ("tls.clientAuth",)
 
 
@@ -289,16 +293,17 @@ def every_schema_leaf_is_known_failures(doc: dict, values: dict) -> list[str]:
 
 
 def required_no_default_mode_failures(doc: dict) -> list[str]:
-    """The mode half of K-1: each leaf in `REQUIRED_NO_DEFAULT_MODES` carries
-    `type: string` AND the exact three-value `enum`, and is in its parent's
-    `required` list. `required` alone passes a null; `type` alone passes any
-    string; the `enum` is what refuses a typo by name at the schema."""
+    """The mode half of K-1: each leaf in `REQUIRED_NO_DEFAULT_MODES` is in its
+    parent's `required` list AND stays the untyped `{}` (ruling R1). A `type`
+    or `enum` added here would pre-empt the render check's named sentences, so
+    it is refused as surely as a dropped `required`."""
     failures = []
     for path in REQUIRED_NO_DEFAULT_MODES:
         node = node_at(doc, path)
-        if node != {"type": "string", "enum": CLIENT_AUTH_MODES}:
+        if node != {}:
             failures.append(
-                f"{path} is not declared as type string with enum {CLIENT_AUTH_MODES}: {node!r}"
+                f"{path} must be the untyped leaf {{}} so the render check names the "
+                f"refusal (ruling R1, ADR-0847): {node!r}"
             )
         parent_path, _, leaf = path.rpartition(".")
         parent = node_at(doc, parent_path) if parent_path else doc
@@ -364,7 +369,7 @@ def test_the_required_no_default_leaves_are_typed_boolean_and_required():
     assert failures == [], "\n".join(failures)
 
 
-def test_the_required_no_default_modes_are_typed_enumerated_and_required():
+def test_the_required_no_default_modes_are_untyped_and_required():
     failures = required_no_default_mode_failures(schema())
     assert failures == [], "\n".join(failures)
 
@@ -375,10 +380,15 @@ def test_mutation_dropping_client_auth_from_required_reddens():
     assert required_no_default_mode_failures(mutated) != []
 
 
-def test_mutation_dropping_client_auth_enum_reddens():
-    mutated = copy.deepcopy(schema())
-    mutated["properties"]["tls"]["properties"]["clientAuth"] = {"type": "string"}
-    assert required_no_default_mode_failures(mutated) != []
+def test_mutation_adding_a_client_auth_type_or_enum_reddens():
+    for node in (
+        {"type": "string"},
+        {"enum": ["off", "optional", "required"]},
+        {"type": "string", "enum": ["off", "optional", "required"]},
+    ):
+        mutated = copy.deepcopy(schema())
+        mutated["properties"]["tls"]["properties"]["clientAuth"] = node
+        assert required_no_default_mode_failures(mutated) != []
 
 
 def test_every_required_no_default_key_has_no_default_in_values_yaml():
@@ -656,12 +666,23 @@ def test_dropping_tls_required_degrades_the_bare_lint_message(tmp_path):
 # `clientAuth: "off"` is measured at review through the parent render (K-8),
 # not asserted here.
 #
-# WHICH REFUSAL FIRES IS MEASURED, NOT ASSUMED. The schema (`type: string`,
-# `enum`, `required`) pre-empts the template for an absent key, a bare `off`
-# and an unknown mode; those cases assert the schema's stable wrapper plus the
-# key and its path segment. The two cross-key refusals the schema cannot
-# express — a verifying mode with TLS off, and one with no CA Secret — are
-# the template's own, and assert its exact sentence.
+# WHICH REFUSAL FIRES IS MEASURED, NOT ASSUMED, on helm 4.3.0 and 3.18.4.
+# The schema's `required` refuses an ABSENT key, so that case asserts the
+# schema's stable wrapper plus the key. Everything else is the render
+# check's, by NAME (coordinator ruling R1: the leaf carries no `type` or
+# `enum`, so nothing pre-empts it): a bare `off`, any other non-string, an
+# unknown mode, and the two cross-key refusals — a verifying mode with TLS
+# off, and one with no CA Secret. Those cases assert the exact sentence, and
+# none passes `--skip-schema-validation`: the schema runs and lets them by.
+
+CLIENT_AUTH_NOT_A_STRING_SENTENCE = (
+    'iam: tls.clientAuth must be set to a quoted string, "off", "optional" or '
+    '"required"; it renders LISTEN_TLS_CLIENT_AUTH and has no default. YAML reads a '
+    'bare off as false: write `clientAuth: "off"` (ADR-0854, ADR-0845, ADR-0797)'
+)
+CLIENT_AUTH_UNKNOWN_SENTENCE = (
+    'iam: tls.clientAuth is "{mode}", which is not off, optional or required.'
+)
 
 CLIENT_AUTH_WITHOUT_TLS_SENTENCE = (
     'iam: tls.clientAuth is "{mode}" but tls.enabled is false: a cleartext listener '
@@ -720,26 +741,43 @@ def test_client_auth_absent_is_refused_by_bare_lint_too():
     assert "clientAuth" in result.stdout + result.stderr
 
 
-def test_client_auth_unknown_mode_is_refused_by_the_schema(tmp_path):
+def test_client_auth_unknown_mode_is_refused_by_name(tmp_path):
+    """MUTATION: an `enum` re-added to the schema turns this red — helm's own
+    wording would fire instead of the sentence."""
     for mode in ("bogus", "Required", "on"):
         overlay = values_file(
             tmp_path / f"{mode}.yaml", {"tls": {"enabled": True, "clientAuth": mode}}
         )
         result = render(CHART, "--values", str(overlay))
         assert result.returncode != 0, f"clientAuth: {mode} must refuse"
-        assert SCHEMA_WRAPPER in result.stderr, result.stderr
-        assert "clientAuth" in result.stderr, result.stderr
+        assert CLIENT_AUTH_UNKNOWN_SENTENCE.format(mode=mode) in result.stderr, result.stderr
+        assert SCHEMA_WRAPPER not in result.stderr, result.stderr
 
 
-def test_client_auth_unquoted_off_is_refused_by_the_schema(tmp_path):
+def test_client_auth_unquoted_off_is_refused_by_name(tmp_path):
     """UNQUOTED, DELIBERATELY: YAML 1.1 reads a bare `off` as the boolean
-    `false`. The schema's `type: string` refuses it before the template's own
-    `kindIs "string"` guard is reached."""
+    `false`. The render check's `kindIs "string"` guard refuses it with the
+    sentence telling the adopter to quote it (convention item 1).
+
+    MUTATION: a `type: string` re-added to the schema turns this red."""
     overlay = values_file(tmp_path / "unquoted-off.yaml", "tls: {enabled: true, clientAuth: off}\n")
     result = render(CHART, "--values", str(overlay))
     assert result.returncode != 0
-    assert SCHEMA_WRAPPER in result.stderr, result.stderr
-    assert "clientAuth" in result.stderr, result.stderr
+    assert CLIENT_AUTH_NOT_A_STRING_SENTENCE in result.stderr, result.stderr
+    assert SCHEMA_WRAPPER not in result.stderr, result.stderr
+
+
+def test_client_auth_non_string_is_refused_by_name(tmp_path):
+    """Any other non-string — a number, a list, a map — meets the same
+    sentence."""
+    for shape in ("3", "[off]", "{mode: off}", "true"):
+        overlay = values_file(
+            tmp_path / "non-string.yaml", f"tls: {{enabled: true, clientAuth: {shape}}}\n"
+        )
+        result = render(CHART, "--values", str(overlay))
+        assert result.returncode != 0, f"clientAuth: {shape} must refuse"
+        assert CLIENT_AUTH_NOT_A_STRING_SENTENCE in result.stderr, result.stderr
+        assert SCHEMA_WRAPPER not in result.stderr, result.stderr
 
 
 def test_client_auth_off_with_tls_on_renders_the_variable(tmp_path):
