@@ -12,13 +12,14 @@
 //!
 //! # TLS
 //!
-//! **OPT-IN, and OFF unless a deployment asks for it.** With nothing configured
-//! this dials exactly as it always has, in cleartext. That is deliberate rather
-//! than timid: the code ships first and the cut-over is a separate change that
-//! can be reverted on its own. `iam-db` can now serve TLS — opt-in and off by
-//! default, the same shape [`crate::serve`] gives this service's own listener —
-//! so the cut-over is the one change that turns both ends of the hop on
-//! together.
+//! **NO COMPILED-IN DEFAULT (ADR-0845).** `IAM_DB_TLS_ENABLED` must be exactly
+//! `"1"` or `"0"`; absent, empty or any other value refuses the boot rather
+//! than guessing cleartext. This used to be opt-in — anything but `"1"`
+//! dialled in cleartext — until ADR-0845 found that an unset variable and a
+//! typo both silently meant the same thing. The CUT-OVER ITSELF is still a
+//! separate, revertible choice: writing `"0"` is what reverts it, and the
+//! chart renders this variable (from `iamDb.tls.enabled`) unconditionally
+//! now, so the only way it is genuinely absent is a chart that forgot to.
 //!
 //! **This module is the VERIFYING half.** [`crate::serve`] is the presenting
 //! half, and the two are easy to confuse because they share a word: here a
@@ -103,6 +104,15 @@ pub const IAM_DB: &str = "IAM_DB";
 #[derive(Debug, thiserror::Error)]
 pub enum TlsConfigError {
     #[error(
+        "{0}_TLS_ENABLED must be \"1\" or \"0\" and is {1}. ADR-0845 gives this knob no \
+         compiled-in default, so this service cannot guess whether to dial over TLS: \
+         leaving it unset or empty is refused exactly like any other value outside the two \
+         it accepts. Write \"1\" to dial over TLS or \"0\" to dial in cleartext. The chart \
+         renders this from `iamDb.tls.enabled`."
+    )]
+    EnabledNotBoolean(&'static str, String),
+
+    #[error(
         "{0}_TLS_ENABLED is set but {0}_TLS_CA_FILE names no CA bundle. TLS was asked \
          for, so this is a deployment mistake rather than a reason to connect in \
          cleartext — and it is NOT the same as leaving TLS off, which is the \
@@ -168,8 +178,9 @@ struct ClientIdentity {
 impl UpstreamTls {
     /// Read one upstream's transport configuration from the environment.
     ///
-    /// `Ok(None)` is the ordinary answer today: TLS is opt-in, so an
-    /// unconfigured deployment dials in cleartext exactly as before.
+    /// `Ok(None)` is the explicit-cleartext answer: `{prefix}_TLS_ENABLED` is
+    /// `"0"`. There is no unconfigured answer any more (ADR-0845) — absent or
+    /// anything else refuses.
     pub fn from_env(prefix: &'static str) -> Result<Option<Self>, TlsConfigError> {
         Self::from_lookup(prefix, |key| std::env::var(key).ok())
     }
@@ -190,30 +201,47 @@ impl UpstreamTls {
                 .filter(|v| !v.is_empty())
         };
 
-        // Exactly "1". A permissive parse here — "0", "false" and "no" all
-        // enabling it — is how a setting meant to be off ends up on, and the
-        // reverse mistake is worse: this flag is the revert lever for the
-        // cut-over, and a lever that does not move is not one.
-        if get("TLS_ENABLED").as_deref() != Some("1") {
-            // THE CLIENT CERTIFICATE IS NAMED HERE TOO, and leaving it out was
-            // the silent case: an operator who mounts a client leaf and forgets
-            // the flag gets a cleartext hop presenting no identity, and nothing
-            // says so. Mutual TLS is meaningless without the encrypted transport
-            // it runs inside, so this one flag turns both off.
-            if get("TLS_CA_FILE").is_some() || get("TLS_CLIENT_CERT_FILE").is_some() {
-                // NOT an error. Leaving the bundle in place while the flag is
-                // off is exactly how the cut-over gets reverted, so refusing it
-                // would make the lever unusable. It is still worth a line: a
-                // deployment that believes it is encrypted and is not should be
-                // able to see that from the boot log.
-                tracing::warn!(
-                    prefix,
-                    "a CA bundle or a client certificate is configured but \
-                     {prefix}_TLS_ENABLED is not \"1\", so this upstream is dialled in \
-                     CLEARTEXT and presents no identity"
-                );
+        // EXACTLY "1" OR "0", AND NOTHING ELSE — INCLUDING ABSENT (ADR-0845).
+        // The knob used to have a compiled-in default: anything but "1" was
+        // cleartext, so an unset variable and a typo both silently meant OFF.
+        // ADR-0845 deletes that default.
+        match get("TLS_ENABLED").as_deref() {
+            Some("0") => {
+                // THE CLIENT CERTIFICATE IS NAMED HERE TOO, and leaving it out
+                // was the silent case: an operator who mounts a client leaf
+                // and forgets the flag gets a cleartext hop presenting no
+                // identity, and nothing says so. Mutual TLS is meaningless
+                // without the encrypted transport it runs inside, so this one
+                // flag turns both off.
+                if get("TLS_CA_FILE").is_some() || get("TLS_CLIENT_CERT_FILE").is_some() {
+                    // NOT an error. Leaving the bundle in place while the flag
+                    // is off is exactly how the cut-over gets reverted, so
+                    // refusing it would make the lever unusable. It is still
+                    // worth a line: a deployment that believes it is
+                    // encrypted and is not should be able to see that from
+                    // the boot log.
+                    tracing::warn!(
+                        prefix,
+                        "a CA bundle or a client certificate is configured but \
+                         {prefix}_TLS_ENABLED is \"0\", so this upstream is dialled in \
+                         CLEARTEXT and presents no identity"
+                    );
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            Some("1") => {}
+            Some(other) => {
+                return Err(TlsConfigError::EnabledNotBoolean(
+                    prefix,
+                    format!("{other:?}"),
+                ))
+            }
+            None => {
+                return Err(TlsConfigError::EnabledNotBoolean(
+                    prefix,
+                    "NOT SET".to_string(),
+                ))
+            }
         }
 
         // BOTH, OR NEITHER. A certificate with no key cannot be presented and a

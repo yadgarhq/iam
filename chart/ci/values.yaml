@@ -1,0 +1,35 @@
+# WHAT THIS CHART'S OWN CI RENDERS AGAINST, bare — no parent, no subchart.
+#
+# ADR-0845 (C-SVb) drops `tls.enabled`'s and `iamDb.tls.enabled`'s chart
+# defaults and makes both `required` (`chart/values.schema.json`), so a bare
+# `helm lint --strict chart` and a bare `helm template` both refuse the
+# moment that lands, with nothing in THIS repository's own diff to explain
+# why: the shared `helm-lint` hook (`yadgarhq/actions` C-A2) and
+# `scripts/tests/*.py` render this chart alone, with no parent values to
+# fall back on.
+#
+# `yadgarhq/actions`'s `chart_values_override.py` passes this file with `-f`
+# to both `helm lint --strict` and `helm template` whenever it exists — the
+# same backward-compatible convention `chart/ci/api-versions.txt` would use
+# for `--api-versions`, had this chart needed one. A chart with no such file
+# sees no difference; this one now needs it, the same reason
+# `yadgarhq/chart`'s own `chart/ci/values.yaml` exists at the parent level.
+#
+# `scripts/tests/test_values_schema.py` and
+# `scripts/tests/test_render_checks.py` pass this same file to every bare
+# `helm template`/`helm lint` they run, so the suite and the hook measure one
+# chart rather than two.
+tls:
+  enabled: true
+iamDb:
+  tls:
+    enabled: true
+
+# B-N3E (K-8 expand, ADR-0852): the broker hop's switch, stated at the only
+# value this chart version accepts. `false` renders `NATS_TLS_ENABLED="0"`;
+# `true` is refused until B-N3, because platform's NATS serves no TLS until
+# B-L1. Stated here so B-N3, which makes the key required, needs no change to
+# this file.
+nats:
+  tls:
+    enabled: false

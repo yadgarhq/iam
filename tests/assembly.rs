@@ -11,7 +11,7 @@
 //!
 //! **THE MUTANT THIS FILE EXISTS TO KILL.** The watch set used to be FOUR builder
 //! calls scattered across `main.rs`, up to a hundred and fifty lines apart, and
-//! no test in this repository spawns the binary — so deleting any one of them
+//! no test in this repository spawned the binary then — so deleting any one of them
 //! compiled, passed the whole suite, and shipped a process that would never
 //! notice that file rotating. The old `tests/tls_rotation.rs` could not catch it:
 //! it rebuilt the same assembly by hand through the same four methods, so

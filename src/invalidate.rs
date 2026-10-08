@@ -213,6 +213,50 @@ pub struct Invalidator {
     published: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>,
 }
 
+/// How long one dial may take before it counts as unreachable.
+///
+/// **Set here rather than left to `async-nats`, because [`Invalidator::connect`]
+/// is awaited from `main` before the listener binds** — so whatever bounds
+/// this bounds how long this service takes to start serving when the
+/// broker's address accepts a connection and then says nothing. The
+/// library's own default happens to be five seconds today, and a default in
+/// a dependency is not a bound this repository gets to rely on.
+///
+/// 965 CENSUS ROW M10 (CC): mirrors `gateway`'s `invalidate/broker.rs`
+/// `CONNECT_TIMEOUT` exactly — same value, same builder — because the two
+/// boot dials are the same shape against the same broker, and a repository
+/// that left this one unmarked while the other set it explicitly is exactly
+/// the drift 965 exists to name.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Everything [`Invalidator::connect`] builds before it dials: the pair or
+/// the anonymous default, bounded by [`CONNECT_TIMEOUT`], with the event
+/// callback that surfaces a refused publish. Pulled out so a test can
+/// inspect what this function alone produces — `connect` itself does
+/// nothing further to it before `.connect(url).await` — rather than
+/// re-deriving the same expression and asserting it equals itself.
+fn connect_options(credentials: &Option<Credentials>) -> async_nats::ConnectOptions {
+    // BUILT FROM THE PAIR, never spliced into the URL. `nats://user:pass@host`
+    // carries a password only URL-encoded, so a password containing `@`, `/`
+    // or `#` would be silently truncated and a DIFFERENT one sent than the one
+    // in the Secret — a WRONGPASS whose cause is invisible at every layer.
+    let options = match credentials {
+        Some(c) => {
+            async_nats::ConnectOptions::with_user_and_password(c.user.clone(), c.password.clone())
+        }
+        None => async_nats::ConnectOptions::new(),
+    };
+    options
+        // BOUNDED HERE. See `CONNECT_TIMEOUT`: this is awaited before the
+        // listener binds, so an unbounded dial is an unbounded boot.
+        .connection_timeout(CONNECT_TIMEOUT)
+        // WITHOUT THIS THE WORST FAILURE IN THIS MODULE IS INVISIBLE. See
+        // the module comment: a refused PUBLISH leaves the connection
+        // open, is answered asynchronously after `publish` has already
+        // returned `Ok`, and is logged by `async-nats` itself at `debug!`.
+        .event_callback(|event| async move { on_event(event) })
+}
+
 impl Invalidator {
     /// Connect, or return a publisher that does nothing.
     ///
@@ -247,22 +291,7 @@ impl Invalidator {
             );
             return Self::with(None);
         };
-        // BUILT FROM THE PAIR, never spliced into the URL. `nats://user:pass@host`
-        // carries a password only URL-encoded, so a password containing `@`, `/`
-        // or `#` would be silently truncated and a DIFFERENT one sent than the one
-        // in the Secret — a WRONGPASS whose cause is invisible at every layer.
-        let options = match &credentials {
-            Some(c) => async_nats::ConnectOptions::with_user_and_password(
-                c.user.clone(),
-                c.password.clone(),
-            ),
-            None => async_nats::ConnectOptions::new(),
-        };
-        // WITHOUT THIS THE WORST FAILURE IN THIS MODULE IS INVISIBLE. See the
-        // module comment: a refused PUBLISH leaves the connection open, is
-        // answered asynchronously after `publish` has already returned `Ok`, and
-        // is logged by `async-nats` itself at `debug!`.
-        let options = options.event_callback(|event| async move { on_event(event) });
+        let options = connect_options(&credentials);
         match options.connect(url).await {
             Ok(client) => {
                 tracing::info!(
@@ -418,68 +447,4 @@ fn on_event(event: async_nats::Event) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn no_broker_is_a_working_publisher_that_publishes_nothing() {
-        // The alternative — refusing to construct — would make a missing broker
-        // an authentication outage, which is a worse failure than a late
-        // revocation.
-        let inv = Invalidator::connect(None, None).await;
-        inv.credential_revoked("yadgar:user:x").await;
-        inv.teams_changed("yadgar:user:x").await;
-        assert!(!inv.is_publishing());
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_broker_does_not_panic_or_block() {
-        let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), None).await;
-        inv.credential_revoked("yadgar:user:y").await;
-        assert!(!inv.is_publishing());
-    }
-
-    #[test]
-    fn a_credential_never_prints_itself() {
-        // The one place a password reaches a formatter. A derived `Debug` would
-        // put it into every panic message and test failure that touched the
-        // struct, which is how a secret ends up in a log nobody meant to write
-        // it to.
-        let c = Credentials {
-            user: "iam".into(),
-            password: "sentinel-of-the-nats-password".into(),
-            password_file: "/var/run/secrets/nats/password".into(),
-        };
-        let printed = format!("{c:?}");
-        assert!(
-            !printed.contains("sentinel-of-the-nats-password"),
-            "{printed}"
-        );
-        assert!(printed.contains("iam"), "{printed}");
-    }
-
-    #[test]
-    fn subjects_share_a_namespace_so_one_wildcard_can_catch_them() {
-        assert!(subject::CREDENTIAL_REVOKED.starts_with("yadgar.iam."));
-        assert!(subject::TEAMS_CHANGED.starts_with("yadgar.iam."));
-    }
-
-    #[test]
-    fn the_subjects_are_pinned_as_literals_because_three_parties_must_agree() {
-        // AS LITERALS, never through `subject::*`. An assertion that reads the
-        // constant renames both sides at once, so it cannot see a rename — the
-        // namespace check above is exactly that shape, and both subjects can be
-        // renamed under it with the whole suite still green.
-        //
-        // Three parties carry these strings and only one of them is this file.
-        // `gateway/src/invalidate.rs` keeps its own copy, pinned there the same
-        // way, and `deploy/infra/nats.yaml` names both in the broker's publish
-        // and subscribe allow-lists. A rename no test can see leaves publisher,
-        // subscriber and broker disagreeing while three suites stay green: the
-        // broker refuses the publish, nothing subscribes to what is published,
-        // and a revoked credential keeps working until the gateway's cache TTL
-        // expires. That is a security bound, so the literal is the assertion.
-        assert_eq!(subject::CREDENTIAL_REVOKED, "yadgar.iam.credential.revoked");
-        assert_eq!(subject::TEAMS_CHANGED, "yadgar.iam.user.teams-changed");
-    }
-}
+mod tests;

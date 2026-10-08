@@ -238,7 +238,7 @@ fn verify_counted(password: &str, parsed: &PasswordHash) -> Option<bool> {
 ///
 /// THEN CHECK THE FLOOR STILL CLEARS THE NEW COST. Raising these is precisely
 /// the change that pushes a legitimate verification past
-/// [`crate::service::DEFAULT_LOGIN_RESPONSE_FLOOR`], and a floor a verification
+/// [`crate::service::MEASURED_LOGIN_RESPONSE_FLOOR`], and a floor a verification
 /// exceeds is a floor hiding nothing. `Login` warns when that happens rather
 /// than failing, so the signal is in the logs and not in this test suite.
 fn hash_secret(secret: &[u8]) -> Result<String, argon2::password_hash::Error> {
@@ -433,7 +433,7 @@ impl Keys {
     /// changes is only that the set of rows at the current cost is not empty.
     ///
     /// THE DEFENCE THAT GENERALISES IS A RESPONSE-TIME FLOOR ON `Login`, AND IT IS
-    /// BUILT — [`crate::service::DEFAULT_LOGIN_RESPONSE_FLOOR`], configurable
+    /// BUILT — [`crate::service::MEASURED_LOGIN_RESPONSE_FLOOR`], configurable
     /// through `LOGIN_RESPONSE_FLOOR_MS`. The response time stops being a function
     /// of the work done, so a row's parameters stop being readable from it. Three
     /// things about where it had to sit:

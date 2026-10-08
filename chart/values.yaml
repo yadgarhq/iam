@@ -35,16 +35,27 @@ resources:
 # something neither the chart nor the binary can tell apart. Nothing here
 # requires a CRD, an issuer or a mesh.
 tls:
-  # OFF, and it stays off until both halves of the hop can be turned on
-  # together. The code ships first and the cut-over is a separate, revertible
-  # change — the same discipline the attestation cut-over used.
+  # NO DEFAULT HERE ANY MORE (ADR-0845, C-SVb). `enabled` used to ship
+  # `false`, and the binary's own compiled-in default agreed with it;
+  # ADR-0845 deleted that default from the binary, so a chart default would
+  # be the one compiled-in default this knob has left — invisible at the
+  # point of use and wrong the day somebody relies on it.
+  # `chart/values.schema.json` marks the key `required`, so an adopter who
+  # omits it meets a render-time refusal naming `tls.enabled` rather than a
+  # listener that silently opens in cleartext. `chart/ci/values.yaml` sets it
+  # `true` so every shared gate that lints or renders this chart offline
+  # still has a value to coalesce.
+  #
+  # THE CUT-OVER ITSELF IS STILL A SEPARATE, REVERTIBLE CHOICE. It stays off
+  # until both halves of the hop can be turned on together — the same
+  # discipline the attestation cut-over used.
   #
   # THERE IS NO SILENT MIDDLE STATE. `true` with no usable certificate fails at
   # boot naming the file, before the crypto keys are even read; it never falls
   # back to a plaintext listener. `false` with a certificate still configured is
   # the reverted state, and iam logs a warning saying the listener is in
   # cleartext so nobody has to infer it.
-  enabled: false
+  #
   # The Secret holding the certificate this service serves AND its private key.
   #
   # BOTH KEYS ARE MOUNTED HERE, which is the one place in this chart where that
@@ -139,21 +150,29 @@ iamDb:
   # assembled by hand produces something neither the chart nor the binary can
   # tell apart. Nothing here requires a CRD, an issuer or a mesh.
   tls:
-    # OFF, and it stays off until the cut-over. **iam-db CAN now serve TLS** —
-    # its chart's `tls.enabled`, also off by default — so this is no longer
-    # waiting on a server that cannot answer. It is waiting on certificates, and
-    # on turning BOTH ends on in one change: this value alone breaks the hop,
-    # and iam-db's alone breaks it from the other side.
+    # NO DEFAULT HERE ANY MORE (ADR-0845, C-SVb). `enabled` used to ship
+    # `false`, and the binary's own compiled-in default agreed with it;
+    # ADR-0845 deleted that default from the binary, so a chart default would
+    # be the one compiled-in default this knob has left. `chart/values.schema
+    # .json` marks the key `required`, so an adopter who omits it meets a
+    # render-time refusal naming `iamDb.tls.enabled` rather than a hop that
+    # silently dials cleartext. `chart/ci/values.yaml` sets it `true` so
+    # every shared gate that lints or renders this chart offline still has a
+    # value to coalesce.
     #
-    # The code ships first and the cut-over is a separate, revertible change —
-    # the same discipline the attestation cut-over used.
+    # THE CUT-OVER ITSELF IS STILL A SEPARATE, REVERTIBLE CHOICE. **iam-db CAN
+    # now serve TLS** — its chart's `tls.enabled`, no default either — so
+    # this is no longer waiting on a server that cannot answer. It is waiting
+    # on certificates, and on turning BOTH ends on in one change: this value
+    # alone breaks the hop, and iam-db's alone breaks it from the other side.
+    # The same discipline the attestation cut-over used.
     #
     # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at boot
     # naming the file; it never falls back to cleartext, and it never falls back
     # to the platform trust store. `false` with a bundle still configured is the
     # reverted state, and iam logs a warning saying the hop is in cleartext so
     # nobody has to infer it.
-    enabled: false
+    #
     # The Secret holding the authority that signed iam-db's certificate.
     #
     # A SECRET, THOUGH A CA IS PUBLIC — because that is where an issuer actually
@@ -357,6 +376,22 @@ nats:
   # the block names an account and a password together, and iam refuses to start
   # with one and not the other.
   user: iam
+
+  # TLS on the broker hop (ADR-0852, ADR-0845): `nats.tls.enabled`. THIS CHART
+  # VERSION IS THE K-8 EXPAND. It declares the key in the schema and states no
+  # value for it here, deliberately, so nothing about the hop changes yet:
+  #
+  #   - left out, nothing renders, and the manifest is what it was before;
+  #   - `false` renders `NATS_TLS_ENABLED="0"`;
+  #   - `true` is REFUSED at render. The binary reads `NATS_TLS_ENABLED` only
+  #     from B-N3, and the broker serves no TLS until B-L1, so a `true` here
+  #     would look encrypted while the hop stays cleartext.
+  #
+  # B-N3 makes `enabled` required with no default (ADR-0845), lifts the `true`
+  # refusal, and adds the CA keys and mount. State `false` now, so that step
+  # needs no values change. The hop will present iam's existing client leaf,
+  # `iam-client-tls` (ADR-0852 design item 7); which key names it is B-N3's
+  # choice, because today that leaf mounts only under `iamDb.tls`.
 
 login:
   # The shortest time Login may answer in, in milliseconds. It floors the WHOLE

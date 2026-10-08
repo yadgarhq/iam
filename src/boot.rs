@@ -58,8 +58,8 @@ pub fn nats_credentials(
     // a variable with no value must not be a different configuration from one
     // that omits it, so both collapse to the empty string here and every arm
     // below tests emptiness rather than presence.
-    let user = env(USER_KEY).unwrap_or_default();
-    let path = env(PASSWORD_FILE_KEY).unwrap_or_default();
+    let user = env(USER_KEY).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): NEITHER user nor password is how a deployment says the broker asks for none (965 census, orphan).
+    let path = env(PASSWORD_FILE_KEY).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): absence here is the same deployment as an empty value — the broker asking for no authentication (965 census, orphan).
 
     if path.is_empty() {
         return match user.is_empty() {
@@ -220,7 +220,7 @@ pub fn logging() {
         // A service nobody can observe is one D67 cannot measure either.
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")), // ADR-0569-EXCEPTION(LIB): the log level is observability, not behaviour (965 census row B8).
         )
         .init();
 }
@@ -234,9 +234,11 @@ pub fn listener() -> Result<(Option<ServerTls>, Server), Box<dyn std::error::Err
     // quietly stayed in the clear is the one failure an operator who asked for
     // TLS cannot see.
     //
-    // `.to_string()` on the way out for the reason spelled out on the dial
-    // below: `Box<dyn Error>` prints with DEBUG, and these messages are
-    // sentences naming a file.
+    // `.to_string()` on the way out. It dates from when `main` returned
+    // `Result` and Rust printed a bare `?` here with Debug; `main` prints
+    // Display now (ledger 1258), so the conversion no longer changes what
+    // the operator reads. It stays as the sentence it always produced,
+    // naming a file.
     let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
     let server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
     Ok((listen_tls, server))
@@ -251,17 +253,25 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
     let db_host = env_required("IAM_DB_HOST")?;
-    let db_port: u16 = env_required("IAM_DB_PORT")?.parse()?;
+    // NAMED on the way out. A bare `?` here would print the parse error
+    // alone — `invalid digit found in string` — which tells an operator
+    // neither which variable was wrong nor what it held.
+    let db_port: u16 = env_required("IAM_DB_PORT")?
+        .parse()
+        .map_err(|e| format!("IAM_DB_PORT is not a port number: {e}"))?;
 
-    // OPT-IN, and OFF unless a deployment asks for it. Nothing configured means
-    // the cleartext dial this service has always done. `iam-db` can now serve
-    // TLS, also opt-in and also off, so the cut-over is a later change that
-    // turns both ends on together and can be reverted on its own.
+    // NO COMPILED-IN DEFAULT (ADR-0845). `IAM_DB_TLS_ENABLED` must be exactly
+    // "1" or "0"; absent, empty or any other value refuses the boot rather
+    // than guessing cleartext. `iam-db` can now serve TLS, under the same
+    // contract, so the cut-over is a later change that turns both ends on
+    // together and can be reverted on its own by writing "0".
     //
-    // `.to_string()` on the way out, and not decoration: `main` returns
-    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
-    // `NoCaFile("IAM_DB")` on the operator's terminal instead of the sentence
-    // naming the missing variable and saying why cleartext is not the answer.
+    // `.to_string()` on the way out. It dates from when `main` returned
+    // `Result` and Rust printed a bare `?` here with Debug, as
+    // `NoCaFile("IAM_DB")`. `main` prints Display now (ledger 1258), so the
+    // conversion no longer changes what the operator reads; it stays as the
+    // sentence it always produced, naming the missing variable and saying
+    // why cleartext is not the answer.
     let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB).map_err(|e| e.to_string())?;
     let db = upstream::connect(&db_host, db_port, db_tls.as_ref())
         .await
@@ -270,8 +280,7 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
         // the chain walk. `BalanceError`'s other messages are already complete
         // paragraphs explaining that an empty bundle trusts nobody and that a
         // missing one is not a reason to connect in cleartext — `Tls` is not
-        // one of them, and Debug would print the struct and throw all of that
-        // away regardless.
+        // one of them.
         .map_err(|e| refusal(&e))?;
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
@@ -299,8 +308,10 @@ pub fn rotation() -> Result<(Configuration, Schedule), Box<dyn std::error::Error
     // `yadgarhq/deploy`'s MIGRATION_NOTES.md, steps 2a and 2b — NOT this
     // repository's, which has no such section.
     //
-    // `.to_string()` on the way out because `Box<dyn Error>` prints with DEBUG
-    // and these messages are sentences.
+    // `.to_string()` on the way out. It dates from when `main` returned
+    // `Result` and Rust printed a bare `?` here with Debug; `main` prints
+    // Display now (ledger 1258), so the conversion no longer changes what
+    // the operator reads. It stays as the sentence it always produced.
     let config = rotate::Configuration::mounted();
     let schedule = config.schedule().map_err(|e| e.to_string())?;
     Ok((config, schedule))
@@ -312,7 +323,9 @@ pub fn metrics() -> Result<(), Box<dyn std::error::Error>> {
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
     // serve traffic, which is D25's rule applied to the metrics path too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
+        .parse()
+        .map_err(|e| format!("METRICS_LISTEN is not a host:port address: {e}"))?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
@@ -368,18 +381,26 @@ pub fn response_floors() -> Result<ResponseFloors, Box<dyn std::error::Error>> {
     // back to. Substituting one silently would leave an operator who believes
     // they raised the floor running the old one, and a security control nobody
     // can tell is misconfigured is the failure this floor's own warning exists
-    // to prevent. `service::DEFAULT_LOGIN_RESPONSE_FLOOR` survives as the
+    // to prevent. `service::MEASURED_LOGIN_RESPONSE_FLOOR` survives as the
     // MEASUREMENT the chart's value was calibrated from — documentation, read by
     // no knob path.
-    let login_response_floor =
-        Duration::from_millis(env_required("LOGIN_RESPONSE_FLOOR_MS")?.parse()?);
+    let login_response_floor = Duration::from_millis(
+        env_required("LOGIN_RESPONSE_FLOOR_MS")?
+            .parse()
+            .map_err(|e| format!("LOGIN_RESPONSE_FLOOR_MS is not a number of milliseconds: {e}"))?,
+    );
 
     // ITS OWN VALUE, because `RedeemEnrolment` legitimately does more work — two
     // Argon2id operations and a further round trip — and a floor sized for
     // `Login` would be exceeded by every successful redemption, turning the
     // warning that says "raise this" into one that fires on every call.
-    let redeem_response_floor =
-        Duration::from_millis(env_required("REDEEM_RESPONSE_FLOOR_MS")?.parse()?);
+    let redeem_response_floor = Duration::from_millis(
+        env_required("REDEEM_RESPONSE_FLOOR_MS")?
+            .parse()
+            .map_err(|e| {
+                format!("REDEEM_RESPONSE_FLOOR_MS is not a number of milliseconds: {e}")
+            })?,
+    );
     tracing::info!(
         login_floor_ms = login_response_floor.as_millis() as u64,
         redeem_floor_ms = redeem_response_floor.as_millis() as u64,

@@ -2,20 +2,23 @@
 //!
 //! The mirror image of [`crate::upstream`], and deliberately the same shape: a
 //! `<PREFIX>_TLS_*` triple read through an injected lookup, a flag that must be
-//! exactly `"1"`, and a misconfiguration that is an error rather than a
+//! exactly `"1"` or `"0"`, and a misconfiguration that is an error rather than a
 //! downgrade. **The two configure opposite directions and must not be
 //! confused:** `upstream` decides how this service VERIFIES `iam-db`, and its
 //! prefix names that upstream; this module decides which certificate this
 //! service PRESENTS to its own callers, and its prefix is `LISTEN`, already the
 //! variable naming the address it binds.
 //!
-//! # It is OPT-IN, and OFF unless a deployment asks for it
+//! # NO COMPILED-IN DEFAULT (ADR-0845)
 //!
-//! With nothing configured this binds exactly the plaintext listener it always
-//! has. That is deliberate rather than timid: the certificates do not exist yet,
-//! and this service's callers — the gateway among them — carry their own
-//! matching flag, also shipped off. The cut-over turns both ends on together and
-//! is a separate change that can be reverted on its own.
+//! `LISTEN_TLS_ENABLED` must be exactly `"1"` or `"0"`; absent, empty or any
+//! other value refuses the boot rather than guessing cleartext. This used to
+//! be opt-in — anything but `"1"` bound the plaintext listener it always had —
+//! until ADR-0845 found that an unset variable and a typo both silently meant
+//! the same thing. The CUT-OVER ITSELF is still a separate, revertible
+//! choice: writing `"0"` is what reverts it, and the chart renders this
+//! variable (from `tls.enabled`) unconditionally now, so the only way it is
+//! genuinely absent is a chart that forgot to.
 //!
 //! # Configuration is file paths and a flag, never an issuer-specific resource
 //!
@@ -61,7 +64,7 @@
 //!
 //! **The one test that stays here is the one whose numbers are both here.** The
 //! budget must outlast the slowest legitimate call, and
-//! [`crate::service::DEFAULT_REDEEM_RESPONSE_FLOOR`] is the estate's only real
+//! [`crate::service::MEASURED_REDEEM_RESPONSE_FLOOR`] is the estate's only real
 //! lower bound for that — so `a_drain_budget_must_outlast_the_slowest_legitimate_call`
 //! compares two production constants in this repository against the crate's.
 //!
@@ -103,6 +106,15 @@ pub const LISTEN: &str = "LISTEN";
 /// that is what an operator who set the flag was trying to stop.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerTlsError {
+    #[error(
+        "{0}_TLS_ENABLED must be \"1\" or \"0\" and is {1}. ADR-0845 gives this knob no \
+         compiled-in default, so this service cannot guess whether to listen over TLS: \
+         leaving it unset or empty is refused exactly like any other value outside the two \
+         it accepts. Write \"1\" to serve this listener over TLS or \"0\" to serve in \
+         cleartext. The chart renders this from `tls.enabled`."
+    )]
+    EnabledNotBoolean(&'static str, String),
+
     #[error(
         "{0}_TLS_ENABLED is set but {0}_TLS_CERT_FILE names no certificate. TLS was \
          asked for, so this is a deployment mistake rather than a reason to listen in \
@@ -194,8 +206,9 @@ pub struct ServerTls {
 impl ServerTls {
     /// Read the listener's transport configuration from the environment.
     ///
-    /// `Ok(None)` is the ordinary answer today: TLS is opt-in, so an
-    /// unconfigured deployment binds the plaintext listener exactly as before.
+    /// `Ok(None)` is the explicit-cleartext answer: `{prefix}_TLS_ENABLED` is
+    /// `"0"`. There is no unconfigured answer any more (ADR-0845) — absent or
+    /// anything else refuses.
     pub fn from_env(prefix: &'static str) -> Result<Option<Self>, ServerTlsError> {
         Self::from_lookup(prefix, |key| std::env::var(key).ok())
     }
@@ -216,25 +229,44 @@ impl ServerTls {
                 .filter(|v| !v.is_empty())
         };
 
-        // Exactly "1". A permissive parse here — "0", "false" and "no" all
-        // enabling it — is how a setting meant to be off ends up on, and the
-        // reverse mistake is worse: this flag is the revert lever for the
-        // cut-over, and a lever that does not move is not one. It is the same
-        // rule the client side applies to its own flag.
-        if get("TLS_ENABLED").as_deref() != Some("1") {
-            if get("TLS_CERT_FILE").is_some() || get("TLS_KEY_FILE").is_some() {
-                // NOT an error. Leaving the paths in place while the flag is off
-                // is exactly how the cut-over gets reverted, so refusing it would
-                // make the lever unusable. It is still worth a line: a deployment
-                // that believes it is encrypted and is not should be able to see
-                // that from the boot log.
-                tracing::warn!(
-                    prefix,
-                    "a certificate is configured but {prefix}_TLS_ENABLED is not \"1\", so \
-                     this service listens in CLEARTEXT"
-                );
+        // EXACTLY "1" OR "0", AND NOTHING ELSE — INCLUDING ABSENT (ADR-0845).
+        // The knob used to have a compiled-in default: anything but "1" was
+        // cleartext, so an unset variable and a typo both silently meant OFF.
+        // ADR-0845 deletes that default. A permissive parse here — "false"
+        // and "no" both meaning off, or an absent value meaning off — is how
+        // a setting meant to be off ends up looking chosen when nobody chose
+        // it; the chart renders this variable unconditionally now, so the
+        // only way it is genuinely absent is a chart that forgot to.
+        match get("TLS_ENABLED").as_deref() {
+            Some("0") => {
+                if get("TLS_CERT_FILE").is_some() || get("TLS_KEY_FILE").is_some() {
+                    // NOT an error. Leaving the paths in place while the flag
+                    // is off is exactly how the cut-over gets reverted, so
+                    // refusing it would make the lever unusable. It is still
+                    // worth a line: a deployment that believes it is
+                    // encrypted and is not should be able to see that from
+                    // the boot log.
+                    tracing::warn!(
+                        prefix,
+                        "a certificate is configured but {prefix}_TLS_ENABLED is \"0\", so \
+                         this service listens in CLEARTEXT"
+                    );
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            Some("1") => {}
+            Some(other) => {
+                return Err(ServerTlsError::EnabledNotBoolean(
+                    prefix,
+                    format!("{other:?}"),
+                ))
+            }
+            None => {
+                return Err(ServerTlsError::EnabledNotBoolean(
+                    prefix,
+                    "NOT SET".to_string(),
+                ))
+            }
         }
 
         Ok(Some(Self {

@@ -203,15 +203,20 @@ spec:
               value: "0.0.0.0:50052"
             - name: METRICS_LISTEN
               value: "0.0.0.0:9090"
-            {{- if .Values.tls.enabled }}
             # THE CERTIFICATE THIS SERVICE PRESENTS, not one it verifies —
             # `IAM_DB_TLS_*` below is the other direction, and the two share a
-            # word. RENDERED ONLY WHEN ASKED FOR, so a deployment that has not
-            # cut over sends the binary nothing at all and binds the plaintext
-            # listener it always bound. Absence is the default, and the flag is
-            # the whole of the lever.
+            # word.
+            #
+            # RENDERED UNCONDITIONALLY, NEVER BEHIND `tls.enabled` (ADR-0845,
+            # C-SVb): the binary refuses to boot when LISTEN_TLS_ENABLED is
+            # absent or empty rather than defaulting to cleartext, so a chart
+            # that withheld this variable under an `if` would leave every
+            # deployment that has not cut over refusing to boot instead of
+            # binding cleartext as before. `templates/render-checks.yaml`
+            # (K-1) is this value's named refusal.
             - name: LISTEN_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" .Values.tls.enabled | quote }}
+            {{- if .Values.tls.enabled }}
             # PATHS, never an issuer-specific resource (D80). cert-manager writes
             # these files in the reference deployment and a hand-assembled Secret
             # writes them anywhere else; neither the chart nor the binary can
@@ -220,18 +225,40 @@ spec:
               value: /var/run/secrets/iam-tls/tls.pem
             - name: LISTEN_TLS_KEY_FILE
               value: /var/run/secrets/iam-tls/tls-key.pem
+            {{- if and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") }}
+            # B-U5E EXPAND (folded into C-SVb), STATED AHEAD OF THE BINARY
+            # READING IT. `templates/render-checks.yaml` refuses every value
+            # but `off` until B-U5 lifts that, so this is reached only with
+            # `off`. Nested under `tls.enabled`, because mutual TLS with no
+            # server TLS is not a shape this chart offers.
+            - name: LISTEN_TLS_CLIENT_AUTH
+              value: {{ .Values.tls.clientAuth | quote }}
+            {{- end }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
+            # THE AUTHORITY this listener would check a CLIENT certificate
+            # against, once B-U5 adopts it. A PATH, never a PEM (D80), mounted
+            # from its own Secret rather than `tls.certSecret`'s: the CA that
+            # signs the callers' certificates is not necessarily the one that
+            # signs this pod's own.
+            - name: LISTEN_TLS_CLIENT_CA_FILE
+              value: /var/run/config/client-ca/ca.crt
+            {{- end }}
             {{- end }}
             - name: IAM_DB_HOST
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT
               value: {{ .Values.iamDb.port | quote }}
-            {{- if .Values.iamDb.tls.enabled }}
-            # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
-            # cut over sends the binary nothing at all and takes the cleartext
-            # path it always took. Absence is the default, and the flag is the
-            # whole of the lever.
+            # THE HOP TO iam-db, which LISTEN_TLS_ENABLED above says nothing
+            # about: that one describes this pod's own listener.
+            #
+            # RENDERED UNCONDITIONALLY, NEVER BEHIND `iamDb.tls.enabled`
+            # (ADR-0845, C-SVb), for the same reason as LISTEN_TLS_ENABLED
+            # above: the binary refuses absence rather than defaulting to
+            # cleartext. `templates/render-checks.yaml` (K-1) is this value's
+            # named refusal.
             - name: IAM_DB_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" .Values.iamDb.tls.enabled | quote }}
+            {{- if .Values.iamDb.tls.enabled }}
             # A PATH, never an issuer-specific resource (D80) — the same shape
             # ENROLMENT_CA_PEM_FILE below already uses. cert-manager writes this
             # file in the reference deployment and a hand-assembled Secret writes
@@ -278,6 +305,14 @@ spec:
             # backstop for exactly that window.
             - name: NATS_URL
               value: {{ .Values.nats.url | quote }}
+            {{- if and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") }}
+            # B-N3E: RENDERED ONLY WHEN `nats.tls.enabled` IS STATED, and only
+            # ever as "0" — `templates/render-checks.yaml` refuses `true` until
+            # B-N3. This binary does not read the variable yet; it is on the
+            # wire so the stated value is visible in the manifest.
+            - name: NATS_TLS_ENABLED
+              value: {{ ternary "1" "0" .Values.nats.tls.enabled | quote }}
+            {{- end }}
             {{- if .Values.nats.passwordSecret }}
             # RENDERED ONLY WHEN THE BROKER ASKS FOR A CREDENTIAL, so a
             # deployment that has not cut over sends the binary nothing at all
@@ -548,6 +583,15 @@ spec:
               mountPath: /var/run/secrets/iam-tls
               readOnly: true
             {{- end }}
+            {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
+            # B-U5E EXPAND (folded into C-SVb): a DIRECTORY MOUNT, never
+            # subPath, for the same reason as `serving-cert` above: kubelet
+            # never refreshes a subPath mount, and a rotated authority would
+            # never reach this pod.
+            - name: client-ca
+              mountPath: /var/run/config/client-ca
+              readOnly: true
+            {{- end }}
             {{- if .Values.iamDb.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath — for the reason spelled out on
             # the enrolment CA below: a subPath mount is a one-time copy that
@@ -634,6 +678,19 @@ spec:
                 path: tls.pem
               - key: {{ required "tls.keySecretKey names the key inside tls.certSecret that holds the private key and must be set whenever tls.enabled is; see the chart's values.yaml" .Values.tls.keySecretKey | quote }}
                 path: tls-key.pem
+        {{- end }}
+        {{- if and (kindIs "map" .Values.tls) .Values.tls.enabled (hasKey .Values.tls "clientAuth") .Values.tls.clientCaSecret }}
+        # B-U5E EXPAND (folded into C-SVb): the authority a future `required`
+        # mode checks a CALLER's certificate against. Required rather than
+        # optional: nothing in this binary opens this file yet (B-U5 is what
+        # will), so there is no refusal downstream to defer to — a
+        # FailedMount naming this Secret is the only error there would be.
+        - name: client-ca
+          secret:
+            secretName: {{ .Values.tls.clientCaSecret }}
+            items:
+              - key: {{ required "tls.clientCaSecretKey names the key inside tls.clientCaSecret that holds the CA bundle and must be set whenever tls.clientCaSecret is; see the chart's values.yaml" .Values.tls.clientCaSecretKey | quote }}
+                path: ca.crt
         {{- end }}
         {{- if .Values.iamDb.tls.enabled }}
         - name: iam-db-ca

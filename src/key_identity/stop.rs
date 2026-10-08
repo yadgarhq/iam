@@ -22,7 +22,8 @@ pub enum Ended {
 
 impl Ended {
     /// What the process owes the exit code once BOTH verdicts are in. `Err` is
-    /// the non-zero exit: `main` returns it and the process exits 1.
+    /// the non-zero exit: `run` returns it and `main` exits `ExitCode::FAILURE`
+    /// (1).
     ///
     /// **THE TWO VERDICTS COMBINE RATHER THAN NEST, and that is the whole reason
     /// this takes an argument it never branches on.** `drain_overran` is
