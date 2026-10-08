@@ -71,8 +71,9 @@
 //! encryption cannot see: the pod is Running, the readiness probe passes, and
 //! every caller is in the clear.
 //!
-//! Both transports are OPT-IN and OFF by default, so an unconfigured deployment
-//! dials and listens exactly as it always has.
+//! Neither transport has a default (ADR-0845): each switch is written `1` or
+//! `0`, and the listener's client-authentication mode is written `off`,
+//! `optional` or `required` (ADR-0854, B-U5). An absent value refuses the boot.
 //!
 //! **AND BOTH ARE READ EXACTLY ONCE, HERE.** tonic cannot swap a running
 //! listener's certificate, so a pod serves its day-0 leaf until it restarts —

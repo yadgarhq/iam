@@ -1,13 +1,15 @@
 //! Unit tests for [`super`], in their own file.
 //!
 //! A submodule rather than a `#[cfg(test)]` block at the foot of `serve.rs`,
-//! the same seam `crypto` and `service` already take. The file-size ceiling
-//! counts a test module's lines against the file that holds it, and splitting
-//! `serve.rs`'s production half to make room for its tests would cut a module
-//! that has no second concern in it.
+//! the same seam `crypto` and `service` already take.
 //!
-//! Still a UNIT test module: it reaches the private `tls_config` and
-//! `ServerTls`'s own fields, which an integration test cannot see.
+//! **WHAT IS LEFT HERE IS THIS SERVICE'S WIRING (B-U5).** The `ServerTls` type
+//! and its parser are `yadgar_lifecycle::serve_tls`'s, tested there. Every case
+//! below goes through [`super::from_lookup`], so it asserts the prefix and the
+//! chart key THIS service hands the crate. `tests/serve_tls.rs` proves the
+//! handshakes.
+
+use std::path::Path;
 
 use super::*;
 
@@ -44,46 +46,41 @@ fn a_drain_budget_must_outlast_the_slowest_legitimate_call() {
     );
 }
 
-/// NO UNCONFIGURED ANSWER ANY MORE (ADR-0845). The compiled-in default this
-/// used to fall back to is deleted: absent is refused exactly like any other
-/// value outside "1"/"0", naming the knob.
+/// The chart key is `tls`, the block every listener key renders from. A
+/// different value would make every refusal name a key the chart has not got.
 #[test]
-fn absent_tls_enabled_is_refused() {
-    let err = ServerTls::from_lookup(LISTEN, lookup(&[])).unwrap_err();
-    // NOT INTERPOLATED into the assert message (CodeQL's cleartext-logging
-    // query reads an enum variant's name — `ClientCertificateWithoutKey` is
-    // this error's sibling variant, holding no secret of any kind, just a
-    // `&'static str` prefix — as a signal that formatting ANY value of the
-    // type "logs sensitive data", even though every field involved is a
-    // prefix or a chart key. The boolean match below is the whole of the
-    // proof; a plain `assert!` needs no diagnostic string to redden
-    // informatively, since the panic already names the file and line.
-    assert!(matches!(
-        err,
-        ServerTlsError::EnabledNotBoolean("LISTEN", _)
-    ));
-    // ON THE MESSAGE, not only the variant: a refusal that dropped the
-    // variable name or the chart key out of its sentence would still match
-    // the `matches!` above, which is exactly the mutation this guards
-    // against — the error's wording is what an operator reads, and
-    // ADR-0845's own rule is that it names both.
-    let printed = err.to_string();
-    assert!(printed.contains("LISTEN_TLS_ENABLED"));
-    assert!(printed.contains("tls.enabled"));
+fn the_chart_key_is_the_values_block_the_listener_renders_from() {
+    assert_eq!(CHART_KEY, "tls");
+    assert_eq!(LISTEN, "LISTEN");
 }
 
-/// THE REVERTED STATE is now `"0"` WRITTEN EXPLICITLY, not absence. A
-/// certificate left mounted while the flag is off is still legitimate —
-/// that is how the cut-over gets reverted — so it must not become an error
-/// on its own.
+/// NO UNCONFIGURED ANSWER (ADR-0845). Absent refuses, naming the variable and
+/// this service's chart key.
+///
+/// NOT INTERPOLATED into an assert message: CodeQL's cleartext-logging query
+/// reads an error enum with Key- and Certificate-named variants as sensitive.
+/// The `matches!` and the `contains` checks are the whole proof.
+#[test]
+fn absent_tls_enabled_is_refused() {
+    let err = from_lookup(lookup(&[("LISTEN_TLS_CLIENT_AUTH", "off")])).unwrap_err();
+    assert!(matches!(err, ServeTlsError::EnabledMissing { .. }));
+    let printed = err.to_string();
+    assert!(printed.contains("LISTEN_TLS_ENABLED"));
+    assert!(printed.contains("`tls.enabled`"));
+}
+
+/// THE REVERTED STATE is `"0"` WRITTEN EXPLICITLY, with `off`. A certificate
+/// left mounted while the flag is off is still legitimate — that is how the
+/// cut-over gets reverted — so it must not become an error on its own.
 #[test]
 fn a_certificate_alone_with_the_flag_explicitly_off_does_not_enable_tls() {
     let vars = [
         ("LISTEN_TLS_ENABLED", "0"),
+        ("LISTEN_TLS_CLIENT_AUTH", "off"),
         ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
         ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
     ];
-    assert_eq!(ServerTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
+    assert_eq!(from_lookup(lookup(&vars)).unwrap(), None);
 }
 
 /// Exactly "0" is off; every OTHER value — including the ones a permissive
@@ -91,81 +88,78 @@ fn a_certificate_alone_with_the_flag_explicitly_off_does_not_enable_tls() {
 /// cleartext under a value nobody chose it to mean (ADR-0845).
 #[test]
 fn anything_but_zero_or_one_is_refused() {
-    for value in ["false", "no", "true", "yes", "2", "", " "] {
+    for value in ["false", "no", "true", "yes", "2"] {
         let vars = [
             ("LISTEN_TLS_ENABLED", value),
+            ("LISTEN_TLS_CLIENT_AUTH", "off"),
             ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
             ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
         ];
         assert!(
             matches!(
-                ServerTls::from_lookup(LISTEN, lookup(&vars)),
-                Err(ServerTlsError::EnabledNotBoolean("LISTEN", _))
+                from_lookup(lookup(&vars)),
+                Err(ServeTlsError::EnabledInvalid { .. })
             ),
-            "{value:?} must be refused, not treated as off"
+            "a value outside 1/0 must be refused, not treated as off"
+        );
+    }
+    for blank in ["", " "] {
+        let vars = [
+            ("LISTEN_TLS_ENABLED", blank),
+            ("LISTEN_TLS_CLIENT_AUTH", "off"),
+        ];
+        assert!(
+            matches!(
+                from_lookup(lookup(&vars)),
+                Err(ServeTlsError::EnabledMissing { .. })
+            ),
+            "an empty switch must be refused as absent"
         );
     }
 }
 
 /// THE FAILURE THAT MUST NOT DEGRADE. Asking for TLS and naming no
-/// certificate is a deployment mistake, and the answer to it is an error
-/// rather than a plaintext listener.
+/// certificate — or no key — is a deployment mistake, and the answer is an
+/// error naming the missing variable and `tls.certSecret`, never cleartext.
 #[test]
-fn asking_for_tls_without_a_certificate_is_an_error() {
-    for vars in [
-        vec![("LISTEN_TLS_ENABLED", "1")],
-        vec![("LISTEN_TLS_ENABLED", "1"), ("LISTEN_TLS_CERT_FILE", "")],
-        vec![("LISTEN_TLS_ENABLED", "1"), ("LISTEN_TLS_CERT_FILE", "   ")],
+fn asking_for_tls_without_a_certificate_or_a_key_is_an_error() {
+    for (vars, missing) in [
+        (
+            vec![("LISTEN_TLS_CERT_FILE", "   ")],
+            "LISTEN_TLS_CERT_FILE",
+        ),
+        (
+            vec![("LISTEN_TLS_CERT_FILE", SENTINEL_CERT)],
+            "LISTEN_TLS_KEY_FILE",
+        ),
     ] {
-        assert!(
-            matches!(
-                ServerTls::from_lookup(LISTEN, lookup(&vars)),
-                Err(ServerTlsError::NoCertFile("LISTEN"))
-            ),
-            "{vars:?} must be refused, not silently downgraded"
-        );
-    }
-}
-
-/// And the same for the key, separately — a certificate with no key serves
-/// nothing, and half a configuration is not a reason to serve cleartext.
-#[test]
-fn asking_for_tls_without_a_key_is_an_error() {
-    for vars in [
-        vec![
-            ("LISTEN_TLS_ENABLED", "1"),
-            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-        ],
-        vec![
-            ("LISTEN_TLS_ENABLED", "1"),
-            ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
-            ("LISTEN_TLS_KEY_FILE", "  "),
-        ],
-    ] {
-        assert!(
-            matches!(
-                ServerTls::from_lookup(LISTEN, lookup(&vars)),
-                Err(ServerTlsError::NoKeyFile("LISTEN"))
-            ),
-            "{vars:?} must be refused, not silently downgraded"
-        );
+        let mut vars = vars;
+        vars.push(("LISTEN_TLS_ENABLED", "1"));
+        vars.push(("LISTEN_TLS_CLIENT_AUTH", "off"));
+        let err = from_lookup(lookup(&vars)).unwrap_err();
+        assert!(matches!(err, ServeTlsError::NoServingFile { .. }));
+        let printed = err.to_string();
+        assert!(printed.contains(missing));
+        assert!(printed.contains("`tls.certSecret`"));
     }
 }
 
 /// Both paths reach the settings, proved with names the module could not
-/// have chosen for itself.
+/// have chosen for itself, and `off` verifies no caller.
 #[test]
 fn both_paths_arrive() {
     let vars = [
         ("LISTEN_TLS_ENABLED", "1"),
+        ("LISTEN_TLS_CLIENT_AUTH", "off"),
         ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
         ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
     ];
-    let tls = ServerTls::from_lookup(LISTEN, lookup(&vars))
+    let tls = from_lookup(lookup(&vars))
         .unwrap()
-        .expect("a flag, a certificate and a key enable TLS");
+        .expect("a flag, a mode, a certificate and a key enable TLS");
     assert_eq!(tls.cert_file(), Path::new(SENTINEL_CERT));
     assert_eq!(tls.key_file(), Path::new(SENTINEL_KEY));
+    assert_eq!(tls.client_ca_file(), None);
 }
 
 /// The prefix is what selects the variables, so a value meant for something
@@ -176,13 +170,15 @@ fn variables_under_another_prefix_do_not_configure_the_listener() {
         ("TLS_ENABLED", "1"),
         ("SERVER_TLS_ENABLED", "1"),
         ("IAM_DB_TLS_ENABLED", "1"),
+        ("IAM_DB_TLS_CLIENT_AUTH", "required"),
         ("TLS_CERT_FILE", SENTINEL_CERT),
-        // `LISTEN_TLS_ENABLED` itself, stated explicitly — ADR-0845 leaves it
-        // no default to fall into, so proving isolation needs a value rather
-        // than absence.
+        // `LISTEN_TLS_*` itself, stated explicitly — ADR-0845 leaves neither
+        // key a default to fall into, so proving isolation needs values
+        // rather than absence.
         ("LISTEN_TLS_ENABLED", "0"),
+        ("LISTEN_TLS_CLIENT_AUTH", "off"),
     ];
-    assert_eq!(ServerTls::from_lookup(LISTEN, lookup(&vars)).unwrap(), None);
+    assert_eq!(from_lookup(lookup(&vars)).unwrap(), None);
 }
 
 /// A CONFIGURATION error and a FILE error are different failures, and only
@@ -193,8 +189,10 @@ fn variables_under_another_prefix_do_not_configure_the_listener() {
 fn from_lookup_does_not_read_the_files() {
     let vars = [
         ("LISTEN_TLS_ENABLED", "1"),
+        ("LISTEN_TLS_CLIENT_AUTH", "required"),
+        ("LISTEN_TLS_CLIENT_CA_FILE", SENTINEL_CERT),
         ("LISTEN_TLS_CERT_FILE", SENTINEL_CERT),
         ("LISTEN_TLS_KEY_FILE", SENTINEL_KEY),
     ];
-    assert!(ServerTls::from_lookup(LISTEN, lookup(&vars)).is_ok());
+    assert!(from_lookup(lookup(&vars)).is_ok());
 }

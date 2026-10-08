@@ -6,8 +6,8 @@
 //! watch, that an identical-bytes swap does not, that an unreadable mount is
 //! survived, that the leaf rather than the issuer is what the gauge reports.
 //! None of that is repeated here. What is here is the claim only this repository
-//! can make: **an `iam` configured this way reads exactly these eight files, so
-//! exactly these eight files are watched.**
+//! can make: **an `iam` configured this way reads exactly these nine files, so
+//! exactly these nine files are watched.**
 //!
 //! **THE MUTANT THIS FILE EXISTS TO KILL.** The watch set used to be FOUR builder
 //! calls scattered across `main.rs`, up to a hundred and fifty lines apart, and
@@ -19,7 +19,7 @@
 //! below goes through [`yadgar_iam::rotate::watch_set`] — the SAME function
 //! `main.rs` calls — so a member deleted from that list turns this red.
 //!
-//! **THREE OF THE EIGHT ARE NOT TRANSPORT MATERIAL.** The broker password is not
+//! **THREE OF THE NINE ARE NOT TRANSPORT MATERIAL.** The broker password is not
 //! a certificate and the enrolment CA is token payload; both are read once at
 //! boot out of directory mounts that rotate, and ADR-0523's rule is about
 //! provenance rather than payload. The mounted configuration document (step 2a)
@@ -102,6 +102,10 @@ fn generation(san: &str) -> Generation {
     vec![
         ("tls.pem".to_string(), format!("{}{}", leaf.pem(), ca.pem())),
         ("tls-key.pem".to_string(), key.serialize_pem()),
+        // THE AUTHORITY THE LISTENER VERIFIES ITS CALLERS AGAINST (B-U5), from
+        // `tls.clientCaSecret`. The same authority here, as in the reference
+        // deployment; a separate FILE, because it is a separate mount.
+        ("client-ca.pem".to_string(), ca.pem()),
         ("ca.pem".to_string(), ca.pem()),
         ("enrolment-ca.pem".to_string(), ca.pem()),
         (
@@ -182,11 +186,12 @@ fn unique() -> String {
     )
 }
 
-/// The listener's transport as a DEPLOYMENT states it — through the same three
-/// variables the chart renders.
+/// The listener's transport as a DEPLOYMENT states it — through the same five
+/// variables the chart renders, with client authentication `required` so the
+/// client CA joins the set (B-U5).
 ///
 /// **Built from the configuration rather than from paths spelled out here.** A
-/// helper naming seven paths would prove only that the watcher watches what it is
+/// helper naming nine paths would prove only that the watcher watches what it is
 /// handed; going through the real loaders proves that a deployment's
 /// CONFIGURATION puts them there, which is the half that can silently be wrong.
 fn listener_tls(mount: &Mount) -> ServerTls {
@@ -200,12 +205,15 @@ fn listener_tls(mount: &Mount) -> ServerTls {
             "LISTEN_TLS_KEY_FILE".to_string(),
             mount.path("tls-key.pem").display().to_string(),
         ),
+        ("LISTEN_TLS_CLIENT_AUTH".to_string(), "required".to_string()),
+        (
+            "LISTEN_TLS_CLIENT_CA_FILE".to_string(),
+            mount.path("client-ca.pem").display().to_string(),
+        ),
     ];
-    ServerTls::from_lookup(serve::LISTEN, move |k| {
-        vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
-    })
-    .expect("a complete configuration")
-    .expect("the flag is set")
+    serve::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        .expect("a complete configuration")
+        .expect("the flag is set")
 }
 
 /// How `iam-db` is verified, and who this service says it is on that hop.
@@ -308,6 +316,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
         vec![
             mount.path("tls.pem").as_path(),
             mount.path("tls-key.pem").as_path(),
+            mount.path("client-ca.pem").as_path(),
             mount.path("ca.pem").as_path(),
             mount.path("client.pem").as_path(),
             mount.path("client-key.pem").as_path(),
@@ -315,10 +324,11 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             mount.path("enrolment-ca.pem").as_path(),
             config.path(),
         ],
-        "a fully configured `iam` reads eight files at boot: the listener's leaf and its \
-         key, the bundle `iam-db` is verified against, the client identity presented on \
-         that hop (ADR-0516), the broker password, the CA every D73 token carries, and the \
-         mounted configuration document every service now watches (step 2a)"
+        "a fully configured `iam` reads nine files at boot: the listener's leaf, its key \
+         and the authority it verifies callers against (B-U5), the bundle `iam-db` is \
+         verified against, the client identity presented on that hop (ADR-0516), the \
+         broker password, the CA every D73 token carries, and the mounted configuration \
+         document every service now watches (step 2a)"
     );
 }
 
@@ -373,10 +383,11 @@ fn each_configured_material_contributes_on_its_own() {
         vec![
             mount.path("tls.pem").as_path(),
             mount.path("tls-key.pem").as_path(),
+            mount.path("client-ca.pem").as_path(),
             config.path(),
         ],
-        "a listener reads its certificate and the key belonging to it, plus the mounted \
-         document"
+        "a listener reads its certificate, the key belonging to it and — when client \
+         authentication verifies — the client CA, plus the mounted document"
     );
 
     assert_eq!(
@@ -429,7 +440,7 @@ fn each_configured_material_contributes_on_its_own() {
 /// CONFIGURATION DOCUMENT.** A password has no validity period, and neither
 /// does a YAML file; inventing one, or reusing the `kind` label for something
 /// that is not a presented leaf, would put a number on a dashboard that means
-/// nothing. Two series from eight watched files is the assertion that says so.
+/// nothing. Two series from nine watched files is the assertion that says so.
 ///
 /// A plain `#[test]`: `with_local_recorder` is thread-local and
 /// `export_not_after` is synchronous, so there is no runtime to involve.

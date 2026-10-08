@@ -125,8 +125,9 @@ pub fn fresh_keys_dir() -> KeysDir {
 /// the key-identity round trip `tests/assembly.rs`'s sibling `main.rs` starts
 /// after boot, which retries for ever against an absent twin and never
 /// resolves (ADR-0764). Both `*_TLS_ENABLED` are stated as `"0"` rather than
-/// left absent, and both response floors are `"0"` — a real number, not a
-/// default, is all `boot::response_floors` asks for.
+/// left absent, `LISTEN_TLS_CLIENT_AUTH` is stated as `off` (ADR-0854: it has
+/// no default either, TLS on or off), and both response floors are `"0"` — a
+/// real number, not a default, is all `boot::response_floors` asks for.
 pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
     vec![
         ("IAM_DB_HOST", "127.0.0.1".to_string()),
@@ -134,6 +135,7 @@ pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
         ("LISTEN", "127.0.0.1:0".to_string()),
         ("METRICS_LISTEN", "127.0.0.1:0".to_string()),
         ("LISTEN_TLS_ENABLED", "0".to_string()),
+        ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
         ("IAM_DB_TLS_ENABLED", "0".to_string()),
         ("YADGAR_KEYS_DIR", keys_dir.display().to_string()),
         ("LOGIN_RESPONSE_FLOOR_MS", "0".to_string()),

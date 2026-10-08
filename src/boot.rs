@@ -167,10 +167,13 @@ pub fn env_required(key: &str) -> Result<String, String> {
 /// The `iam-db` boot refusal, flattened through the estate's one error-chain
 /// walker (ledger 733, ledger 740, ADR-0591) instead of a second copy.
 ///
-/// **THE ONLY `to_string()` SITE IN THIS FILE THAT TAKES IT.** Every other
-/// refusal here — `serve::ServerTls`, `upstream::UpstreamTls`,
-/// `rotate::Configuration` — already returns a complete sentence with nothing
-/// further under it worth a walk. `upstream::connect` is different: it returns
+/// **TWO `to_string()` SITES IN THIS FILE TAKE IT.** The listener's builder
+/// is the second (B-U5): `serve::builder` returns lifecycle's
+/// `ServeTlsError`, whose `Unusable` keeps tonic's `transport error` as its
+/// source, so its reason is one hop down too. Every other refusal here —
+/// `serve::from_env`, `upstream::UpstreamTls`, `rotate::Configuration` —
+/// already returns a complete sentence with nothing further under it worth a
+/// walk. `upstream::connect` is different: it returns
 /// `yadgar_dial::BalanceError`, and `BalanceError::Tls` wraps a
 /// `tonic::transport::Error` whose entire `Display` is the two words
 /// `transport error` — measured, this is the one place in this file where the
@@ -234,13 +237,17 @@ pub fn listener() -> Result<(Option<ServerTls>, Server), Box<dyn std::error::Err
     // quietly stayed in the clear is the one failure an operator who asked for
     // TLS cannot see.
     //
-    // `.to_string()` on the way out. It dates from when `main` returned
-    // `Result` and Rust printed a bare `?` here with Debug; `main` prints
-    // Display now (ledger 1258), so the conversion no longer changes what
-    // the operator reads. It stays as the sentence it always produced,
-    // naming a file.
-    let listen_tls = serve::ServerTls::from_env(serve::LISTEN).map_err(|e| e.to_string())?;
-    let server = serve::builder(listen_tls.as_ref()).map_err(|e| e.to_string())?;
+    // `.to_string()` on the CONFIGURATION refusal: each one is a complete
+    // sentence naming the variable and the chart key, with nothing under it.
+    //
+    // [`refusal`] on the BUILDER's, and that is not decoration (B-U5).
+    // `yadgar_lifecycle::serve_tls::ServeTlsError::Unusable` keeps tonic's
+    // `transport error` as its `#[source]` rather than flattening it, so the
+    // reason a certificate and a key were refused together — "keys may not be
+    // consistent" — is one `source()` hop down. A bare `to_string()` here
+    // would drop it; `tests/boot_message.rs` turns red if it does.
+    let listen_tls = serve::from_env().map_err(|e| e.to_string())?;
+    let server = serve::builder(listen_tls.as_ref()).map_err(|e| refusal(&e))?;
     Ok((listen_tls, server))
 }
 

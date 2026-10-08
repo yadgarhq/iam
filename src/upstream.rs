@@ -50,12 +50,14 @@
 //! namespace on 2026-09-12. A NetworkPolicy protects this hop on kind too.
 //! ADR-0594, as amended by ADR-0686, ranks mutual TLS and an ingress
 //! NetworkPolicy as EQUAL controls — but only on a hop where both sides hold a
-//! leaf this deployment issued AND verifies. On this hop that is not yet true:
-//! `iam-db`'s `serve.rs` presents server TLS only and leaves `client_ca_root`
-//! unbuilt, so the certificate this module presents is not checked. Today the
-//! NetworkPolicy is the only BUILT control on this hop; the certificate stays
-//! load-bearing for availability, per the rest of this section, once the
-//! server side of mutual TLS lands.
+//! leaf this deployment issued AND verifies. The server side is built by
+//! `iam-db`'s B-U5, which adopts `yadgar_lifecycle::serve_tls` (ADR-0846):
+//! its listener verifies the certificate this module presents when `iam-db`'s
+//! `tls.clientAuth` is `optional` or `required`. With `off` — the value every
+//! server is stated at first (B-P1) — the certificate is not checked, and the
+//! NetworkPolicy is the only ENFORCED control on this hop. The certificate
+//! stays load-bearing for availability, per the rest of this section, from
+//! the day `iam-db`'s mode verifies.
 //!
 //! **A SEPARATE LEVER FROM THE ENCRYPTED TRANSPORT, deliberately.**
 //! `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE` are unset

@@ -13,13 +13,16 @@ description = "The identity module's logic service: business rules, no store."
 # what the twin exists to prevent. proto-contract-design keeps a per-repo check
 # for exactly this.
 #
-# `tls-ring` is DECLARED HERE rather than inherited. `yadgar-dial` enables it and
-# feature unification would hand it to this crate anyway, but a feature this
-# crate's own `serve::builder` calls into is one this crate must ask for: the day
-# the dial dependency changes, an implicit feature disappears with it and the
-# error lands on a line nobody edited. `tls-ring` rather than `tls-aws-lc` for
-# the reason dial gives — aws-lc-rs needs cmake and a C toolchain, and this
-# builds for x86_64-unknown-linux-musl (D63).
+# `tls-ring` is DECLARED HERE rather than inherited. `yadgar-dial` and
+# `yadgar-lifecycle`'s `serve-tls` both enable it and feature unification would
+# hand it to this crate anyway, but `tests/serve_tls.rs` dials this listener with
+# tonic's own `ClientTlsConfig`, and a feature this crate's code calls into is one
+# this crate must ask for: the day a dependency changes, an implicit feature
+# disappears with it and the error lands on a line nobody edited. `tls-ring`
+# rather than `tls-aws-lc` for the reason dial gives — aws-lc-rs needs cmake and a
+# C toolchain, and this builds for x86_64-unknown-linux-musl (D63). ONE provider
+# is measured, not assumed: `cargo tree -e normal,dev -i aws-lc-rs` prints
+# nothing and `cargo tree -i ring` shows one version (B-U5, K-2).
 tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "router",
@@ -29,22 +32,22 @@ tonic = { version = "0.14", default-features = false, features = [
   "tls-ring",
 ] }
 tonic-prost = "0.14"
-# The SAME PEM parser tonic itself uses on the certificate and the key, so "this
-# file holds no certificate" is decided in `serve.rs` rather than failing
-# opaquely inside the acceptor. Present in the tree already by way of
-# tokio-rustls; naming it directly costs nothing and is what lets the error say
-# WHICH of the two files an operator has to fix. It is the same reasoning, and
-# the same crate, that `yadgar_dial::TlsOptions::prepare` uses on a CA bundle.
-rustls-pki-types = { version = "1", features = ["std"] }
 # How this process starts, stops and restarts: ADR-0523's exit-on-change rotation
 # watcher, the SIGTERM drain, and the budget that bounds it. This repository held
 # the ORIGINAL of the watcher and `task` and `gateway` each carried a copy; the
 # X.509 parser that read a leaf's `notAfter` and the metrics facade that gauges it
-# are ITS dependencies now, so both are gone from here. `rustls-pki-types` stays,
-# because `serve` decodes a certificate and a key of its own.
+# are ITS dependencies now, so both are gone from here.
+#
+# `serve-tls` (B-U5, ADR-0846): the listener's transport — the serving identity
+# AND the client-certificate verification ADR-0852 asks of every hop — is the
+# crate's one `ServerTls` now. This repository's own copy, and the
+# `rustls-pki-types` dependency it decoded PEM with, are deleted rather than
+# kept beside it.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.17" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.20", features = [
+  "serve-tls",
+] }
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a
 # correction is a new tag — and Cargo.lock records the revision it resolved to,
 # so the pin is as exact as the revision it replaces.

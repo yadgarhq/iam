@@ -120,19 +120,12 @@ use crate::serve::ServerTls;
 use crate::service::{EnrolmentConfig, SERVICE};
 use crate::upstream::UpstreamTls;
 
-/// The listener's certificate and the private key belonging to it.
-///
-/// **Both halves, or the pair rotates half-watched.** kubelet swaps a mount
-/// atomically, so a set holding only the certificate still fires on an ordinary
-/// rotation — but a deployment that rewrites the key alone would pass unnoticed.
-impl Material for ServerTls {
-    fn files(&self) -> Vec<File<'_>> {
-        vec![
-            File::certificate(Presented::Serving, self.cert_file()),
-            File::read(self.key_file()),
-        ]
-    }
-}
+// THE LISTENER'S `Material` IS THE CRATE'S (B-U5). `ServerTls` is
+// `yadgar_lifecycle::serve_tls::ServerTls` now, and the crate implements the
+// trait beside the type: the serving certificate, its key, and the client CA
+// bundle exactly when `LISTEN_TLS_CLIENT_AUTH` verifies — the files its
+// `builder` reads, and no others. This file's own impl covered the first two;
+// it is deleted rather than kept, which the orphan rule would refuse anyway.
 
 /// The CA bundle `iam-db`'s certificate is verified against, AND the client
 /// certificate this service presents to it.
@@ -183,7 +176,7 @@ impl Material for EnrolmentConfig {
 /// Everything this deployment read at boot, hashed as it was read.
 ///
 /// **THE LIST IS THE ASSERTION, and this service's list is the longest in the
-/// estate.** Five materials, up to eight files. Each of the first four is
+/// estate.** Five materials, up to nine files. Each of the first four is
 /// opt-in and `Option<M>: Material` folds an absent one to nothing, so no
 /// argument needs a branch at the call site — which is what let the four
 /// per-role builder methods this module used to carry collapse into one trait.

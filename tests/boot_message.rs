@@ -57,9 +57,15 @@ fn refusal_without_mounts(vars: &[(&str, String)]) -> String {
 /// runs BEFORE the keys are read and now refuses an absent value rather than
 /// treating it as cleartext, so an empty environment would stop at that
 /// refusal before ever reaching the one this test is about.
+///
+/// `LISTEN_TLS_CLIENT_AUTH` is stated as `off` for the same reason (ADR-0854,
+/// B-U5): it is read beside the switch and refuses when absent.
 #[test]
 fn a_typed_refusal_is_printed_as_its_sentence() {
-    let line = refusal_without_mounts(&[("LISTEN_TLS_ENABLED", "0".to_string())]);
+    let line = refusal_without_mounts(&[
+        ("LISTEN_TLS_ENABLED", "0".to_string()),
+        ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
+    ]);
     assert!(
         line.contains("YADGAR_KEYS_DIR is not set"),
         "the refusal must name the variable: {line}"
@@ -67,6 +73,62 @@ fn a_typed_refusal_is_printed_as_its_sentence() {
     assert!(
         !line.contains("Unconfigured"),
         "the operator got the Debug variant name, not the sentence: {line}"
+    );
+}
+
+/// THE BINARY REFUSES AN ABSENT `LISTEN_TLS_CLIENT_AUTH` (ADR-0854, B-U5),
+/// before it reads anything else, naming the variable and the chart key. The
+/// cases in `tests/serve_tls.rs` prove the sentence; only the binary proves
+/// `boot::listener` reads it, with TLS off included.
+#[test]
+fn an_absent_client_auth_refuses_the_boot_naming_it() {
+    let line = refusal_without_mounts(&[("LISTEN_TLS_ENABLED", "0".to_string())]);
+    assert!(
+        line.contains("LISTEN_TLS_CLIENT_AUTH"),
+        "the boot refusal must name LISTEN_TLS_CLIENT_AUTH"
+    );
+    assert!(
+        line.contains("`tls.clientAuth`"),
+        "the boot refusal must name the chart key tls.clientAuth"
+    );
+}
+
+/// THE LISTENER'S BUILDER REFUSAL REACHES THE OPERATOR WITH ITS REASON (B-U5).
+/// lifecycle's `ServeTlsError::Unusable` keeps the reason as a `source()` hop
+/// below tonic's `transport error`; `boot::listener` walks it with
+/// `boot::refusal`. A certificate paired with a key from another pair is the
+/// refusal whose reason only that walk prints.
+///
+/// MUTATION: `boot::listener`'s builder `map_err` reverted to `e.to_string()`
+/// turns this red.
+#[test]
+fn a_mismatched_serving_pair_names_the_reason() {
+    let dir = std::env::temp_dir().join(format!(
+        "yadgar-iam-boot-message-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let leaf = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let other = rcgen::KeyPair::generate().unwrap();
+    let cert = dir.join("tls.pem");
+    let key = dir.join("tls-key.pem");
+    std::fs::write(&cert, leaf.cert.pem()).unwrap();
+    std::fs::write(&key, other.serialize_pem()).unwrap();
+
+    let line = refusal_without_mounts(&[
+        ("LISTEN_TLS_ENABLED", "1".to_string()),
+        ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
+        ("LISTEN_TLS_CERT_FILE", cert.display().to_string()),
+        ("LISTEN_TLS_KEY_FILE", key.display().to_string()),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        line.contains("keys may not be consistent"),
+        "the boot refusal must carry the reason under tonic's transport error"
     );
 }
 
