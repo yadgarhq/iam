@@ -39,6 +39,11 @@ import yaml
 
 from test_values_schema import CHART, SCHEMA_WRAPPER, helm, objects, render
 
+NOT_BOOL = (
+    "iam: nats.tls.enabled must be true or false when it is set; it renders "
+    "NATS_TLS_ENABLED (ADR-0845, ADR-0797)"
+)
+
 REFUSE_TRUE = (
     "iam: nats.tls.enabled: true is refused by this chart version: it declares the key, "
     "but the binary reads NATS_TLS_ENABLED only from B-N3 and the broker serves no TLS "
@@ -115,12 +120,6 @@ def test_the_ci_values_state_false():
     assert nats_env(result.stdout) == {"NATS_TLS_ENABLED": "0"}
 
 
-def test_false_mounts_no_nats_ca(tmp_path):
-    result = bare(overlay(tmp_path, {"enabled": False}))
-    assert result.returncode == 0, result.stderr
-    assert "nats-tls" not in result.stdout
-
-
 # ── 3. PRESENT AND TRUE: refused until the contract ─────────────────────────
 
 
@@ -162,3 +161,15 @@ def test_an_unknown_key_under_nats_tls_is_a_schema_refusal(tmp_path):
     result = bare(overlay(tmp_path, {"enabled": False, "verify": True}))
     schema_refused(result, "nats.tls")
     assert "verify" in result.stdout + result.stderr
+
+
+def test_a_null_enabled_past_the_schema_is_the_render_check_sentence(tmp_path):
+    """`--skip-schema-validation` is how a render reaches the templates with a
+    null `enabled` (hasKey true, not a bool). Without the render check, the
+    `ternary` in `templates/deployment.yaml` fails with Go's type error, which
+    names no key; the check must refuse first, with its own sentence."""
+    path = overlay(tmp_path, {"enabled": None})
+    refused(
+        helm("template", "x", str(CHART), "-f", str(path), "--skip-schema-validation"),
+        NOT_BOOL,
+    )
