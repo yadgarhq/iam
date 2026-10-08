@@ -66,12 +66,19 @@ OPEN_PATHS = ("global", "resources", "rollingUpdate")
 # `templates/render-checks.yaml` validates them when present, and the binary
 # reads none of them yet — there is nothing for `values.yaml` to default,
 # same shape as `image.digest` above (a template reads it; nothing ships it).
+#
+# `nats.tls.enabled` joins them for the B-N3E expand (K-8, ADR-0852): declared
+# (`type: boolean`, not required) and read only when present, with no value in
+# `values.yaml`. B-N3 moves it to `REQUIRED_NO_DEFAULT` when the binary
+# requires `NATS_TLS_ENABLED`. (`nats.tls` itself is a block, not a leaf, so
+# this walk never lists it.)
 EXTRAS = (
     "image.digest",
     "networkPolicy.scrapeFrom.namespace",
     "tls.clientAuth",
     "tls.clientCaSecret",
     "tls.clientCaSecretKey",
+    "nats.tls.enabled",
 )
 
 # `tls.enabled` and `iamDb.tls.enabled` (ADR-0845, C-SVb): leaves `values.yaml`
