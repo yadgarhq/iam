@@ -6,13 +6,14 @@
 //! file, is what made the split due rather than optional).
 
 use super::*;
+use crate::upstream;
 
 #[tokio::test]
 async fn no_broker_is_a_working_publisher_that_publishes_nothing() {
     // The alternative — refusing to construct — would make a missing broker
     // an authentication outage, which is a worse failure than a late
     // revocation.
-    let inv = Invalidator::connect(None, None).await;
+    let inv = Invalidator::connect(None, None, None).await;
     inv.credential_revoked("yadgar:user:x").await;
     inv.teams_changed("yadgar:user:x").await;
     assert!(!inv.is_publishing());
@@ -20,7 +21,7 @@ async fn no_broker_is_a_working_publisher_that_publishes_nothing() {
 
 #[tokio::test]
 async fn an_unreachable_broker_does_not_panic_or_block() {
-    let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), None).await;
+    let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), None, None).await;
     inv.credential_revoked("yadgar:user:y").await;
     assert!(!inv.is_publishing());
 }
@@ -49,12 +50,296 @@ fn the_connect_options_carry_the_bound() {
             password_file: "/var/run/secrets/nats/password".into(),
         }),
     ] {
-        let options = connect_options(&credentials);
+        let options = connect_options(&credentials, &None);
         assert!(
             format!("{options:?}").contains("\"connection_timeout\": 3s"),
             "the bound built into the options sent to `connect` must be {CONNECT_TIMEOUT:?}"
         );
     }
+}
+
+/// `require_tls` IS CALLED EXPLICITLY ON BOTH SIDES (B-N3). Dropping the
+/// `false` arm would leave `async-nats`'s own default standing in for a
+/// deployment that asked for cleartext — passing today, because the
+/// default happens to agree, and silently wrong the day it does not.
+#[test]
+fn require_tls_is_explicit_in_both_directions() {
+    let without = transport::connect_options(&None, &None);
+    assert!(
+        format!("{without:?}").contains("\"tls_required\": false"),
+        "cleartext must set require_tls(false) explicitly: {without:?}"
+    );
+
+    let tls = sentinel_tls(None);
+    let with = transport::connect_options(&None, &Some(tls));
+    assert!(
+        format!("{with:?}").contains("\"tls_required\": true"),
+        "TLS on must set require_tls(true): {with:?}"
+    );
+}
+
+/// THE CA REACHES THE OPTIONS. Dropping `add_root_certificates` would leave
+/// the trust store at whatever `async-nats` defaults to — the platform
+/// store on a distroless image has nothing in it, so this is the one check
+/// that tells "no roots were added" apart from "the right root was added".
+#[test]
+fn the_ca_bundle_reaches_connect_options() {
+    let without_tls = transport::connect_options(&None, &None);
+    assert!(
+        format!("{without_tls:?}").contains("\"certificates\": []"),
+        "with no TLS configured, no root certificate must be added: {without_tls:?}"
+    );
+
+    let tls = sentinel_tls(None);
+    let with_tls = transport::connect_options(&None, &Some(tls));
+    assert!(
+        !format!("{with_tls:?}").contains("\"certificates\": []"),
+        "a CA bundle must reach the options as a root certificate: {with_tls:?}"
+    );
+}
+
+/// THE DEFAULT: no client certificate configured, so the connection is
+/// encrypted and presents no identity — exactly `UpstreamTls`'s own default
+/// for every other hop.
+#[test]
+fn with_no_client_identity_the_hop_presents_none() {
+    let tls = sentinel_tls(None);
+    let options = transport::connect_options(&None, &Some(tls));
+    assert!(
+        format!("{options:?}").contains("\"client_cert\": None"),
+        "no client certificate configured must add no identity to the options"
+    );
+}
+
+/// THE CLIENT PAIR REACHES THE OPTIONS WHEN CONFIGURED. `UpstreamTls` holds
+/// both or neither, so `None`'s absence above and this presence are the
+/// only two reachable shapes.
+#[test]
+fn the_client_pair_reaches_connect_options_when_configured() {
+    let tls = sentinel_tls(Some((
+        "/var/run/secrets/nats-client-tls/client.pem",
+        "/var/run/secrets/nats-client-tls/client-key.pem",
+    )));
+    let options = transport::connect_options(&None, &Some(tls));
+    assert!(
+        !format!("{options:?}").contains("\"client_cert\": None"),
+        "a configured client certificate must reach the options as an identity: {options:?}"
+    );
+}
+
+/// A SENTINEL `UpstreamTls`, built the same way `broker_tls` builds a real
+/// one — through `from_lookup` — but over made-up paths this test never
+/// reads: `connect_options` wires paths into `ConnectOptions` without
+/// opening them (`async-nats` reads them at the dial).
+fn sentinel_tls(client: Option<(&str, &str)>) -> upstream::UpstreamTls {
+    let mut vars = vec![
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            "/var/run/config/nats-ca/ca.pem".to_string(),
+        ),
+    ];
+    if let Some((cert, key)) = client {
+        vars.push(("NATS_TLS_CLIENT_CERT_FILE".to_string(), cert.to_string()));
+        vars.push(("NATS_TLS_CLIENT_KEY_FILE".to_string(), key.to_string()));
+    }
+    upstream::UpstreamTls::from_lookup(upstream::NATS, upstream::NATS_CHART_KEY, move |k| {
+        vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    })
+    .expect("a complete configuration")
+    .expect("the flag is set")
+}
+
+/// A name no other case in this run can collide with — `tests/assembly.rs`
+/// has its own copy of this helper for the same reason.
+fn unique() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// A file under the system temp directory, deleted when this value drops —
+/// so a test that panics mid-case does not leave a fixture beside the next
+/// run's.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn write(name: &str, contents: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("yadgar-iam-transport-{}-{name}", unique()));
+        std::fs::write(&path, contents).expect("a writable temp directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A real, self-signed certificate's PEM — enough to satisfy `broker_tls`'s
+/// "holds at least one PEM certificate" check. Not a chain and not signed by
+/// any authority these tests mint elsewhere: `certificates_in` counts PEM
+/// blocks, not trust.
+fn a_certificate_pem() -> String {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.self_signed(&key).unwrap().pem()
+}
+
+/// A real PEM private key, for the "holds a PEM private key" check.
+fn a_private_key_pem() -> String {
+    rcgen::KeyPair::generate().unwrap().serialize_pem()
+}
+
+/// `NATS_TLS_DOMAIN` IS REFUSED. `async-nats` verifies the broker's
+/// certificate against the host in `NATS_URL` and has no override, unlike
+/// the gRPC hops' own `domain` key.
+#[test]
+fn nats_tls_domain_is_refused() {
+    let ca = TempFile::write("ca", &a_certificate_pem());
+    let vars = [
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            ca.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_DOMAIN".to_string(),
+            "broker.verified-as-this.invalid".to_string(),
+        ),
+    ];
+    let lookup = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let err = transport::broker_tls(&lookup).unwrap_err();
+    assert!(err.contains("NATS_TLS_DOMAIN"), "{err}");
+}
+
+/// A CA FILE WITH NO CERTIFICATE IS ZERO TRUST ANCHORS, which `async-nats`
+/// treats as no error at all — so this check has to run before the dial
+/// ever does, or every handshake fails as an unknown issuer with no
+/// deployment mistake named anywhere.
+#[test]
+fn an_empty_ca_file_is_refused_before_any_dial() {
+    let ca = TempFile::write("ca", "not a certificate");
+    let vars = [
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            ca.path().display().to_string(),
+        ),
+    ];
+    let lookup = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let err = transport::broker_tls(&lookup).unwrap_err();
+    assert!(err.contains("NATS_TLS_CA_FILE"), "{err}");
+    assert!(err.contains("no PEM certificate"), "{err}");
+}
+
+/// THE SAME CHECK, ON THE CLIENT CERTIFICATE: a deployment that names a
+/// Secret holding no certificate has no identity to present, and the
+/// mistake belongs at boot rather than at a handshake that fails for an
+/// unrelated reason.
+#[test]
+fn an_empty_client_certificate_is_refused_before_any_dial() {
+    let ca = TempFile::write("ca", &a_certificate_pem());
+    let cert = TempFile::write("cert", "not a certificate");
+    let key = TempFile::write("key", &a_private_key_pem());
+    let vars = [
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            ca.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_CERT_FILE".to_string(),
+            cert.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_KEY_FILE".to_string(),
+            key.path().display().to_string(),
+        ),
+    ];
+    let lookup = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let err = transport::broker_tls(&lookup).unwrap_err();
+    assert!(err.contains("NATS_TLS_CLIENT_CERT_FILE"), "{err}");
+}
+
+/// A KEY FILE HOLDING NO PRIVATE KEY is refused the same way: a certificate
+/// cannot be presented without one, and the mistake is caught before the
+/// dial names neither variable.
+#[test]
+fn a_client_key_file_with_no_private_key_is_refused() {
+    let ca = TempFile::write("ca", &a_certificate_pem());
+    let cert = TempFile::write("cert", &a_certificate_pem());
+    let key = TempFile::write("key", "not a private key");
+    let vars = [
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            ca.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_CERT_FILE".to_string(),
+            cert.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_KEY_FILE".to_string(),
+            key.path().display().to_string(),
+        ),
+    ];
+    let lookup = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let err = transport::broker_tls(&lookup).unwrap_err();
+    assert!(err.contains("NATS_TLS_CLIENT_KEY_FILE"), "{err}");
+}
+
+/// A COMPLETE, VALID CONFIGURATION IS ACCEPTED, with both files real and
+/// non-empty — the green case the four refusals above are measured against.
+#[test]
+fn a_complete_configuration_is_accepted() {
+    let ca = TempFile::write("ca", &a_certificate_pem());
+    let cert = TempFile::write("cert", &a_certificate_pem());
+    let key = TempFile::write("key", &a_private_key_pem());
+    let vars = [
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            ca.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_CERT_FILE".to_string(),
+            cert.path().display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_KEY_FILE".to_string(),
+            key.path().display().to_string(),
+        ),
+    ];
+    let lookup = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let tls = transport::broker_tls(&lookup)
+        .expect("a real CA and a real client pair")
+        .expect("the flag is set");
+    assert_eq!(tls.ca_file(), ca.path());
+}
+
+/// `NATS_TLS_ENABLED="0"` IS STILL CLEARTEXT, through the SAME parser
+/// `IAM_DB` uses — proved here rather than only in `upstream/tests.rs`,
+/// because this is the call site that matters: `main` must not refuse a
+/// deployment that has not cut over yet.
+#[test]
+fn nats_tls_enabled_false_is_cleartext() {
+    let vars = [("NATS_TLS_ENABLED".to_string(), "0".to_string())];
+    let lookup = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    assert_eq!(transport::broker_tls(&lookup).unwrap(), None);
 }
 
 #[test]

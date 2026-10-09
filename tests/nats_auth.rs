@@ -124,7 +124,7 @@ async fn connect(addr: SocketAddr, credentials: Option<Credentials>) -> Invalida
     // a CI job.
     tokio::time::timeout(
         Duration::from_secs(10),
-        Invalidator::connect(Some(&format!("nats://{addr}")), credentials),
+        Invalidator::connect(Some(&format!("nats://{addr}")), credentials, None),
     )
     .await
     .expect("the broker answered within the deadline")
@@ -203,7 +203,7 @@ async fn an_unreachable_broker_is_survivable_and_a_refused_one_is_too() {
     // that publishes nothing rather than in a process that will not run. They
     // are told apart in the LOG, which is where an operator can act on the
     // difference.
-    let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), Some(credentials())).await;
+    let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), Some(credentials()), None).await;
     assert!(!inv.is_publishing());
     inv.credential_revoked("yadgar:user:z").await;
     inv.teams_changed("yadgar:user:z").await;

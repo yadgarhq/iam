@@ -308,13 +308,40 @@ spec:
             # backstop for exactly that window.
             - name: NATS_URL
               value: {{ .Values.nats.url | quote }}
-            {{- if and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") }}
-            # B-N3E: RENDERED ONLY WHEN `nats.tls.enabled` IS STATED, and only
-            # ever as "0" — `templates/render-checks.yaml` refuses `true` until
-            # B-N3. This binary does not read the variable yet; it is on the
-            # wire so the stated value is visible in the manifest.
+            # TLS on the broker hop (ADR-0852, ADR-0845, B-N3): the twin of
+            # IAM_DB_TLS_ENABLED above and NATS_TLS_ENABLED in `gateway`'s own
+            # chart.
+            #
+            # RENDERED UNCONDITIONALLY, NEVER BEHIND A `hasKey` GUARD (B-N3
+            # lifts the B-N3E expand's one): the binary refuses
+            # `NATS_TLS_ENABLED` absent or non-boolean whenever `NATS_URL` is
+            # set, so a chart that withheld this variable would leave every
+            # deployment with a configured broker refusing to boot instead of
+            # binding cleartext as before. `templates/render-checks.yaml`
+            # (K-1) is this value's named refusal.
             - name: NATS_TLS_ENABLED
               value: {{ ternary "1" "0" .Values.nats.tls.enabled | quote }}
+            {{- if .Values.nats.tls.enabled }}
+            # A PATH, never an issuer-specific resource (D80) — the same
+            # shape IAM_DB_TLS_CA_FILE above already takes. cert-manager
+            # writes this file in the reference deployment; a hand-assembled
+            # Secret writes it anywhere else.
+            - name: NATS_TLS_CA_FILE
+              value: /var/run/config/nats-ca/ca.pem
+            {{- if .Values.nats.tls.clientCertSecret }}
+            # WHO THIS SERVICE PRESENTS TO THE BROKER — mutual TLS
+            # (ADR-0852 design item 7). RENDERED ONLY WHEN A SECRET IS
+            # NAMED, the same lever IAM_DB_TLS_CLIENT_CERT_FILE above takes.
+            #
+            # A SEPARATE MOUNT FROM iam-db's CLIENT LEAF (ADR-0885): the
+            # broker's identity renders from `nats.tls.clientCertSecret`, at
+            # its OWN path, so turning `iamDb.tls` off cannot silently turn
+            # the broker's identity off too.
+            - name: NATS_TLS_CLIENT_CERT_FILE
+              value: /var/run/secrets/nats-client-tls/client.pem
+            - name: NATS_TLS_CLIENT_KEY_FILE
+              value: /var/run/secrets/nats-client-tls/client-key.pem
+            {{- end }}
             {{- end }}
             {{- if .Values.nats.passwordSecret }}
             # RENDERED ONLY WHEN THE BROKER ASKS FOR A CREDENTIAL, so a
@@ -615,6 +642,30 @@ spec:
               mountPath: /var/run/secrets/iam-client-tls
               readOnly: true
             {{- end }}
+            {{- if .Values.nats.tls.enabled }}
+            # THE BROKER'S OWN CA (B-N3, ADR-0852): a DIRECTORY MOUNT, never
+            # subPath, for the reason given on `iam-db-ca` above: a rotated
+            # authority must reach this process without a restart.
+            - name: nats-ca
+              mountPath: /var/run/config/nats-ca
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.nats.tls.enabled .Values.nats.tls.clientCertSecret }}
+            # WHO THIS SERVICE PRESENTS TO THE BROKER (B-N3, ADR-0852 design
+            # item 7): a DIRECTORY MOUNT, never subPath, for the reason given
+            # on `iam-db-client-cert` above — ADR-0516 makes an expired
+            # client leaf STOP the hop rather than merely weaken it.
+            #
+            # A SEPARATE VOLUME FROM `iam-db-client-cert`, MOUNTED AT A
+            # SEPARATE PATH (ADR-0885), even though `nats.tls.clientCertSecret`
+            # defaults to the SAME Secret name, `iam-client-tls`. Two volumes
+            # may read one Secret; what ADR-0885 refuses is coupling the two
+            # MOUNTS' render conditions, which would make turning `iamDb.tls`
+            # off silently turn the broker's identity off too.
+            - name: nats-client-cert
+              mountPath: /var/run/secrets/nats-client-tls
+              readOnly: true
+            {{- end }}
             {{- if .Values.enrolment.caSecret }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
             # copy that kubelet never refreshes, so the CA would freeze at
@@ -745,6 +796,47 @@ spec:
               - key: {{ required "iamDb.tls.clientCertSecretKey names the key inside iamDb.tls.clientCertSecret that holds the client certificate and must be set whenever iamDb.tls.clientCertSecret is; see the chart's values.yaml" .Values.iamDb.tls.clientCertSecretKey | quote }}
                 path: client.pem
               - key: {{ required "iamDb.tls.clientKeySecretKey names the key inside iamDb.tls.clientCertSecret that holds the client private key and must be set whenever iamDb.tls.clientCertSecret is; see the chart's values.yaml" .Values.iamDb.tls.clientKeySecretKey | quote }}
+                path: client-key.pem
+        {{- end }}
+        {{- if .Values.nats.tls.enabled }}
+        - name: nats-ca
+          secret:
+            secretName: {{ required "nats.tls.caSecret holds the CA bundle the broker is verified against and must be set whenever nats.tls.enabled is; see the chart's values.yaml" .Values.nats.tls.caSecret }}
+            # OPTIONAL, and here it means the OPPOSITE of what it means on
+            # the enrolment CA below — the same split `iam-db-ca` above
+            # draws. There it buys availability: the CA belongs to one
+            # administrative RPC, so a missing Secret must not stop the
+            # authentication plane. Here the process MUST NOT START without
+            # a usable bundle once TLS is asked for, and `optional` is
+            # simply which error says so. A required mount that cannot be
+            # satisfied leaves the pod in ContainerCreating with a
+            # FailedMount event about a volume; an optional one mounts an
+            # empty directory, the binary finds no file at NATS_TLS_CA_FILE,
+            # and it exits naming THAT PATH. Neither starts; only one of
+            # them explains itself.
+            optional: true
+            # ONE KEY, not the whole Secret: `nats-tls` is the BROKER's
+            # serving Secret, issued for `server auth`, and holds no private
+            # key this pod has any business reading.
+            items:
+              - key: {{ required "nats.tls.caSecretKey names the key inside nats.tls.caSecret that holds the CA bundle and must be set whenever nats.tls.enabled is; see the chart's values.yaml" .Values.nats.tls.caSecretKey | quote }}
+                path: ca.pem
+        {{- end }}
+        {{- if and .Values.nats.tls.enabled .Values.nats.tls.clientCertSecret }}
+        # WHO THIS SERVICE PRESENTS TO THE BROKER (B-N3, ADR-0852 design item
+        # 7). A SEPARATE VOLUME FROM `iam-db-client-cert` ABOVE, mounted at
+        # its OWN path (ADR-0885) — even when, as by default, it names the
+        # SAME Secret, `iam-client-tls`. Two volumes reading one Secret is
+        # ordinary; what ADR-0885 refuses is coupling the two mounts' render
+        # conditions to each other.
+        - name: nats-client-cert
+          secret:
+            secretName: {{ .Values.nats.tls.clientCertSecret }}
+            optional: true
+            items:
+              - key: {{ required "nats.tls.clientCertSecretKey names the key inside nats.tls.clientCertSecret that holds the client certificate and must be set whenever nats.tls.clientCertSecret is; see the chart's values.yaml" .Values.nats.tls.clientCertSecretKey | quote }}
+                path: client.pem
+              - key: {{ required "nats.tls.clientKeySecretKey names the key inside nats.tls.clientCertSecret that holds the client private key and must be set whenever nats.tls.clientCertSecret is; see the chart's values.yaml" .Values.nats.tls.clientKeySecretKey | quote }}
                 path: client-key.pem
         {{- end }}
         {{- if .Values.enrolment.caSecret }}

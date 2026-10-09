@@ -259,11 +259,15 @@ fn upstream_tls(ca_file: &std::path::Path, domain: &str) -> crate::upstream::Ups
         ),
         ("IAM_DB_TLS_DOMAIN".to_string(), domain.to_string()),
     ];
-    crate::upstream::UpstreamTls::from_lookup(crate::upstream::IAM_DB, |key| {
-        vars.iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.to_string())
-    })
+    crate::upstream::UpstreamTls::from_lookup(
+        crate::upstream::IAM_DB,
+        crate::upstream::IAM_DB_CHART_KEY,
+        |key| {
+            vars.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        },
+    )
     .expect("a flag, a bundle and a domain are a valid configuration")
     .expect("the flag is set, so TLS is on")
 }

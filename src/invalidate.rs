@@ -96,6 +96,10 @@
 //! later publish could usefully consult. A flag no code reads would be a second
 //! mechanism dressed as one.
 
+use crate::upstream;
+
+pub mod transport;
+
 /// Subjects, namespaced so a wildcard subscription is possible later.
 pub mod subject {
     /// A credential was revoked. Payload: the **user id**, not the credential id.
@@ -231,22 +235,20 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Everything [`Invalidator::connect`] builds before it dials: the pair or
 /// the anonymous default, bounded by [`CONNECT_TIMEOUT`], with the event
-/// callback that surfaces a refused publish. Pulled out so a test can
-/// inspect what this function alone produces — `connect` itself does
-/// nothing further to it before `.connect(url).await` — rather than
-/// re-deriving the same expression and asserting it equals itself.
-fn connect_options(credentials: &Option<Credentials>) -> async_nats::ConnectOptions {
-    // BUILT FROM THE PAIR, never spliced into the URL. `nats://user:pass@host`
-    // carries a password only URL-encoded, so a password containing `@`, `/`
-    // or `#` would be silently truncated and a DIFFERENT one sent than the one
-    // in the Secret — a WRONGPASS whose cause is invisible at every layer.
-    let options = match credentials {
-        Some(c) => {
-            async_nats::ConnectOptions::with_user_and_password(c.user.clone(), c.password.clone())
-        }
-        None => async_nats::ConnectOptions::new(),
-    };
-    options
+/// callback that surfaces a refused publish — AND, from B-N3, the broker
+/// hop's transport. Pulled out so a test can inspect what this function
+/// alone produces — `connect` itself does nothing further to it before
+/// `.connect(url).await` — rather than re-deriving the same expression and
+/// asserting it equals itself.
+///
+/// **THE TLS HALF LIVES IN [`transport::connect_options`], not here** (file
+/// size). This function adds the one thing that module cannot: the timeout
+/// and the event callback, both independent of TLS.
+fn connect_options(
+    credentials: &Option<Credentials>,
+    tls: &Option<upstream::UpstreamTls>,
+) -> async_nats::ConnectOptions {
+    transport::connect_options(credentials, tls)
         // BOUNDED HERE. See `CONNECT_TIMEOUT`: this is awaited before the
         // listener binds, so an unbounded dial is an unbounded boot.
         .connection_timeout(CONNECT_TIMEOUT)
@@ -283,7 +285,17 @@ impl Invalidator {
     /// itself; a rejected password does not, and an operator who reads
     /// "cannot reach the broker" for a wrong password goes looking for a network
     /// fault that is not there.
-    pub async fn connect(url: Option<&str>, credentials: Option<Credentials>) -> Self {
+    ///
+    /// `tls` is the broker hop's transport (B-N3, ADR-0852): `None` dials in
+    /// cleartext exactly as this did before; `Some` is
+    /// [`transport::broker_tls`]'s resolved, boot-checked configuration.
+    /// `main` reads `NATS_TLS_ENABLED` and refuses the boot itself; this
+    /// function never reads the environment, so a test can hand it any pair.
+    pub async fn connect(
+        url: Option<&str>,
+        credentials: Option<Credentials>,
+        tls: Option<upstream::UpstreamTls>,
+    ) -> Self {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             tracing::warn!(
                 "no broker configured: cache invalidation will NOT be published, so a \
@@ -291,13 +303,14 @@ impl Invalidator {
             );
             return Self::with(None);
         };
-        let options = connect_options(&credentials);
+        let options = connect_options(&credentials, &tls);
         match options.connect(url).await {
             Ok(client) => {
                 tracing::info!(
                     %url,
                     // WHETHER, never WHAT. This log is shipped.
                     authenticated = credentials.is_some(),
+                    tls = tls.is_some(),
                     "publishing cache invalidation"
                 );
                 if credentials.is_none() {
@@ -314,7 +327,7 @@ impl Invalidator {
             // match has two error arms. See the section on this method.
             Err(e) if e.kind() == async_nats::ConnectErrorKind::AuthorizationViolation => {
                 tracing::error!(
-                    %url, error = %e,
+                    %url, error = %e, tls = tls.is_some(),
                     "the broker REFUSED this service's credential, so cache invalidation will \
                      NOT be published and revocations will be honoured late. This is a \
                      deployment error rather than an outage: it does not recover on its own. \
@@ -323,11 +336,18 @@ impl Invalidator {
                 );
                 Self::with(None)
             }
+            // A REFUSED TLS HANDSHAKE ARRIVES HERE TOO: async-nats has no TLS
+            // error kind of its own (gateway#105 measured the same thing), so
+            // a wrong CA or a broker that does not speak TLS reaches this arm
+            // as a plain I/O error. `tls` on the log line and the wording
+            // below are what let an operator tell the two apart without
+            // reading the wrapped error.
             Err(e) => {
                 tracing::error!(
-                    %url, error = %e,
-                    "cannot reach the broker: cache invalidation will NOT be published \
-                     until it recovers, and revocations will be honoured late"
+                    %url, error = %e, tls = tls.is_some(),
+                    "cannot reach the broker, or the TLS handshake with it failed: cache \
+                     invalidation will NOT be published until it recovers, and revocations \
+                     will be honoured late"
                 );
                 Self::with(None)
             }
