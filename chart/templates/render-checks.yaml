@@ -145,21 +145,21 @@ chart's.
 {{- end }}
 
 {{/*
-B-N3E, THE K-8 EXPAND FOR THE BROKER HOP (ADR-0852), the twin of gateway#104.
-`nats.tls.enabled` is OPTIONAL in this chart version: absent renders nothing,
-so every values file written before this key existed renders as it did.
-PRESENCE IS `enabled`, never the `tls` map, so a `tls: {}` (or, from B-N3, a
-map holding only CA keys) does not state the switch. Present, it is validated
-here (the same map / `hasKey` / `kindIs "bool"` shape as the guards above; the
-schema's `type: boolean` refuses a null or a string first), and `true` is
-refused: the binary reads `NATS_TLS_ENABLED` only from B-N3 and the broker
-serves no TLS until B-L1. B-N3 makes the key required and lifts the `true`
-refusal. `templates/deployment.yaml` renders the variable under the same
-map-and-`hasKey` test (a template variable does not cross files).
+B-N3, THE K-8 CONTRACT FOR THE BROKER HOP (ADR-0852, ADR-0845), the twin of
+gateway#105. `nats.tls.enabled` is now REQUIRED with no default, the same
+K-1 guard `tls.enabled` and `iamDb.tls.enabled` already carry above: the
+schema's `required: [enabled]` plus `type: boolean` pre-empts the absent and
+non-bool cases with a null value (K-1's own note on why `required` alone is
+not enough), and this guard is what produces ADR-0845's own named sentence
+for the two shapes that reach it anyway (a non-map `tls` block, or an
+`enabled` that is present but not a bare bool). THE EXPAND'S "true is
+refused" LINE IS LIFTED: the binary reads `NATS_TLS_ENABLED` now, and
+platform's broker serves TLS from B-L1 — `true` is a real, supported
+configuration rather than a chart-only promise.
 */}}
-{{- $natsTlsStated := and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") -}}
-{{- if and $natsTlsStated (not (kindIs "bool" .Values.nats.tls.enabled)) }}{{ fail "iam: nats.tls.enabled must be true or false when it is set; it renders NATS_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
-{{- if and $natsTlsStated (kindIs "bool" .Values.nats.tls.enabled) .Values.nats.tls.enabled }}{{ fail "iam: nats.tls.enabled: true is refused by this chart version: it declares the key, but the binary reads NATS_TLS_ENABLED only from B-N3 and the broker serves no TLS until B-L1. Set it to false (ADR-0845, ADR-0852)" }}{{ end }}
+{{- if not (and (kindIs "map" .Values.nats) (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") (kindIs "bool" .Values.nats.tls.enabled)) }}
+{{- fail "iam: nats.tls.enabled must be set to true or false; it renders NATS_TLS_ENABLED (ADR-0845, ADR-0797)" }}
+{{- end }}
 
 {{/*
 B-U5, THE CONTRACT HALF OF `tls.clientAuth` (K-8 step 3; ADR-0854, which

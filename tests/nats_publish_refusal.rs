@@ -184,7 +184,7 @@ async fn a_refused_publish_reaches_the_log_at_error_with_the_brokers_own_words()
     let addr = refusing_broker().await;
     let inv = tokio::time::timeout(
         Duration::from_secs(10),
-        Invalidator::connect(Some(&format!("nats://{addr}")), Some(credentials())),
+        Invalidator::connect(Some(&format!("nats://{addr}")), Some(credentials()), None),
     )
     .await
     .expect("the broker answered within the deadline");

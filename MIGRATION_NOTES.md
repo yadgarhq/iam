@@ -3,6 +3,38 @@
 Commands for a human to run, and orderings a human must decide. Nothing here is
 applied automatically.
 
+## The broker hop's TLS switch is now required (B-N3, ADR-0852, ADR-0845, ADR-0885)
+
+**Breaking: `nats.tls.enabled` must be set to `true` or `false` explicitly.**
+The expand release (B-N3E) made it optional; this release makes it `required`
+in the schema with no chart default, guarded in
+`templates/render-checks.yaml` the same way `tls.enabled` and
+`iamDb.tls.enabled` already are. A values source without it is refused at
+`helm template` / `helm lint --strict` / an Argo sync, naming the key. The
+binary refuses to boot when `NATS_URL` is set and `NATS_TLS_ENABLED` is
+absent, empty, or not `1`/`0`.
+
+- `yadgarhq/chart`'s `chart/ci/values.yaml` and `example/values.yaml` already
+  state `iam.nats.tls.enabled: false` (chart#39, B-P2).
+- `false` renders exactly what the expand rendered: `NATS_TLS_ENABLED="0"`
+  and nothing else.
+- `true` dials the broker over TLS. It verifies the broker against
+  `nats.tls.caSecret` / `caSecretKey` (default `nats-tls` / `ca.crt`, one key
+  mounted at `/var/run/config/nats-ca/ca.pem`) and nothing else. It refuses a
+  broker that serves no TLS. It presents `nats.tls.clientCertSecret` when
+  that is set (default `iam-client-tls`, mounted at its own path,
+  `/var/run/secrets/nats-client-tls`). Set it only after platform's NATS
+  serves TLS (B-N4.1). The flip is B-N4.2.
+- **ADR-0885: a SEPARATE chart key from `iamDb.tls.clientCertSecret`, with
+  its OWN mount.** `iam` does not share one client-identity mount across
+  every upstream the way `gateway` does; its only client leaf mount before
+  this release was `iam-db-client-cert`, gated on `iamDb.tls`. Turning
+  `iamDb.tls` off or rotating `iamDb.tls.clientCertSecret` has no effect on
+  the broker hop's identity, and vice versa — even though both key's
+  defaults name the same underlying Secret, `iam-client-tls`.
+
+Revert is a straight `git revert`.
+
 ## The broker password — this image first, the broker second (ledger 518)
 
 `iam` can now present a credential to the broker it publishes D72's cache

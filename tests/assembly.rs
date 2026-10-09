@@ -123,6 +123,21 @@ fn generation(san: &str) -> Generation {
             "nats-password".to_string(),
             format!("sentinel-broker-password-{}\n", unique()),
         ),
+        // THE BROKER'S OWN CA AND CLIENT LEAF (B-N3, ADR-0885) — DISTINCT
+        // FILE NAMES from `ca.pem`/`client.pem`/`client-key.pem` above,
+        // because ADR-0885's whole point is that the broker hop's identity
+        // has its OWN mount rather than sharing `iam-db`'s. Reusing the same
+        // authority and client leaf as a value is fine: this fixture tests
+        // the WATCH WIRING, not a second chain.
+        ("nats-ca.pem".to_string(), ca.pem()),
+        (
+            "nats-client.pem".to_string(),
+            format!("{}{}", client_leaf.pem(), ca.pem()),
+        ),
+        (
+            "nats-client-key.pem".to_string(),
+            client_key.serialize_pem(),
+        ),
     ]
 }
 
@@ -233,7 +248,7 @@ fn upstream_tls(mount: &Mount) -> UpstreamTls {
             mount.path("client-key.pem").display().to_string(),
         ),
     ];
-    UpstreamTls::from_lookup(upstream::IAM_DB, move |k| {
+    UpstreamTls::from_lookup(upstream::IAM_DB, upstream::IAM_DB_CHART_KEY, move |k| {
         vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
     })
     .expect("a complete configuration")
@@ -264,6 +279,32 @@ fn broker_credentials(mount: &Mount) -> Credentials {
     })
     .expect("a complete configuration")
     .expect("both variables are set")
+}
+
+/// The broker hop's OWN transport (B-N3, ADR-0885) — through
+/// `boot::nats_tls` rather than by naming the path, for the same reason
+/// [`broker_credentials`] goes through `boot::nats_credentials`.
+fn nats_tls_fixture(mount: &Mount) -> UpstreamTls {
+    let vars = [
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            mount.path("nats-ca.pem").display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_CERT_FILE".to_string(),
+            mount.path("nats-client.pem").display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_KEY_FILE".to_string(),
+            mount.path("nats-client-key.pem").display().to_string(),
+        ),
+    ];
+    yadgar_iam::boot::nats_tls("nats://nats:4222", move |k| {
+        vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+    })
+    .expect("a complete configuration")
+    .expect("the flag is set")
 }
 
 /// The enrolment CA, loaded the way `main` loads it — which is what records the
@@ -309,6 +350,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             Some(&listener_tls(&mount)),
             Some(&upstream_tls(&mount)),
             Some(&broker_credentials(&mount)),
+            None,
             Some(&enrolment_config(&mount)),
             &config,
         )
@@ -346,6 +388,7 @@ fn each_certificate_is_reported_as_the_one_it_is() {
         Some(&listener_tls(&mount)),
         Some(&upstream_tls(&mount)),
         Some(&broker_credentials(&mount)),
+        None,
         Some(&enrolment_config(&mount)),
         &config,
     );
@@ -372,14 +415,14 @@ fn each_configured_material_contributes_on_its_own() {
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     assert_eq!(
-        rotate::watch_set(None, None, None, None, &config).watched(),
+        rotate::watch_set(None, None, None, None, None, &config).watched(),
         vec![config.path()],
         "with nothing else configured, the mounted configuration document is the only \
          thing watched — it is unconditional, unlike the four materials beside it"
     );
 
     assert_eq!(
-        rotate::watch_set(Some(&listener_tls(&mount)), None, None, None, &config).watched(),
+        rotate::watch_set(Some(&listener_tls(&mount)), None, None, None, None, &config).watched(),
         vec![
             mount.path("tls.pem").as_path(),
             mount.path("tls-key.pem").as_path(),
@@ -391,7 +434,7 @@ fn each_configured_material_contributes_on_its_own() {
     );
 
     assert_eq!(
-        rotate::watch_set(None, Some(&upstream_tls(&mount)), None, None, &config).watched(),
+        rotate::watch_set(None, Some(&upstream_tls(&mount)), None, None, None, &config).watched(),
         vec![
             mount.path("ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -403,7 +446,15 @@ fn each_configured_material_contributes_on_its_own() {
     );
 
     assert_eq!(
-        rotate::watch_set(None, None, Some(&broker_credentials(&mount)), None, &config).watched(),
+        rotate::watch_set(
+            None,
+            None,
+            Some(&broker_credentials(&mount)),
+            None,
+            None,
+            &config
+        )
+        .watched(),
         vec![mount.path("nats-password").as_path(), config.path()],
         "the broker password is watched on the same ground as a certificate: the process \
          read it at boot"
@@ -411,7 +462,15 @@ fn each_configured_material_contributes_on_its_own() {
 
     // TLS OFF, enrolment CA set: the chart's DEFAULT shape.
     assert_eq!(
-        rotate::watch_set(None, None, None, Some(&enrolment_config(&mount)), &config).watched(),
+        rotate::watch_set(
+            None,
+            None,
+            None,
+            None,
+            Some(&enrolment_config(&mount)),
+            &config
+        )
+        .watched(),
         vec![mount.path("enrolment-ca.pem").as_path(), config.path()],
         "a cleartext deployment with an enrolment CA still watches it, plus the mounted \
          document"
@@ -423,10 +482,114 @@ fn each_configured_material_contributes_on_its_own() {
     let no_ca = EnrolmentConfig::load("https://gateway.invalid:18443", None)
         .expect("no CA is a deployment, not an error");
     assert_eq!(
-        rotate::watch_set(None, None, None, Some(&no_ca), &config).watched(),
+        rotate::watch_set(None, None, None, None, Some(&no_ca), &config).watched(),
         vec![config.path()],
         "no CA configured leaves only the mounted document, which is never absent"
     );
+
+    // THE BROKER'S OWN TRANSPORT (B-N3, ADR-0885): its CA and its client pair
+    // are watched by PATH, on their own, independent of `iam-db`'s.
+    assert_eq!(
+        rotate::watch_set(
+            None,
+            None,
+            None,
+            Some(&nats_tls_fixture(&mount)),
+            None,
+            &config
+        )
+        .watched(),
+        vec![
+            mount.path("nats-ca.pem").as_path(),
+            mount.path("nats-client.pem").as_path(),
+            mount.path("nats-client-key.pem").as_path(),
+            config.path(),
+        ],
+        "the broker hop's CA and client pair are watched on their own, at their own \
+         paths — never `iam-db`'s"
+    );
+}
+
+/// ADR-0885's WHOLE POINT, PROVED: the broker's client leaf is watched at
+/// its OWN path alongside `iam-db`'s, and the two neither collide nor
+/// silently replace each other in the watched-files list.
+///
+/// **THE GAUGE IS THE OTHER HALF, AND IT DOES NOT DOUBLE.** `rotate.rs`'s
+/// own doc explains why: `yadgar_lifecycle::rotate::Inputs` keeps one
+/// `Leaf` per `Presented` kind, so a second `Presented::Client` leaf would
+/// overwrite `iam-db`'s in `CERTIFICATE_NOT_AFTER{kind="client"}` — this is
+/// why the broker's leaf is watched by `Inputs::also` rather than folded
+/// through `UpstreamTls`'s `Material` impl. This case asserts the
+/// consequence directly: with BOTH client leaves configured, the gauge
+/// still emits exactly two series — one `serving`, one `client` — and the
+/// `client` one is still `iam-db`'s own expiry, unperturbed by the broker's
+/// leaf being watched at all.
+#[test]
+fn the_brokers_own_client_leaf_is_watched_without_touching_iam_dbs_gauge() {
+    let mount = Mount::new(&generation("iam"));
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+
+    let inputs = rotate::watch_set(
+        None,
+        Some(&upstream_tls(&mount)),
+        None,
+        Some(&nats_tls_fixture(&mount)),
+        None,
+        &config,
+    );
+    let watched = inputs.watched();
+    assert!(
+        watched.contains(&mount.path("client.pem").as_path()),
+        "iam-db's client leaf must still be watched: {watched:?}"
+    );
+    assert!(
+        watched.contains(&mount.path("nats-client.pem").as_path()),
+        "the broker's own client leaf must be watched too, at its own path: {watched:?}"
+    );
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter: Snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        rotate::watch_set(
+            None,
+            Some(&upstream_tls(&mount)),
+            None,
+            Some(&nats_tls_fixture(&mount)),
+            None,
+            &config,
+        )
+        .export_not_after()
+    });
+    let emitted = snapshotter.snapshot().into_vec();
+    assert_eq!(
+        emitted.len(),
+        1,
+        "with no listener configured, exactly one gauge — iam-db's client leaf — must \
+         be published; a second series here would mean the broker's leaf gained its own \
+         gauge, which this repository has no `kind` label for: {emitted:?}"
+    );
+    let (composite, _unit, _description, value) = &emitted[0];
+    let labels: Vec<(String, String)> = composite
+        .key()
+        .labels()
+        .map(|l| (l.key().to_string(), l.value().to_string()))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            ("service".to_string(), "iam".to_string()),
+            ("kind".to_string(), "client".to_string()),
+        ]
+    );
+    match value {
+        DebugValue::Gauge(seconds) => assert_eq!(
+            seconds.into_inner(),
+            CLIENT_NOT_AFTER as f64,
+            "the one gauge must still be iam-db's own client leaf's expiry, unperturbed \
+             by the broker's leaf being configured and watched alongside it"
+        ),
+        other => panic!("expected a gauge, got {other:?}"),
+    }
 }
 
 /// THE GAUGE THIS PROCESS PUBLISHES SAYS `service = "iam"`.
@@ -455,6 +618,7 @@ fn the_gauge_names_this_service_and_each_certificate_it_holds() {
             Some(&listener_tls(&mount)),
             Some(&upstream_tls(&mount)),
             Some(&broker_credentials(&mount)),
+            None,
             Some(&enrolment_config(&mount)),
             &config,
         )
@@ -545,6 +709,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
         Some(&listener_tls(&mount)),
         Some(&upstream_tls(&mount)),
         Some(&broker_credentials(&mount)),
+        None,
         Some(&enrolment_config(&mount)),
         &config,
     );

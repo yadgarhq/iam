@@ -98,9 +98,30 @@ use yadgar_dial::{BalanceError, TlsOptions};
 ///
 /// Built from a PREFIX rather than written out five times, so the naming stays
 /// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CA_FILE`, `<PREFIX>_TLS_DOMAIN`,
-/// `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE`. This service has one upstream, `IAM_DB`; the gateway
-/// has two, and uses the identical shape for both.
+/// `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE`. This service had one
+/// upstream, `IAM_DB`, until B-N3 added the broker hop's `NATS`; the gateway has three, and
+/// uses the identical shape for all of them.
 pub const IAM_DB: &str = "IAM_DB";
+
+/// The chart key that renders `IAM_DB_TLS_ENABLED` (`EnabledNotBoolean`'s `{2}`).
+///
+/// **NAMED EXPLICITLY, NOT DERIVED FROM THE PREFIX.** `IAM_DB`'s chart key is
+/// `iamDb.tls.enabled` — camelCase, with the `_` dropped — so a mechanical
+/// `prefix.to_lowercase()` would print `iam_db.tls.enabled`, which is not a
+/// key this chart declares. [`NATS`]'s happens to lowercase correctly
+/// (`nats.tls.enabled`), but a convention that holds for one prefix and not
+/// the other is not a convention; both are threaded through explicitly.
+pub const IAM_DB_CHART_KEY: &str = "iamDb.tls.enabled";
+
+/// The broker hop (B-N3, ADR-0852, ADR-0885): the same `UpstreamTls` shape as
+/// `IAM_DB`, read by `crate::invalidate::transport::broker_tls` rather than by
+/// [`connect`] — the broker is dialled by `async-nats`, not by
+/// [`yadgar_dial`], so this prefix's `UpstreamTls` never reaches
+/// [`UpstreamTls::options`].
+pub const NATS: &str = "NATS";
+
+/// The chart key that renders `NATS_TLS_ENABLED`. See [`IAM_DB_CHART_KEY`].
+pub const NATS_CHART_KEY: &str = "nats.tls.enabled";
 
 /// What a deployment got wrong about the transport, before anything is dialled.
 #[derive(Debug, thiserror::Error)]
@@ -110,9 +131,9 @@ pub enum TlsConfigError {
          compiled-in default, so this service cannot guess whether to dial over TLS: \
          leaving it unset or empty is refused exactly like any other value outside the two \
          it accepts. Write \"1\" to dial over TLS or \"0\" to dial in cleartext. The chart \
-         renders this from `iamDb.tls.enabled`."
+         renders this from `{2}`."
     )]
-    EnabledNotBoolean(&'static str, String),
+    EnabledNotBoolean(&'static str, String, &'static str),
 
     #[error(
         "{0}_TLS_ENABLED is set but {0}_TLS_CA_FILE names no CA bundle. TLS was asked \
@@ -183,8 +204,11 @@ impl UpstreamTls {
     /// `Ok(None)` is the explicit-cleartext answer: `{prefix}_TLS_ENABLED` is
     /// `"0"`. There is no unconfigured answer any more (ADR-0845) — absent or
     /// anything else refuses.
-    pub fn from_env(prefix: &'static str) -> Result<Option<Self>, TlsConfigError> {
-        Self::from_lookup(prefix, |key| std::env::var(key).ok())
+    pub fn from_env(
+        prefix: &'static str,
+        chart_key: &'static str,
+    ) -> Result<Option<Self>, TlsConfigError> {
+        Self::from_lookup(prefix, chart_key, |key| std::env::var(key).ok())
     }
 
     /// The same decision, over an injected lookup.
@@ -193,8 +217,13 @@ impl UpstreamTls {
     /// sets one steers every other test running in the same binary, so the
     /// decision that picks between an encrypted transport and a cleartext one
     /// could not be tested at all without this.
+    ///
+    /// `chart_key` is the dotted values path that renders `{prefix}_TLS_ENABLED`
+    /// — named by the caller rather than derived, because this chart's naming
+    /// is not mechanical across prefixes. See [`IAM_DB_CHART_KEY`].
     pub fn from_lookup(
         prefix: &'static str,
+        chart_key: &'static str,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<Option<Self>, TlsConfigError> {
         let get = |suffix: &str| {
@@ -236,12 +265,14 @@ impl UpstreamTls {
                 return Err(TlsConfigError::EnabledNotBoolean(
                     prefix,
                     format!("{other:?}"),
+                    chart_key,
                 ))
             }
             None => {
                 return Err(TlsConfigError::EnabledNotBoolean(
                     prefix,
                     "NOT SET".to_string(),
+                    chart_key,
                 ))
             }
         }

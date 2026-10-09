@@ -36,7 +36,7 @@ fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Opt
 /// value outside "1"/"0", naming the knob.
 #[test]
 fn absent_tls_enabled_is_refused() {
-    let err = UpstreamTls::from_lookup(IAM_DB, lookup(&[])).unwrap_err();
+    let err = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&[])).unwrap_err();
     // NOT INTERPOLATED into the assert message (CodeQL's cleartext-logging
     // query reads an enum variant's name — `ClientCertificateWithoutKey` and
     // `ClientKeyWithoutCertificate` are this error's sibling variants,
@@ -46,7 +46,10 @@ fn absent_tls_enabled_is_refused() {
     // boolean match below is the whole of the proof; a plain `assert!`
     // needs no diagnostic string to redden informatively, since the panic
     // already names the file and line.
-    assert!(matches!(err, TlsConfigError::EnabledNotBoolean(IAM_DB, _)));
+    assert!(matches!(
+        err,
+        TlsConfigError::EnabledNotBoolean(IAM_DB, _, _)
+    ));
     // ON THE MESSAGE, not only the variant: a refusal that dropped the
     // variable name or the chart key out of its sentence would still match
     // the `matches!` above, which is exactly the mutation this guards
@@ -55,6 +58,29 @@ fn absent_tls_enabled_is_refused() {
     let printed = err.to_string();
     assert!(printed.contains("IAM_DB_TLS_ENABLED"));
     assert!(printed.contains("iamDb.tls.enabled"));
+}
+
+/// THE CHART KEY IS PER PREFIX, NOT DERIVED FROM IT (B-N3, ledger 925).
+/// `IAM_DB`'s key is `iamDb.tls.enabled` — camelCase, with the `_` dropped —
+/// so a refusal built by lowercasing the prefix would print `iam_db.tls
+/// .enabled`, a key this chart does not declare. This is the mutant a second
+/// upstream exposes: `NATS` lowercases correctly to `nats.tls.enabled`, so a
+/// test that only ever reads `IAM_DB` cannot tell a derived key from a
+/// threaded one apart. It also fixed a REAL bug: before `chart_key` was
+/// threaded through, `NATS`'s refusal named `iamDb.tls.enabled` unconditionally
+/// — the one message in this module hardcoded to the first upstream it ever
+/// had.
+#[test]
+fn the_chart_key_in_the_refusal_is_the_callers_own_not_the_first_upstreams() {
+    let err = UpstreamTls::from_lookup(NATS, NATS_CHART_KEY, lookup(&[])).unwrap_err();
+    assert!(matches!(err, TlsConfigError::EnabledNotBoolean(NATS, _, _)));
+    let printed = err.to_string();
+    assert!(printed.contains("NATS_TLS_ENABLED"));
+    assert!(printed.contains("nats.tls.enabled"));
+    assert!(
+        !printed.contains("iamDb"),
+        "NATS's refusal must not name IAM_DB's chart key: {printed:?}"
+    );
 }
 
 /// THE REVERTED STATE is now `"0"` WRITTEN EXPLICITLY, not absence. A bundle
@@ -67,7 +93,7 @@ fn a_ca_bundle_alone_with_the_flag_explicitly_off_does_not_enable_tls() {
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
     ];
     assert_eq!(
-        UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
+        UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars)).unwrap(),
         None
     );
 }
@@ -84,8 +110,8 @@ fn anything_but_zero_or_one_is_refused() {
         ];
         assert!(
             matches!(
-                UpstreamTls::from_lookup(IAM_DB, lookup(&vars)),
-                Err(TlsConfigError::EnabledNotBoolean(IAM_DB, _))
+                UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars)),
+                Err(TlsConfigError::EnabledNotBoolean(IAM_DB, _, _))
             ),
             "{value:?} must be refused, not treated as off"
         );
@@ -104,7 +130,7 @@ fn asking_for_tls_without_a_ca_bundle_is_an_error() {
     ] {
         assert!(
             matches!(
-                UpstreamTls::from_lookup(IAM_DB, lookup(&vars)),
+                UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars)),
                 Err(TlsConfigError::NoCaFile("IAM_DB"))
             ),
             "{vars:?} must be refused, not silently downgraded"
@@ -121,7 +147,7 @@ fn the_bundle_and_the_domain_both_arrive() {
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
         ("IAM_DB_TLS_DOMAIN", SENTINEL_DOMAIN),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert_eq!(tls.ca_file(), Path::new(SENTINEL_CA));
@@ -136,7 +162,7 @@ fn the_domain_is_optional() {
         ("IAM_DB_TLS_ENABLED", "1"),
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert_eq!(tls.domain(), None);
@@ -166,7 +192,7 @@ async fn a_tls_dial_goes_through_connect_tls_and_not_through_connect() {
         ("IAM_DB_TLS_ENABLED", "1"),
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .unwrap();
 
@@ -207,7 +233,7 @@ async fn a_cleartext_dial_reads_no_bundle() {
         ("IAM_DB_TLS_ENABLED", "1"),
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .unwrap();
 
@@ -240,7 +266,7 @@ fn another_upstreams_variables_do_not_configure_this_one() {
         ("IAM_DB_TLS_ENABLED", "0"),
     ];
     assert_eq!(
-        UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
+        UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars)).unwrap(),
         None
     );
 }
@@ -253,7 +279,7 @@ fn no_client_certificate_is_the_default() {
         ("IAM_DB_TLS_ENABLED", "1"),
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert_eq!(tls.client_certificate_file(), None);
@@ -272,7 +298,7 @@ fn the_client_certificate_and_its_key_both_arrive() {
         ("IAM_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
         ("IAM_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert_eq!(
@@ -293,7 +319,7 @@ fn half_a_client_identity_is_refused() {
         ("IAM_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
     ];
     assert!(matches!(
-        UpstreamTls::from_lookup(IAM_DB, lookup(&cert_only)),
+        UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&cert_only)),
         Err(TlsConfigError::ClientCertificateWithoutKey(IAM_DB))
     ));
 
@@ -303,7 +329,7 @@ fn half_a_client_identity_is_refused() {
         ("IAM_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
     ];
     assert!(matches!(
-        UpstreamTls::from_lookup(IAM_DB, lookup(&key_only)),
+        UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&key_only)),
         Err(TlsConfigError::ClientKeyWithoutCertificate(IAM_DB))
     ));
 }
@@ -320,7 +346,7 @@ fn an_empty_client_path_is_the_same_as_an_unset_one() {
         ("IAM_DB_TLS_CLIENT_CERT_FILE", "  "),
         ("IAM_DB_TLS_CLIENT_KEY_FILE", ""),
     ];
-    let tls = UpstreamTls::from_lookup(IAM_DB, lookup(&vars))
+    let tls = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert_eq!(tls.client_certificate_file(), None);
@@ -338,7 +364,7 @@ fn a_client_certificate_alone_does_not_enable_tls() {
         ("IAM_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
     ];
     assert_eq!(
-        UpstreamTls::from_lookup(IAM_DB, lookup(&vars)).unwrap(),
+        UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&vars)).unwrap(),
         None
     );
 }
@@ -360,7 +386,7 @@ fn the_client_identity_reaches_tlsoptions_when_the_env_sets_it() {
         ("IAM_DB_TLS_CA_FILE", SENTINEL_CA),
     ];
 
-    let without = UpstreamTls::from_lookup(IAM_DB, lookup(&base))
+    let without = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&base))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert!(
@@ -374,7 +400,7 @@ fn the_client_identity_reaches_tlsoptions_when_the_env_sets_it() {
         ("IAM_DB_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
         ("IAM_DB_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
     ];
-    let with = UpstreamTls::from_lookup(IAM_DB, lookup(&with_client))
+    let with = UpstreamTls::from_lookup(IAM_DB, IAM_DB_CHART_KEY, lookup(&with_client))
         .unwrap()
         .expect("a flag and a bundle enable TLS");
     assert!(

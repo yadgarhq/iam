@@ -74,29 +74,30 @@ OPEN_PATHS = ("global", "resources", "rollingUpdate")
 # ships it). `tls.clientAuth` LEFT this set for `REQUIRED_NO_DEFAULT_MODES`
 # when B-U5 made it required.
 #
-# `nats.tls.enabled` joins them for the B-N3E expand (K-8, ADR-0852): declared
-# (`type: boolean`, not required) and read only when present, with no value in
-# `values.yaml`. B-N3 moves it to `REQUIRED_NO_DEFAULT` when the binary
-# requires `NATS_TLS_ENABLED`. (`nats.tls` itself is a block, not a leaf, so
-# this walk never lists it.)
 EXTRAS = (
     "image.digest",
     "networkPolicy.scrapeFrom.namespace",
     "tls.clientCaSecret",
     "tls.clientCaSecretKey",
-    "nats.tls.enabled",
 )
 
-# `tls.enabled` and `iamDb.tls.enabled` (ADR-0845, C-SVb): leaves `values.yaml`
-# DELIBERATELY ships no value for, because the knob's own absence is the
-# property the schema exists to catch — a chart default here would be one
-# more compiled-in default under the exact rule this unit enforces on the
-# binary. Excluded from the values.yaml half of the key-set census (there is
-# no value to find there) and from the untyped-leaf census below (the leaf
+# `tls.enabled`, `iamDb.tls.enabled` (ADR-0845, C-SVb) and, from B-N3
+# (ADR-0852, ADR-0885), `nats.tls.enabled`: leaves `values.yaml` DELIBERATELY
+# ships no value for, because the knob's own absence is the property the
+# schema exists to catch — a chart default here would be one more
+# compiled-in default under the exact rule this unit enforces on the binary.
+# Excluded from the values.yaml half of the key-set census (there is no
+# value to find there) and from the untyped-leaf census below (the leaf
 # keeps `type: boolean`, K-1). NOT an EXTRA: an extra is a key `values.yaml`
-# omits by design with NO constraint attached; these two are omitted by
+# omits by design with NO constraint attached; these three are omitted by
 # design AND an adopter MUST choose one of exactly two values.
-REQUIRED_NO_DEFAULT = ("tls.enabled", "iamDb.tls.enabled")
+#
+# `nats.tls`'s OTHER leaves (`caSecret`, `caSecretKey`, `clientCertSecret`,
+# `clientCertSecretKey`, `clientKeySecretKey`) are untyped and carry real
+# defaults in `values.yaml`, the same shape `iamDb.tls`'s equivalents take —
+# so none of them join EXTRAS or REQUIRED_NO_DEFAULT; the census below finds
+# them in `values.yaml` like any other leaf.
+REQUIRED_NO_DEFAULT = ("tls.enabled", "iamDb.tls.enabled", "nats.tls.enabled")
 
 # `tls.clientAuth` (B-U5, ADR-0854 extending ADR-0845): required with no
 # default like the switches above, but a MODE rather than a switch, and its
@@ -472,6 +473,13 @@ def test_mutation_dropping_iam_db_tls_enabled_required_reddens():
     assert required_no_default_failures(mutated) != []
 
 
+def test_mutation_dropping_nats_tls_enabled_required_reddens():
+    """B-N3's own version of the mutation above (ADR-0852, ADR-0845)."""
+    mutated = copy.deepcopy(schema())
+    del mutated["properties"]["nats"]["properties"]["tls"]["required"]
+    assert required_no_default_failures(mutated) != []
+
+
 # ── RENDER, THE RED-CASE TABLE (brief §5) ────────────────────────────────────
 # Asserted on the KEY NAME and the PATH FRAGMENT, never on helm's wording: helm
 # 3.18.4 prints `- <path>: Additional property X is not allowed`, helm 3.20.2 and
@@ -635,6 +643,12 @@ def test_dropping_tls_required_degrades_the_bare_lint_message(tmp_path):
     mutated = json.loads(schema_copy.read_text())
     del mutated["properties"]["tls"]["required"]
     del mutated["properties"]["iamDb"]["properties"]["tls"]["required"]
+    # B-N3 (ADR-0852, ADR-0845): `nats.tls.enabled` is REQUIRED_NO_DEFAULT
+    # too now, and the mutation must drop every `required` the chart states
+    # or the schema wrapper above keeps firing for THIS key while the
+    # mutation under test is the other two — masking the degradation this
+    # case exists to prove.
+    del mutated["properties"]["nats"]["properties"]["tls"]["required"]
     schema_copy.write_text(json.dumps(mutated))
 
     # BARE, NO `-f CI_VALUES` — the whole point is the chart with no

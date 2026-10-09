@@ -30,11 +30,11 @@ iamDb:
   tls:
     enabled: true
 
-# B-N3E (K-8 expand, ADR-0852): the broker hop's switch, stated at the only
-# value this chart version accepts. `false` renders `NATS_TLS_ENABLED="0"`;
-# `true` is refused until B-N3, because platform's NATS serves no TLS until
-# B-L1. Stated here so B-N3, which makes the key required, needs no change to
-# this file.
+# B-N3 (K-8 contract, ADR-0852, ADR-0845): the broker hop's switch, now
+# required with no default, the same shape as `tls.enabled`/`iamDb.tls.enabled`
+# above. Stated `false` — unchanged from the B-N3E expand — because platform's
+# broker does not serve TLS until B-L1; `true` is accepted by this chart
+# version but would be a real cleartext-dial refusal against today's broker.
 nats:
   tls:
     enabled: false

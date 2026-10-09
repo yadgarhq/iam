@@ -176,21 +176,43 @@ impl Material for EnrolmentConfig {
 /// Everything this deployment read at boot, hashed as it was read.
 ///
 /// **THE LIST IS THE ASSERTION, and this service's list is the longest in the
-/// estate.** Five materials, up to nine files. Each of the first four is
+/// estate.** Six materials, up to twelve files. Each of the first five is
 /// opt-in and `Option<M>: Material` folds an absent one to nothing, so no
 /// argument needs a branch at the call site — which is what let the four
 /// per-role builder methods this module used to carry collapse into one trait.
 ///
-/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE FIFTH MEMBER, AND THE ONLY ONE
+/// **`nats_tls` IS NOT FOLDED THROUGH [`UpstreamTls`]'s OWN `Material` IMPL,
+/// AND THAT IS DELIBERATE (B-N3, ADR-0885).** `yadgar_lifecycle::rotate::Inputs`
+/// keeps exactly ONE `Leaf` per [`Presented`] kind (`certificate` overwrites
+/// whatever the kind already held, keyed on the kind alone, never on the
+/// path) — true of `upstream`'s own client leaf already, harmless there
+/// because nothing else in this service presents one. ADR-0885 gives the
+/// broker hop its OWN client certificate, independent of `iamDb.tls`'s, so a
+/// deployment presenting both would have TWO `Presented::Client` leaves —
+/// and folding the second one through the same impl would silently
+/// overwrite the first in `CERTIFICATE_NOT_AFTER{kind="client"}`'s gauge,
+/// reporting only whichever leaf this function happened to fold last.
+///
+/// **ROTATION SAFETY IS NOT WHAT THIS COSTS.** `Inputs::also` de-duplicates
+/// and hashes by PATH, not by kind, so the broker's CA, its client
+/// certificate and its key are watched and exit-on-change exactly as every
+/// other file here does — an expired or rotated broker leaf still restarts
+/// this pod (ADR-0516). What is lost is ONLY the expiry GAUGE for this one
+/// leaf; see the PR that added this comment for the measurement and the
+/// follow-up this gap was filed as (a per-path, not per-kind, gauge in
+/// `yadgar-lifecycle` — out of this repository's reach while that crate is
+/// pinned by tag).
+///
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE LAST MEMBER, AND THE ONLY ONE
 /// THAT IS NEVER ABSENT (step 2a).** `config` is `shared/shared.yaml`, mounted
 /// from `yadgarhq/config`'s `shared` ConfigMap, and it is a [`Material`] like
-/// the other four: `Configuration` implements the trait by returning the one
+/// the first five: `Configuration` implements the trait by returning the one
 /// file it read its schedule from, so folding it in here joins the document to
 /// the ADR-0523 watch set through the exact same `Inputs::of` path the
 /// certificates, the broker password and the enrolment CA already take. An
 /// operator editing `shared.yaml` restarts this pod exactly as editing a CA
 /// bundle would. It is `&Configuration`, not `Option<&Configuration>` —
-/// unlike the other four, there is no deployment shape in which this service
+/// unlike the other five, there is no deployment shape in which this service
 /// has none.
 ///
 /// **A cleartext `iam` already watched something before this**, unlike `task`
@@ -203,15 +225,42 @@ impl Material for EnrolmentConfig {
 /// actually loaded. Collecting paths and reading them when the watcher first
 /// polls would put the rest of boot inside a window where a kubelet swap quietly
 /// becomes the baseline, and the real rotation would never be noticed.
+///
+/// **SIX ARGUMENTS, AND THE ALTERNATIVE IS WORSE THAN THE LINT.** Grouping
+/// them into a struct is what clippy asks for, and a struct that satisfied
+/// the call sites would carry `Default` — at which point a per-half case in
+/// `tests/assembly.rs` could omit a member with `..Default::default()`, and
+/// a NEW member added later would be silently absent from every one of
+/// them. Positional arguments make every call site name every member, which
+/// is what turns a deleted one red instead of quiet.
+#[allow(clippy::too_many_arguments)]
 pub fn watch_set(
     listener: Option<&ServerTls>,
     upstream: Option<&UpstreamTls>,
     broker: Option<&Credentials>,
+    nats_tls: Option<&UpstreamTls>,
     enrolment: Option<&EnrolmentConfig>,
     config: &Configuration,
 ) -> Inputs {
-    Inputs::of(
-        SERVICE,
-        &[&listener, &upstream, &broker, &enrolment, config],
-    )
+    // THE SAME FOLD `Inputs::of` PERFORMS, split around the one member that
+    // is not a plain `Material` call: `nats_tls`'s files are watched by
+    // `also` (see this function's own doc), positioned here, between
+    // `broker` and `enrolment`, so a deployment's watched-files list reads
+    // in the same order its arguments do — `config` stays genuinely LAST.
+    let inputs = Inputs::new(SERVICE)
+        .take(&listener)
+        .take(&upstream)
+        .take(&broker);
+    let inputs = match nats_tls {
+        None => inputs,
+        Some(tls) => {
+            let inputs = inputs.also(tls.ca_file());
+            match (tls.client_certificate_file(), tls.client_key_file()) {
+                (Some(certificate), Some(key)) => inputs.also(certificate).also(key),
+                // `UpstreamTls` holds both or neither, so this arm is "neither".
+                _ => inputs,
+            }
+        }
+    };
+    inputs.take(&enrolment).take(config)
 }

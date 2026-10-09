@@ -396,21 +396,57 @@ nats:
   # with one and not the other.
   user: iam
 
-  # TLS on the broker hop (ADR-0852, ADR-0845): `nats.tls.enabled`. THIS CHART
-  # VERSION IS THE K-8 EXPAND. It declares the key in the schema and states no
-  # value for it here, deliberately, so nothing about the hop changes yet:
-  #
-  #   - left out, nothing renders, and the manifest is what it was before;
-  #   - `false` renders `NATS_TLS_ENABLED="0"`;
-  #   - `true` is REFUSED at render. The binary reads `NATS_TLS_ENABLED` only
-  #     from B-N3, and the broker serves no TLS until B-L1, so a `true` here
-  #     would look encrypted while the hop stays cleartext.
-  #
-  # B-N3 makes `enabled` required with no default (ADR-0845), lifts the `true`
-  # refusal, and adds the CA keys and mount. State `false` now, so that step
-  # needs no values change. The hop will present iam's existing client leaf,
-  # `iam-client-tls` (ADR-0852 design item 7); which key names it is B-N3's
-  # choice, because today that leaf mounts only under `iamDb.tls`.
+  # TLS on the broker hop (ADR-0852, ADR-0845, B-N3): `nats.tls.enabled`.
+  # THIS CHART VERSION IS THE K-8 CONTRACT. `enabled` now has NO DEFAULT
+  # HERE ANY MORE, the same shape `tls.enabled` and `iamDb.tls.enabled` take
+  # above: the binary refuses `NATS_TLS_ENABLED` absent or non-boolean once
+  # `NATS_URL` is set, so a chart default here would be the one compiled-in
+  # default this knob has left. `chart/values.schema.json` marks the key
+  # `required`, so an adopter who omits it meets a render-time refusal
+  # naming `nats.tls.enabled` rather than a hop that silently dials
+  # cleartext. `chart/ci/values.yaml` sets it `false` so every shared gate
+  # that lints or renders this chart offline still has a value to coalesce
+  # — unchanged from the B-N3E expand, because platform's broker does not
+  # serve TLS until B-L1. `true` is no longer refused BY THIS CHART: the
+  # binary reads `NATS_TLS_ENABLED` now, so flipping it is a real cut-over
+  # rather than a chart-only promise, done at B-N4.2 once the broker itself
+  # serves TLS.
+  tls:
+    # The Secret holding the authority the broker's certificate is verified
+    # against. The same Secret the gateway's `nats.tls.caSecret` names: one
+    # broker, one issuer, one CA bundle every hop to it is verified against.
+    #
+    # A SECRET, THOUGH A CA IS PUBLIC — see `iamDb.tls.caSecret` above for
+    # why: that is where an issuer writes it, not a claim of confidentiality.
+    caSecret: nats-tls
+    # The key inside that Secret holding the bundle, mounted as `ca.pem`.
+    caSecretKey: ca.crt
+
+    # WHO THIS SERVICE SAYS IT IS TO THE BROKER — mutual TLS (ADR-0852
+    # design item 7). **A SEPARATE KEY FROM `iamDb.tls.clientCertSecret`,
+    # WITH ITS OWN MOUNT (ADR-0885).** The B-N3 plan card assumed this
+    # service already shares one client-identity mount across every
+    # upstream, the way `gateway` does; it does not. `iam`'s only client
+    # leaf mount before this release was `iam-db-client-cert`, rendered only
+    # when `iamDb.tls.clientCertSecret` is set, under `iamDb.tls.enabled`.
+    # Reusing it here would couple the broker's identity to that hop's flags
+    # — turning `iamDb.tls` off would silently turn the broker's identity
+    # off too. This key, and the mount it renders, are independent of every
+    # `iamDb.tls` key.
+    #
+    # DEFAULT NON-EMPTY, UNLIKE `iamDb.tls.clientCertSecret`. `iam` already
+    # holds one client leaf, `iam-client-tls` (ADR-0852 design item 7: "leaves
+    # are added where a client has none" adds no leaf here, because iam
+    # already has one), and this is the SAME Secret under a second,
+    # independent mount — not a Secret this chart must additionally create.
+    clientCertSecret: iam-client-tls
+    # The key inside that Secret holding the certificate, mounted as
+    # `client.pem`. Named for the reason `caSecretKey` and
+    # `iamDb.tls.clientCertSecretKey` already are.
+    clientCertSecretKey: tls.crt
+    # The key inside that Secret holding the private key, mounted as
+    # `client-key.pem`.
+    clientKeySecretKey: tls.key
 
 login:
   # The shortest time Login may answer in, in milliseconds. It floors the WHOLE

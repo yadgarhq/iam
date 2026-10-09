@@ -98,6 +98,37 @@ pub fn nats_credentials(
     }))
 }
 
+/// The broker hop's transport (B-N3, ADR-0852, ADR-0845): `None` for no
+/// broker at all, or for `NATS_TLS_ENABLED="0"`; `Some` resolved and CHECKED
+/// — see [`crate::invalidate::transport::broker_tls`], which does the real
+/// work and is where the file-level checks live (ca bundle unreadable, zero
+/// certificates, client pair half-configured, `NATS_TLS_DOMAIN` refused).
+///
+/// **`url` IS READ BY THE CALLER, NEVER HERE.** `main` already holds
+/// `NATS_URL` for [`crate::invalidate::Invalidator::connect`]; a second read
+/// here could in principle disagree with it (a real risk only across two
+/// `std::env::var` calls racing a mutation nothing in this process makes,
+/// but the same discipline [`nats_credentials`] takes for the same reason —
+/// one resolved value, not two reads of the same name).
+///
+/// **NO URL MEANS NO HOP TO ENCRYPT, so `NATS_TLS_ENABLED` is not even
+/// looked at.** This differs from [`nats_credentials`], which reads
+/// `NATS_USER`/`NATS_PASSWORD_FILE` whatever the url says and lets the
+/// chart's own `{{- if .Values.nats.passwordSecret }}` guard keep the two
+/// in step: a credential left mounted against a cleared `nats.url` is
+/// merely unused, never wrong. `NATS_TLS_ENABLED` is different — ADR-0845
+/// refuses it absent, so reading it against no broker at all would refuse
+/// a boot that asked for nothing.
+pub fn nats_tls(
+    url: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<UpstreamTls>, String> {
+    if url.is_empty() {
+        return Ok(None);
+    }
+    crate::invalidate::transport::broker_tls(&env)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BootError {
     #[error(
@@ -279,7 +310,8 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
     // conversion no longer changes what the operator reads; it stays as the
     // sentence it always produced, naming the missing variable and saying
     // why cleartext is not the answer.
-    let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB).map_err(|e| e.to_string())?;
+    let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB, upstream::IAM_DB_CHART_KEY)
+        .map_err(|e| e.to_string())?;
     let db = upstream::connect(&db_host, db_port, db_tls.as_ref())
         .await
         // `refusal` rather than `to_string()` (ledger 733, ledger 740): see its

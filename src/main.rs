@@ -169,6 +169,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // states it refuses.
     let nats_credentials = boot::nats_credentials(|key| std::env::var(key).ok())?;
 
+    // THE BROKER HOP'S TRANSPORT (B-N3, ADR-0852, ADR-0845), from the SAME
+    // url `Invalidator::connect` below dials. See `boot::nats_tls`'s own doc
+    // for why it is read only once `nats_url` is non-empty.
+    let nats_url = std::env::var("NATS_URL").ok().unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): absence means no broker is configured, the same gate `Invalidator::connect` takes below.
+    let nats_tls = boot::nats_tls(&nats_url, |key| std::env::var(key).ok())?;
+
     let enrolment = boot::enrolment();
 
     // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION IN ONE PLACE AND
@@ -178,27 +184,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // inside a window where a kubelet swap quietly becomes the baseline, and the
     // real rotation would never be noticed.
     //
-    // FIVE MATERIALS, THREE OF WHICH ARE NOT TRANSPORT. The broker password is a
-    // file this process read at boot, mounted as a directory so it can rotate
-    // and about to be baked into a `Client` cached for the life of the process;
-    // the enrolment CA is token payload the chart mounts the same way. ADR-0523's
-    // rule is about provenance rather than payload, so both are watched exactly
-    // as the certificates are.
-    //
-    // THE MOUNTED CONFIGURATION DOCUMENT JOINS THE SAME SET, as a fifth
-    // `Material` and the only one that is never absent (step 2a) — `config` is
-    // `&Configuration`, not `Option<&Configuration>`. An operator editing
-    // `shared.yaml` now restarts this pod exactly as editing a CA bundle would.
-    //
-    // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be four builder calls
-    // scattered across this function, up to a hundred and fifty lines apart,
-    // where nothing could reach them: no test spawned this binary then, so
-    // deleting any one of them compiled and passed everything. The list lives in
-    // `rotate::watch_set` now and `tests/assembly.rs` calls it.
+    // SIX MATERIALS, THREE OF WHICH ARE NOT TRANSPORT (the broker password
+    // and the enrolment CA, token payload; the mounted configuration
+    // document, the only one never absent). THE BROKER'S OWN CLIENT LEAF
+    // (B-N3, ADR-0885) IS THE SIXTH, watched BY PATH rather than through
+    // `UpstreamTls`'s own `Material` impl — see `rotate::watch_set`'s own
+    // doc for why a second `Presented::Client` leaf cannot share that impl
+    // with `iam-db`'s. ONE CALL, AND THE SAME ONE A TEST MAKES: deleting a
+    // member from `rotate::watch_set`'s list turns `tests/assembly.rs` red.
     let watch_inputs = rotate::watch_set(
         listen_tls.as_ref(),
         db_tls.as_ref(),
         nats_credentials.as_ref(),
+        nats_tls.as_ref(),
         enrolment.as_ref(),
         &config,
     );
@@ -210,8 +208,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     watch_inputs.export_not_after();
 
     let invalidator = yadgar_iam::invalidate::Invalidator::connect(
-        std::env::var("NATS_URL").ok().as_deref(), // ADR-0569-EXCEPTION(ABS): absence means invalidation publishing is off (965 census row B2); `Invalidator::connect` warns and keeps serving.
+        Some(nats_url.as_str()).filter(|u| !u.is_empty()), // ADR-0569-EXCEPTION(ABS): absence means invalidation publishing is off (965 census row B2); `Invalidator::connect` warns and keeps serving. The SAME `nats_url` `boot::nats_tls` above read, not a second lookup.
         nats_credentials,
+        nats_tls,
     )
     .await;
 
