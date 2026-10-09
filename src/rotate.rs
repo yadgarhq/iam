@@ -226,14 +226,12 @@ impl Material for EnrolmentConfig {
 /// polls would put the rest of boot inside a window where a kubelet swap quietly
 /// becomes the baseline, and the real rotation would never be noticed.
 ///
-/// **SIX ARGUMENTS, AND THE ALTERNATIVE IS WORSE THAN THE LINT.** Grouping
-/// them into a struct is what clippy asks for, and a struct that satisfied
-/// the call sites would carry `Default` — at which point a per-half case in
-/// `tests/assembly.rs` could omit a member with `..Default::default()`, and
-/// a NEW member added later would be silently absent from every one of
-/// them. Positional arguments make every call site name every member, which
-/// is what turns a deleted one red instead of quiet.
-#[allow(clippy::too_many_arguments)]
+/// **SIX ARGUMENTS, POSITIONAL ON PURPOSE.** A struct would carry `Default`
+/// — at which point a per-half case in `tests/assembly.rs` could omit a
+/// member with `..Default::default()`, and a NEW member added later would
+/// be silently absent from every one of them. Positional arguments make
+/// every call site name every member, which is what turns a deleted one
+/// red instead of quiet.
 pub fn watch_set(
     listener: Option<&ServerTls>,
     upstream: Option<&UpstreamTls>,

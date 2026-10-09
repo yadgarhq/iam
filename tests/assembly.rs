@@ -59,6 +59,17 @@ const LEAF_NOT_AFTER: i64 = 1_813_017_600; // 2027-06-15T00:00:00Z
 /// plausible number. A distinct date turns that into a failing equality.
 const CLIENT_NOT_AFTER: i64 = 1_844_640_000; // 2028-06-15T00:00:00Z
 
+/// The BROKER's OWN client leaf's expiry (B-N3, ADR-0885) — A THIRD,
+/// DISTINCT DATE, two years past `CLIENT_NOT_AFTER`'s. A leaf that merely
+/// reused `client_leaf`'s bytes under a second file name would make
+/// `the_brokers_own_client_leaf_is_watched_without_touching_iam_dbs_gauge`
+/// vacuous: folding it through the SAME `Presented::Client` slot
+/// `rotate::watch_set` deliberately avoids would overwrite with an
+/// identical value, and the case would pass whether or not that avoidance
+/// held. A distinct expiry is what makes "the gauge still reports iam-db's"
+/// a claim a mutation can falsify.
+const BROKER_CLIENT_NOT_AFTER: i64 = 1_907_712_000; // 2030-06-15T00:00:00Z
+
 /// One generation of the mount: the file names the chart writes, and their
 /// contents.
 type Generation = Vec<(String, String)>;
@@ -99,6 +110,24 @@ fn generation(san: &str) -> Generation {
         .push(DnType::CommonName, format!("{san}-caller"));
     let client_leaf = client_params.signed_by(&client_key, &ca).unwrap();
 
+    // THE BROKER'S OWN CLIENT LEAF (B-N3, ADR-0885) — A SEPARATE certificate
+    // from `client_leaf` above, from the same authority but its own key and
+    // its own, DELIBERATELY DIFFERENT `not_after`
+    // (`BROKER_CLIENT_NOT_AFTER`). Reusing `client_leaf`'s bytes here would
+    // make the collision-avoidance case this leaf exists for pass whether
+    // or not the avoidance held — see that constant's own doc.
+    let broker_client_key = KeyPair::generate().unwrap();
+    let mut broker_client_params =
+        CertificateParams::new(vec![format!("{san}-broker-caller")]).unwrap();
+    broker_client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    broker_client_params.not_after = date_time_ymd(2030, 6, 15);
+    broker_client_params
+        .distinguished_name
+        .push(DnType::CommonName, format!("{san}-broker-caller"));
+    let broker_client_leaf = broker_client_params
+        .signed_by(&broker_client_key, &ca)
+        .unwrap();
+
     vec![
         ("tls.pem".to_string(), format!("{}{}", leaf.pem(), ca.pem())),
         ("tls-key.pem".to_string(), key.serialize_pem()),
@@ -126,17 +155,17 @@ fn generation(san: &str) -> Generation {
         // THE BROKER'S OWN CA AND CLIENT LEAF (B-N3, ADR-0885) — DISTINCT
         // FILE NAMES from `ca.pem`/`client.pem`/`client-key.pem` above,
         // because ADR-0885's whole point is that the broker hop's identity
-        // has its OWN mount rather than sharing `iam-db`'s. Reusing the same
-        // authority and client leaf as a value is fine: this fixture tests
-        // the WATCH WIRING, not a second chain.
+        // has its OWN mount rather than sharing `iam-db`'s. Reusing the SAME
+        // AUTHORITY is fine (one issuer, every leaf in this estate); reusing
+        // the SAME client leaf is not — see `BROKER_CLIENT_NOT_AFTER`.
         ("nats-ca.pem".to_string(), ca.pem()),
         (
             "nats-client.pem".to_string(),
-            format!("{}{}", client_leaf.pem(), ca.pem()),
+            format!("{}{}", broker_client_leaf.pem(), ca.pem()),
         ),
         (
             "nats-client-key.pem".to_string(),
-            client_key.serialize_pem(),
+            broker_client_key.serialize_pem(),
         ),
     ]
 }
@@ -526,6 +555,11 @@ fn each_configured_material_contributes_on_its_own() {
 /// leaf being watched at all.
 #[test]
 fn the_brokers_own_client_leaf_is_watched_without_touching_iam_dbs_gauge() {
+    // THE PRECONDITION THIS WHOLE CASE RESTS ON: the two leaves' expiries
+    // must actually differ, or an implementation that overwrote iam-db's
+    // with the broker's would pass this case by accident.
+    assert_ne!(BROKER_CLIENT_NOT_AFTER, CLIENT_NOT_AFTER);
+
     let mount = Mount::new(&generation("iam"));
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 

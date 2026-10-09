@@ -799,13 +799,21 @@ spec:
                 path: client-key.pem
         {{- end }}
         {{- if .Values.nats.tls.enabled }}
-        # THE BROKER'S OWN CA (B-N3, ADR-0852). NOT `optional: true`: the
-        # process MUST NOT START without a usable bundle once TLS is asked
-        # for, and `optional` is simply which error says so — the same
-        # reasoning `iam-db-ca` above gives.
         - name: nats-ca
           secret:
             secretName: {{ required "nats.tls.caSecret holds the CA bundle the broker is verified against and must be set whenever nats.tls.enabled is; see the chart's values.yaml" .Values.nats.tls.caSecret }}
+            # OPTIONAL, and here it means the OPPOSITE of what it means on
+            # the enrolment CA below — the same split `iam-db-ca` above
+            # draws. There it buys availability: the CA belongs to one
+            # administrative RPC, so a missing Secret must not stop the
+            # authentication plane. Here the process MUST NOT START without
+            # a usable bundle once TLS is asked for, and `optional` is
+            # simply which error says so. A required mount that cannot be
+            # satisfied leaves the pod in ContainerCreating with a
+            # FailedMount event about a volume; an optional one mounts an
+            # empty directory, the binary finds no file at NATS_TLS_CA_FILE,
+            # and it exits naming THAT PATH. Neither starts; only one of
+            # them explains itself.
             optional: true
             # ONE KEY, not the whole Secret: `nats-tls` is the BROKER's
             # serving Secret, issued for `server auth`, and holds no private
