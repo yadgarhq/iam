@@ -385,3 +385,97 @@ fn the_subjects_are_pinned_as_literals_because_three_parties_must_agree() {
     assert_eq!(subject::CREDENTIAL_REVOKED, "yadgar.iam.credential.revoked");
     assert_eq!(subject::TEAMS_CHANGED, "yadgar.iam.user.teams-changed");
 }
+
+/// A broker that refuses every dial and counts them, for the redial's waits.
+async fn counting_refuser() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds");
+    let url = format!("nats://{}", listener.local_addr().expect("its address"));
+    let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&dials);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = socket.write_all(b"INFO {\"auth_required\":true}\r\n").await;
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"-ERR 'Authorization Violation'\r\n")
+                    .await;
+                while let Ok(n) = socket.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, dials)
+}
+
+/// LEDGER 1420 REVIEW: a refused credential is dialled AGAIN, at the refused
+/// interval and never at the outage one. The platform broker reads this
+/// service's password from its own environment, so a rotation can leave the
+/// broker on the old password until it restarts; a terminal refusal would leave
+/// the pod publishing nothing after that.
+///
+/// Run through [`redial::until_connected`] with SCALED waits — the production
+/// ones are 5 s and 60 s, and CI does not wait a minute — so this proves the
+/// loop's shape; `tests/nats_auth.rs` proves the production outage rate is not
+/// used for a refusal.
+#[tokio::test]
+async fn a_refused_credential_is_redialled_at_the_refused_interval_not_the_outage_one() {
+    let (url, dials) = counting_refuser().await;
+    let waits = redial::Waits {
+        outage: std::time::Duration::from_millis(50),
+        refused: std::time::Duration::from_millis(600),
+    };
+    let task = tokio::spawn(redial::until_connected(
+        url,
+        None,
+        None,
+        std::sync::Arc::default(),
+        std::time::Duration::ZERO,
+        waits,
+    ));
+    let count = || dials.load(std::sync::atomic::Ordering::SeqCst);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(count(), 1, "a refusal was redialled at the outage interval");
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        count() >= 2,
+        "a refused credential was never dialled again, so a broker that later accepts it \
+         would never hear from this pod"
+    );
+    task.abort();
+}
+
+/// The same property through the BOOT path: a credential refused on the first
+/// dial is handed to the redial at the refused interval, not dropped.
+#[tokio::test]
+async fn a_credential_refused_at_boot_is_dialled_again_at_the_refused_interval() {
+    let (url, dials) = counting_refuser().await;
+    let waits = redial::Waits {
+        outage: std::time::Duration::from_millis(50),
+        refused: std::time::Duration::from_millis(600),
+    };
+    let inv = Invalidator::dial(Some(&url), None, None, waits).await;
+    assert!(!inv.is_publishing());
+    let count = || dials.load(std::sync::atomic::Ordering::SeqCst);
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        count(),
+        1,
+        "a boot refusal was redialled at the outage interval"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(
+        count() >= 2,
+        "a credential refused at boot was never dialled again"
+    );
+}

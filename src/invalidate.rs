@@ -98,7 +98,10 @@
 
 use crate::upstream;
 
+mod redial;
 pub mod transport;
+
+pub use redial::{REFUSED_RETRY, RETRY};
 
 /// Subjects, namespaced so a wildcard subscription is possible later.
 pub mod subject {
@@ -196,15 +199,23 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-/// A publisher, or nothing.
+/// A publisher, or nothing, or a publisher still waiting for its broker.
 ///
-/// `None` when no broker is configured, which is a legitimate state for a local
-/// run and NOT for a deployment — `main` warns loudly at boot rather than
-/// treating a missing broker as normal, because a gateway cache with no
-/// invalidation path is the failure D72 names.
+/// **THREE STATES, NOT TWO** (ledger 1420). No broker configured is a
+/// legitimate state for a local run and NOT for a deployment — `main` warns
+/// loudly at boot rather than treating a missing broker as normal, because a
+/// gateway cache with no invalidation path is the failure D72 names. A
+/// configured broker whose first dial failed is the third: [`redial`] fills
+/// `client` once a dial succeeds, and every clone sees it, because the slot is
+/// shared rather than copied — `Iam::new` holds a clone taken at boot.
 #[derive(Clone)]
 pub struct Invalidator {
-    client: Option<async_nats::Client>,
+    /// Set at most once: by the boot dial, or by the redial that follows a
+    /// failed one. After that `async-nats` reconnects underneath it.
+    client: std::sync::Arc<std::sync::OnceLock<async_nats::Client>>,
+    /// Whether a broker URL was configured at all, so a dropped publish says
+    /// which of the two absences it is.
+    configured: bool,
     /// Every publish this instance made, recorded so a test can assert that a
     /// code path publishes AT ALL.
     ///
@@ -260,11 +271,17 @@ fn connect_options(
 }
 
 impl Invalidator {
-    /// Connect, or return a publisher that does nothing.
+    /// Connect, or return a publisher that publishes once a redial connects, or
+    /// one that does nothing.
     ///
     /// A broker that cannot be reached at boot does not stop the service: `iam`
     /// still authenticates, and refusing to start would turn a broker outage into
-    /// an authentication outage. The cost is recorded in the log, not hidden.
+    /// an authentication outage (D69/ADR-0555). The cost is recorded in the log,
+    /// not hidden — and it ENDS: the outage arm hands the dial to [`redial`],
+    /// which retries every [`RETRY`] in the background and starts publishing
+    /// once one succeeds. Before ledger 1420 that arm returned a publisher that
+    /// published nothing for the life of the process, which is what PB-3 hit
+    /// when both pods booted during the broker's roll.
     ///
     /// `credentials` is what this service presents. `None` means the broker asks
     /// for none, and it is a real state rather than an omission — it is what
@@ -278,13 +295,21 @@ impl Invalidator {
     ///
     /// # A refused credential is not a broker outage, and the log says which
     ///
-    /// Both end in a publisher that publishes nothing, because the availability
+    /// Both boot into a publisher that publishes nothing yet, because the availability
     /// argument above applies to both: `iam` is the authentication plane and must
     /// not stop authenticating over the broker. They are told apart in the log,
     /// which is the only place the difference can be acted on. An outage ends by
     /// itself; a rejected password does not, and an operator who reads
     /// "cannot reach the broker" for a wrong password goes looking for a network
     /// fault that is not there.
+    ///
+    /// **A REFUSAL IS RETRIED TOO, AT [`REFUSED_RETRY`] RATHER THAN [`RETRY`]**,
+    /// as `gateway` does, because it can end with no change here: the platform
+    /// broker reads this password from its own env (`$NATS_PASSWORD`, Secret
+    /// `nats-auth`) and rolls on a CONFIG change only. A rotation restarts `iam`
+    /// on the new password while the broker holds the old one until it restarts.
+    /// The log line still says DEPLOYMENT ERROR. Why this is not
+    /// `retry_on_initial_connect` is in [`redial`].
     ///
     /// `tls` is the broker hop's transport (B-N3, ADR-0852): `None` dials in
     /// cleartext exactly as this did before; `Some` is
@@ -296,45 +321,35 @@ impl Invalidator {
         credentials: Option<Credentials>,
         tls: Option<upstream::UpstreamTls>,
     ) -> Self {
+        Self::dial(url, credentials, tls, redial::WAITS).await
+    }
+
+    /// [`Self::connect`] with the redial's waits named, so a unit test can scale them.
+    async fn dial(
+        url: Option<&str>,
+        credentials: Option<Credentials>,
+        tls: Option<upstream::UpstreamTls>,
+        waits: redial::Waits,
+    ) -> Self {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             tracing::warn!(
                 "no broker configured: cache invalidation will NOT be published, so a \
                  revoked credential may be honoured until its TTL expires (D72)"
             );
-            return Self::with(None);
+            return Self::with(false);
         };
         let options = connect_options(&credentials, &tls);
+        let this = Self::with(true);
         match options.connect(url).await {
             Ok(client) => {
-                tracing::info!(
-                    %url,
-                    // WHETHER, never WHAT. This log is shipped.
-                    authenticated = credentials.is_some(),
-                    tls = tls.is_some(),
-                    "publishing cache invalidation"
-                );
-                if credentials.is_none() {
-                    tracing::warn!(
-                        "the connection to the broker is UNAUTHENTICATED: no NATS_PASSWORD_FILE \
-                         is configured, so anything on the pod network can publish D72's \
-                         invalidation events, or drown them under a flood. Set an authorization \
-                         block on the broker and mount its Secret."
-                    );
-                }
-                Self::with(Some(client))
+                redial::connected(url, &credentials, &tls);
+                let _ = this.client.set(client);
             }
             // SEPARATED FROM THE OUTAGE ARM, and it is the whole reason this
             // match has two error arms. See the section on this method.
             Err(e) if e.kind() == async_nats::ConnectErrorKind::AuthorizationViolation => {
-                tracing::error!(
-                    %url, error = %e, tls = tls.is_some(),
-                    "the broker REFUSED this service's credential, so cache invalidation will \
-                     NOT be published and revocations will be honoured late. This is a \
-                     deployment error rather than an outage: it does not recover on its own. \
-                     Check NATS_USER and NATS_PASSWORD_FILE against the broker's authorization \
-                     block."
-                );
-                Self::with(None)
+                redial::refused(url, &e, &tls);
+                redial::spawn(url, credentials, tls, &this.client, waits.refused, waits);
             }
             // A REFUSED TLS HANDSHAKE ARRIVES HERE TOO: async-nats has no TLS
             // error kind of its own (gateway#105 measured the same thing), so
@@ -346,15 +361,19 @@ impl Invalidator {
                 tracing::error!(
                     %url, error = %e, tls = tls.is_some(),
                     "cannot reach the broker, or the TLS handshake with it failed: cache \
-                     invalidation will NOT be published until it recovers, and revocations \
-                     will be honoured late"
+                     invalidation is NOT published until a dial succeeds, and revocations are \
+                     honoured late until then. Retrying every {} seconds.",
+                    RETRY.as_secs()
                 );
-                Self::with(None)
+                redial::spawn(url, credentials, tls, &this.client, waits.outage, waits);
             }
         }
+        this
     }
 
-    /// Whether this instance holds a live connection to the broker.
+    /// Whether this instance has connected to the broker: at boot, or on a
+    /// redial since. It stays `true` across the reconnects `async-nats` makes
+    /// underneath an established client — those are reported by [`on_event`].
     ///
     /// **A test asserting that a credential was CONFIGURED would pass against a
     /// broker that ignored it.** This is what lets a test assert the outcome
@@ -364,12 +383,13 @@ impl Invalidator {
     /// property is proved from `tests/`, which compiles against the shipped
     /// crate.
     pub fn is_publishing(&self) -> bool {
-        self.client.is_some()
+        self.client.get().is_some()
     }
 
-    fn with(client: Option<async_nats::Client>) -> Self {
+    fn with(configured: bool) -> Self {
         Self {
-            client,
+            client: std::sync::Arc::default(),
+            configured,
             #[cfg(test)]
             published: std::sync::Arc::default(),
         }
@@ -392,8 +412,17 @@ impl Invalidator {
             .expect("the publish log")
             .push((subject, payload.clone()));
 
-        let Some(client) = &self.client else {
-            tracing::warn!(subject, %payload, "no broker: invalidation not published");
+        let Some(client) = self.client.get() else {
+            // TRUE ON BOTH BRANCHES, which the single line this replaces was not:
+            // a configured broker that has not answered yet is not "no broker".
+            if self.configured {
+                tracing::warn!(
+                    subject, %payload,
+                    "not connected to the broker yet: invalidation not published"
+                );
+            } else {
+                tracing::warn!(subject, %payload, "no broker: invalidation not published");
+            }
             return;
         };
         if let Err(e) = client.publish(subject, payload.clone().into()).await {

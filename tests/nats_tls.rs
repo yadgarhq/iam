@@ -147,9 +147,20 @@ impl Server {
     /// `dir/server.pem`, `dir/server-key.pem`, and VERIFIES clients against
     /// `dir/ca.pem` (`--tlsverify`, as B-N5 will run the platform broker).
     fn start(tls: Option<&Dir>) -> Self {
+        Self::start_at(tls, None)
+    }
+
+    /// `start`, on a host port the CALLER chose — so a client can be told the
+    /// address before anything listens on it (ledger 1420's late broker).
+    /// `None` lets docker pick, which is what every other case wants.
+    fn start_at(tls: Option<&Dir>, host_port: Option<u16>) -> Self {
         let name = unique("server");
+        let publish = match host_port {
+            Some(port) => format!("127.0.0.1:{port}:4222"),
+            None => "127.0.0.1::4222".to_string(),
+        };
         let mut command = Command::new("docker");
-        command.args(["run", "-d", "--name", &name, "-p", "127.0.0.1::4222"]);
+        command.args(["run", "-d", "--name", &name, "-p", &publish]);
         if let Some(dir) = tls {
             command.args(["-v", &format!("{}:/certs:ro", dir.0.display())]);
         }
@@ -362,4 +373,114 @@ async fn tls_on_against_a_cleartext_broker_is_refused_rather_than_downgraded() {
         !invalidator.is_publishing(),
         "NATS_TLS_ENABLED=1 must never dial a broker in cleartext"
     );
+}
+
+/// A port nothing listens on yet, for a broker started LATER (ledger 1420).
+///
+/// Bound and released: the client is told this address while it refuses
+/// connections, which is what a broker mid-roll looks like from `iam`.
+fn vacant_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port()
+}
+
+/// How long an invalidation may take to arrive once the late broker is up:
+/// one redial interval, plus a dial, plus a wide margin for a loaded runner.
+const RECOVERY: Duration = Duration::from_secs(30);
+
+/// LEDGER 1420, THE PB-3 INCIDENT AS A TEST: `iam` boots while the broker is
+/// down, the broker comes up, and an invalidation must then ARRIVE at a
+/// subscriber on that broker — the outcome, never `is_publishing()`.
+///
+/// **PUBLISHED THROUGH A CLONE TAKEN BEFORE THE BROKER EXISTED**, because
+/// that is what `Iam::new` holds: a recovery visible only to the instance
+/// that dialled would pass a test that published through it and deliver
+/// nothing in production.
+///
+/// **IT PUBLISHES UNTIL ONE ARRIVES**, because a publish made before the
+/// redial lands is dropped by design (the D72 TTL is its backstop). So the
+/// assertion is not "the first publish arrives" but "publishing resumes".
+async fn an_invalidation_arrives_once_a_late_broker_is_up(
+    url: String,
+    iam_tls: Option<upstream::UpstreamTls>,
+    start: impl FnOnce() -> Server,
+    subscriber: async_nats::ConnectOptions,
+) {
+    use tokio_stream::StreamExt;
+    use yadgar_iam::invalidate::subject::CREDENTIAL_REVOKED;
+
+    let invalidator = Invalidator::connect(Some(&url), None, iam_tls).await;
+    assert!(
+        !invalidator.is_publishing(),
+        "nothing listens on {url} yet, so the boot dial must have failed"
+    );
+    let held = invalidator.clone();
+
+    let server = start();
+    let client = subscriber
+        .connect(server.url())
+        .await
+        .expect("the test's own subscriber connects to the late broker");
+    let mut revoked = client
+        .subscribe(CREDENTIAL_REVOKED)
+        .await
+        .expect("subscribe");
+    client
+        .flush()
+        .await
+        .expect("the subscription reached the broker");
+
+    let deadline = Instant::now() + RECOVERY;
+    loop {
+        held.credential_revoked("yadgar:user:late").await;
+        if let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(250), revoked.next()).await
+        {
+            assert_eq!(&message.payload[..], b"yadgar:user:late");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "iam booted while the broker was down and published NOTHING to it within {RECOVERY:?} \
+             of the broker coming up — the PB-3 state, where a failed first dial left the \
+             process without a publisher until it was rolled"
+        );
+    }
+}
+
+#[tokio::test]
+async fn iam_publishes_to_a_broker_that_was_down_when_it_booted() {
+    let port = vacant_port();
+    an_invalidation_arrives_once_a_late_broker_is_up(
+        format!("nats://localhost:{port}"),
+        None,
+        || Server::start_at(None, Some(port)),
+        async_nats::ConnectOptions::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn iam_publishes_over_tls_to_a_broker_that_was_down_when_it_booted() {
+    // THE SAME RECOVERY THROUGH THE B-N3 HOP: the redial must rebuild the
+    // TLS options exactly as the boot dial did, or this broker (`--tlsverify`)
+    // refuses every redial and the case above alone would stay green.
+    let estate = estate();
+    let port = vacant_port();
+    let subscriber = async_nats::ConnectOptions::new()
+        .require_tls(true)
+        .add_root_certificates(estate.ca.clone())
+        .add_client_certificate(estate.client.clone(), estate.client_key.clone());
+    an_invalidation_arrives_once_a_late_broker_is_up(
+        format!("nats://localhost:{port}"),
+        Some(broker_tls(
+            &estate.ca,
+            Some((&estate.client, &estate.client_key)),
+        )),
+        || Server::start_at(Some(&estate.dir), Some(port)),
+        subscriber,
+    )
+    .await;
 }

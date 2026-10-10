@@ -45,9 +45,9 @@ const TLS_DOMAIN: &str = "NATS_TLS_DOMAIN";
 ///
 /// **CHECKED HERE, AT BOOT, because `async-nats` does not check these files
 /// until the dial.** It reads them inside every connection attempt, and its
-/// failures there are a connect error [`super::Invalidator::connect`]'s
-/// redial-free boot would simply report as "cannot reach the broker" for
-/// ever. Two of them are worse than a retry loop:
+/// failures there are a connect error [`super::Invalidator::connect`] and
+/// its redial would simply report as "cannot reach the broker" every retry,
+/// for ever. Two of them are worse than a retry loop:
 ///
 /// - **A CA file holding no certificate is ZERO trust anchors and NO
 ///   error** (`async-nats`'s `tls.rs`: an empty iterator is not an error).
