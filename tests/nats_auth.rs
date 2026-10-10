@@ -27,13 +27,15 @@
 //! What is NOT given up is the assertion that matters most here — the bytes.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use yadgar_iam::invalidate::{Credentials, Invalidator};
+use yadgar_iam::invalidate::{self, Credentials, Invalidator};
 
 /// Deliberately unlike anything the implementation could contain. A fixture equal
 /// to a constant in the code under test would pass for a build that sent its own
@@ -199,12 +201,100 @@ async fn a_wrong_password_is_refused_rather_than_silently_accepted() {
 async fn an_unreachable_broker_is_survivable_and_a_refused_one_is_too() {
     // THE AVAILABILITY PROPERTY, unchanged by any of the above: iam is the
     // authentication plane, and neither a broker outage nor a broker that
-    // refuses this service may stop it authenticating. Both end in a publisher
-    // that publishes nothing rather than in a process that will not run. They
+    // refuses this service may stop it authenticating. Both boot into a
+    // publisher that publishes nothing yet rather than into a process that will
+    // not run (the outage one recovers: see `tests/nats_tls.rs`). They
     // are told apart in the LOG, which is where an operator can act on the
     // difference.
     let inv = Invalidator::connect(Some("nats://127.0.0.1:1"), Some(credentials()), None).await;
     assert!(!inv.is_publishing());
     inv.credential_revoked("yadgar:user:z").await;
     inv.teams_changed("yadgar:user:z").await;
+}
+
+/// A broker that refuses EVERY connection and counts them (ledger 1420).
+///
+/// The count is the oracle for "a refused credential is terminal": the
+/// redial that recovers from an outage must not turn a wrong password into a
+/// process that dials the broker for ever. `is_publishing()` cannot tell the
+/// two apart — it is `false` in both.
+async fn refusing_broker(listener: TcpListener) -> Arc<AtomicUsize> {
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&dials);
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = socket.write_all(b"INFO {\"auth_required\":true}\r\n").await;
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"-ERR 'Authorization Violation'\r\n")
+                    .await;
+                // Held open, as `broker` holds it, so a disconnect is not what
+                // the client is reacting to.
+                while let Ok(n) = socket.read(&mut buf).await {
+                    if n == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    dials
+}
+
+/// Long enough for one redial to have happened if one were going to.
+fn past_one_redial() -> Duration {
+    invalidate::RETRY + Duration::from_secs(2)
+}
+
+#[tokio::test]
+async fn a_credential_refused_at_boot_is_never_dialled_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let addr = listener.local_addr().expect("its address");
+    let dials = refusing_broker(listener).await;
+
+    let inv = connect(addr, Some(credentials())).await;
+    assert!(!inv.is_publishing());
+    tokio::time::sleep(past_one_redial()).await;
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "a refused credential was dialled again: the redial that recovers from an outage \
+         treated a deployment error as one"
+    );
+}
+
+#[tokio::test]
+async fn a_broker_that_comes_up_refusing_ends_the_redial() {
+    // THE SECOND PATH TO THE SAME ARM: the boot dial meets an outage, the
+    // redial meets a refusal. The loop must stop there, as the boot does.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let inv = connect(addr, Some(credentials())).await;
+    assert!(!inv.is_publishing(), "nothing listens on {addr} yet");
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .expect("rebinds the vacant port");
+    let dials = refusing_broker(listener).await;
+    let deadline = tokio::time::Instant::now() + past_one_redial() * 2;
+    while dials.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "iam never dialled the broker that came up after it booted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(past_one_redial()).await;
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "the redial kept dialling a broker that refuses this credential"
+    );
+    assert!(!inv.is_publishing());
 }
