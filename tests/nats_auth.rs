@@ -214,10 +214,11 @@ async fn an_unreachable_broker_is_survivable_and_a_refused_one_is_too() {
 
 /// A broker that refuses EVERY connection and counts them (ledger 1420).
 ///
-/// The count is the oracle for "a refused credential is terminal": the
-/// redial that recovers from an outage must not turn a wrong password into a
-/// process that dials the broker for ever. `is_publishing()` cannot tell the
-/// two apart — it is `false` in both.
+/// The count is the oracle for "a refused credential is not dialled at the
+/// outage rate": it is dialled again only after `invalidate::REFUSED_RETRY`
+/// (60 s), which these tests do not wait for — `src/invalidate/tests.rs`
+/// proves the second dial with scaled waits. `is_publishing()` cannot tell the
+/// rates apart — it is `false` throughout.
 async fn refusing_broker(listener: TcpListener) -> Arc<AtomicUsize> {
     let dials = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&dials);
@@ -244,13 +245,14 @@ async fn refusing_broker(listener: TcpListener) -> Arc<AtomicUsize> {
     dials
 }
 
-/// Long enough for one redial to have happened if one were going to.
+/// Long enough for one OUTAGE-rate redial to have happened, and far short of
+/// `REFUSED_RETRY`.
 fn past_one_redial() -> Duration {
     invalidate::RETRY + Duration::from_secs(2)
 }
 
 #[tokio::test]
-async fn a_credential_refused_at_boot_is_never_dialled_again() {
+async fn a_credential_refused_at_boot_is_not_redialled_at_the_outage_rate() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
     let addr = listener.local_addr().expect("its address");
     let dials = refusing_broker(listener).await;
@@ -261,15 +263,15 @@ async fn a_credential_refused_at_boot_is_never_dialled_again() {
     assert_eq!(
         dials.load(Ordering::SeqCst),
         1,
-        "a refused credential was dialled again: the redial that recovers from an outage \
-         treated a deployment error as one"
+        "a refused credential was dialled again within the outage interval: the redial \
+         treated a deployment error as an outage"
     );
 }
 
 #[tokio::test]
-async fn a_broker_that_comes_up_refusing_ends_the_redial() {
+async fn a_broker_that_comes_up_refusing_slows_the_redial_to_the_refused_rate() {
     // THE SECOND PATH TO THE SAME ARM: the boot dial meets an outage, the
-    // redial meets a refusal. The loop must stop there, as the boot does.
+    // redial meets a refusal. The loop must slow to the refused rate there.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .expect("a free port")
@@ -294,7 +296,7 @@ async fn a_broker_that_comes_up_refusing_ends_the_redial() {
     assert_eq!(
         dials.load(Ordering::SeqCst),
         1,
-        "the redial kept dialling a broker that refuses this credential"
+        "the redial kept dialling a broker that refuses this credential at the outage rate"
     );
     assert!(!inv.is_publishing());
 }

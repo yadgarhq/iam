@@ -101,7 +101,7 @@ use crate::upstream;
 mod redial;
 pub mod transport;
 
-pub use redial::RETRY;
+pub use redial::{REFUSED_RETRY, RETRY};
 
 /// Subjects, namespaced so a wildcard subscription is possible later.
 pub mod subject {
@@ -303,17 +303,13 @@ impl Invalidator {
     /// "cannot reach the broker" for a wrong password goes looking for a network
     /// fault that is not there.
     ///
-    /// **THE REFUSED ARM IS TERMINAL, AND THAT IS WHY THIS DOES NOT USE
-    /// `retry_on_initial_connect`.** With it set, `async-nats` 0.50 returns a
-    /// client before any handshake (`lib.rs:1081`) and retries the first dial
-    /// inside `Connector::connect`, whose `other =>` arm swallows
-    /// `AuthorizationViolation` and loops for ever while `max_reconnects` is its
-    /// default `None` (`connector.rs:249-268`, `options.rs:103`). So the boot
-    /// could no longer tell a refusal from an outage, and a wrong password
-    /// would dial the broker for the life of the process. `gateway` retries a
-    /// refusal at a 60-second interval; this service does not, because the
-    /// rotation watch set in `crate::rotate` restarts it when the Secret it
-    /// would need changes.
+    /// **A REFUSAL IS RETRIED TOO, AT [`REFUSED_RETRY`] RATHER THAN [`RETRY`]**,
+    /// as `gateway` does, because it can end with no change here: the platform
+    /// broker reads this password from its own env (`$NATS_PASSWORD`, Secret
+    /// `nats-auth`) and rolls on a CONFIG change only. A rotation restarts `iam`
+    /// on the new password while the broker holds the old one until it restarts.
+    /// The log line still says DEPLOYMENT ERROR. Why this is not
+    /// `retry_on_initial_connect` is in [`redial`].
     ///
     /// `tls` is the broker hop's transport (B-N3, ADR-0852): `None` dials in
     /// cleartext exactly as this did before; `Some` is
@@ -324,6 +320,16 @@ impl Invalidator {
         url: Option<&str>,
         credentials: Option<Credentials>,
         tls: Option<upstream::UpstreamTls>,
+    ) -> Self {
+        Self::dial(url, credentials, tls, redial::WAITS).await
+    }
+
+    /// [`Self::connect`] with the redial's waits named, so a unit test can scale them.
+    async fn dial(
+        url: Option<&str>,
+        credentials: Option<Credentials>,
+        tls: Option<upstream::UpstreamTls>,
+        waits: redial::Waits,
     ) -> Self {
         let Some(url) = url.filter(|u| !u.is_empty()) else {
             tracing::warn!(
@@ -343,6 +349,7 @@ impl Invalidator {
             // match has two error arms. See the section on this method.
             Err(e) if e.kind() == async_nats::ConnectErrorKind::AuthorizationViolation => {
                 redial::refused(url, &e, &tls);
+                redial::spawn(url, credentials, tls, &this.client, waits.refused, waits);
             }
             // A REFUSED TLS HANDSHAKE ARRIVES HERE TOO: async-nats has no TLS
             // error kind of its own (gateway#105 measured the same thing), so
@@ -358,12 +365,7 @@ impl Invalidator {
                      honoured late until then. Retrying every {} seconds.",
                     RETRY.as_secs()
                 );
-                tokio::spawn(redial::until_connected(
-                    url.to_string(),
-                    credentials,
-                    tls,
-                    std::sync::Arc::clone(&this.client),
-                ));
+                redial::spawn(url, credentials, tls, &this.client, waits.outage, waits);
             }
         }
         this
