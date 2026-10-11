@@ -238,10 +238,13 @@ impl Booted {
 
     /// Wait for the boot to reach the line `serve_and_drain` logs once the
     /// signal handlers are armed and the server is spawned.
-    pub fn wait_until_listening(&mut self) {
+    /// Returns the line itself (ledger 1422): a caller checking what the boot
+    /// actually logged — `client_auth` among it — needs the bytes, not only
+    /// the fact that some line matched.
+    pub fn wait_until_listening(&mut self) -> String {
         self.wait_for_line("the \"iam listening\" line", BOOT_DEADLINE, |l| {
             l.contains("\"iam listening\"")
-        });
+        })
     }
 
     /// Send SIGTERM, the way kubelet ends a pod.

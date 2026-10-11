@@ -56,6 +56,13 @@ yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.17" }
 # The shared instrumentation seam (D67). Pinned by release tag, like every other
 # in-org crate — a branch is a moving target, a published tag is not.
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.17", features = ["grpc"] }
+# THE FACADE, A REAL DEPENDENCY NOW (ledger 1424). `yadgar-lifecycle` owned every
+# gauge this binary published until the invalidation-publishing one: `redial`
+# writes it from the library's own code, so the facade that call needs must be
+# in `[dependencies]` rather than only `[dev-dependencies]`'s test-only copy.
+# MUST resolve to one `metrics` — `[dev-dependencies]`'s pin below is the same
+# version for the same reason.
+metrics = "0.24"
 prost = "0.14"
 prost-types = "0.14"
 # `signal` for `serve::shutdown`; `sync` for the oneshot that carries the
@@ -158,14 +165,11 @@ tokio = { version = "1", features = [
 # the repository is a secret in the repository, and it expires on a date nobody
 # is watching.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
-# `with_local_recorder`, beside `metrics-util`'s `DebuggingRecorder`. The FACADE
-# only, and a dev-dependency now — the binary installs the exporter and
-# `yadgar-lifecycle` owns the gauge; what `tests/assembly.rs` asserts is the
-# `service` label a dashboard selects THIS service on.
-metrics = "0.24"
-# `DebuggingRecorder` + `with_local_recorder`: the only way to assert that the
-# metric NAME a dashboard queries, and the LABEL it carries, are what this crate
-# claims — a typo in either compiles, passes clippy, and produces a series
+# `metrics` ITSELF MOVED TO `[dependencies]` (ledger 1424): `redial` now writes
+# a gauge from library code, not only from a test's `with_local_recorder`. What
+# stays dev-only below is `metrics-util`'s `DebuggingRecorder`: the only way to
+# assert that the metric NAME a dashboard queries, and the LABEL it carries, are
+# what this crate claims — a typo in either compiles, passes clippy, and produces a series
 # nothing queries. MUST resolve against `metrics 0.24`: a metrics-util built on
 # another major links a SECOND facade, and then the snapshot is empty while every
 # assertion still passes vacuously. `yadgar-telemetry` pairs the same two

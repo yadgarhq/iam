@@ -267,7 +267,7 @@ fn connect_options(
         // the module comment: a refused PUBLISH leaves the connection
         // open, is answered asynchronously after `publish` has already
         // returned `Ok`, and is logged by `async-nats` itself at `debug!`.
-        .event_callback(|event| async move { on_event(event) })
+        .event_callback(|event| async move { redial::on_event(event) })
 }
 
 impl Invalidator {
@@ -387,6 +387,11 @@ impl Invalidator {
     }
 
     fn with(configured: bool) -> Self {
+        // BEFORE ANYTHING ELSE RETURNS, AND ON EVERY PATH THAT BUILDS ONE
+        // (ledger 1424). See [`redial::PUBLISHING`]: a gauge that appeared
+        // only once a dial succeeded would make a refused replica and an
+        // unscraped one the same observation.
+        metrics::gauge!(redial::PUBLISHING).set(0.0);
         Self {
             client: std::sync::Arc::default(),
             configured,
@@ -444,54 +449,6 @@ impl Invalidator {
     pub async fn teams_changed(&self, user_id: &str) {
         self.publish(subject::TEAMS_CHANGED, user_id.to_string())
             .await;
-    }
-}
-
-/// Everything the broker says about a connection after it is established.
-///
-/// **`async-nats` logs these at `debug!` and these pods run at `info`**, so
-/// without this function they do not exist. The one that matters is
-/// [`async_nats::Event::ServerError`]: a publish permission violation arrives
-/// there, leaves the connection open, and is otherwise indistinguishable from a
-/// service whose invalidations are all landing.
-fn on_event(event: async_nats::Event) {
-    match event {
-        async_nats::Event::ServerError(e) => {
-            let error = e.to_string();
-            // NAMED SUBJECTS ONLY. A `-ERR` about anything else is still worth an
-            // operator's attention and still logged at ERROR, but it is not a
-            // statement that THIS service's invalidations are being dropped, and
-            // a remedy naming the publish allow-list would send somebody to the
-            // wrong file.
-            if error.contains(subject::CREDENTIAL_REVOKED) || error.contains(subject::TEAMS_CHANGED)
-            {
-                tracing::error!(
-                    error,
-                    "the broker REFUSED this service's publish, so NO invalidation is \
-                     delivered and a revoked credential is honoured until its cache entry \
-                     expires (D72). The connection stays OPEN, `publish` returned Ok, and \
-                     nothing else reports this. It is a deployment error rather than an \
-                     outage: check the publish permissions for this account against {} and \
-                     {}.",
-                    subject::CREDENTIAL_REVOKED,
-                    subject::TEAMS_CHANGED
-                );
-            } else {
-                tracing::error!(error, "the broker reported an error on this connection");
-            }
-        }
-        // LOUD, because the window it opens is the one this module exists to
-        // close: nothing published while it is open is delivered, and no caller
-        // is told. `async-nats` reconnects underneath this, so the `Connected`
-        // below is the end of the window.
-        async_nats::Event::Disconnected => tracing::warn!(
-            "disconnected from the broker; no invalidation is being published until it reconnects"
-        ),
-        async_nats::Event::Connected => tracing::info!("connected to the broker"),
-        async_nats::Event::ClientError(e) => {
-            tracing::warn!(error = %e, "the broker connection reported a client error");
-        }
-        other => tracing::info!(event = %other, "broker event"),
     }
 }
 

@@ -28,8 +28,32 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use super::{connect_options, Credentials};
+use super::{connect_options, subject, Credentials};
 use crate::upstream;
+
+/// Whether this replica is CONNECTED to the broker right now: `1` or `0`
+/// (ledger 1424).
+///
+/// **TWIN OF `gateway`'s `yadgar_gateway_invalidation_consuming`** (ADR-0604):
+/// a gauge because connectedness is a state, not an event, and it is
+/// published as `0` before the first dial so absent never has to mean
+/// anything — the same argument that names CONSUMING.
+///
+/// **IT MEANS CONNECTED, NEVER DELIVERING, and that is the one place this
+/// series is NOT `gateway`'s twin.** `gateway`'s gauge only reads `1` once a
+/// SUBSCRIPTION is confirmed, because a forbidden one leaves the connection
+/// open and answers nothing — "connected" there would be a false positive.
+/// Publishing has no such confirmation to wait for: `Client::publish`
+/// resolves the moment the command is queued locally (see the module doc on
+/// `Invalidator::publish`'s `Err` arm), so there is no second state this
+/// gauge could report that `is_publishing()` does not already cover more
+/// cheaply. A publish permission the broker refuses leaves this gauge at
+/// `1` — the connection stays open — and [`on_event`]'s ERROR line is what
+/// reports THAT, not this gauge.
+///
+/// UNLABELLED, under D67's cardinality rule, for the reason CONSUMING gives:
+/// which failure this is sits in the ERROR line beside it.
+pub(super) const PUBLISHING: &str = "yadgar_iam_invalidation_publishing";
 
 /// How long a replica waits between dials while the broker is unreachable.
 ///
@@ -124,6 +148,9 @@ pub(super) fn connected(
     credentials: &Option<Credentials>,
     tls: &Option<upstream::UpstreamTls>,
 ) {
+    // See [`PUBLISHING`]: `1` on every success this function reports, the
+    // boot dial's and every redial's alike.
+    metrics::gauge!(PUBLISHING).set(1.0);
     tracing::info!(
         %url,
         // WHETHER, never WHAT. This log is shipped.
@@ -148,6 +175,9 @@ pub(super) fn refused(
     e: &async_nats::ConnectError,
     tls: &Option<upstream::UpstreamTls>,
 ) {
+    // See [`PUBLISHING`]: a refused credential never connects, at boot or on
+    // a redial, so this is `0` on both call sites.
+    metrics::gauge!(PUBLISHING).set(0.0);
     tracing::error!(
         %url, error = %e, tls = tls.is_some(),
         "the broker REFUSED this service's credential, so cache invalidation will \
@@ -159,3 +189,68 @@ pub(super) fn refused(
         REFUSED_RETRY.as_secs()
     );
 }
+
+/// Everything the broker says about a connection after it is established.
+///
+/// **`async-nats` logs these at `debug!` and these pods run at `info`**, so
+/// without this function they do not exist. The one that matters is
+/// [`async_nats::Event::ServerError`]: a publish permission violation arrives
+/// there, leaves the connection open, and is otherwise indistinguishable from a
+/// service whose invalidations are all landing.
+///
+/// Moved here from `invalidate.rs` with the gauge it now also carries
+/// (ledger 1424): this module already owns every OTHER report of the
+/// connection's live state, and the 500-line file ceiling (ADR-0635/ADR-0577)
+/// had no room left beside them.
+pub(super) fn on_event(event: async_nats::Event) {
+    match event {
+        async_nats::Event::ServerError(e) => {
+            let error = e.to_string();
+            // NAMED SUBJECTS ONLY. A `-ERR` about anything else is still worth an
+            // operator's attention and still logged at ERROR, but it is not a
+            // statement that THIS service's invalidations are being dropped, and
+            // a remedy naming the publish allow-list would send somebody to the
+            // wrong file.
+            if error.contains(subject::CREDENTIAL_REVOKED) || error.contains(subject::TEAMS_CHANGED)
+            {
+                tracing::error!(
+                    error,
+                    "the broker REFUSED this service's publish, so NO invalidation is \
+                     delivered and a revoked credential is honoured until its cache entry \
+                     expires (D72). The connection stays OPEN, `publish` returned Ok, and \
+                     nothing else reports this. It is a deployment error rather than an \
+                     outage: check the publish permissions for this account against {} and \
+                     {}.",
+                    subject::CREDENTIAL_REVOKED,
+                    subject::TEAMS_CHANGED
+                );
+            } else {
+                tracing::error!(error, "the broker reported an error on this connection");
+            }
+        }
+        // LOUD, because the window it opens is the one this module exists to
+        // close: nothing published while it is open is delivered, and no caller
+        // is told. `async-nats` reconnects underneath this, so the `Connected`
+        // below is the end of the window — and the only report of that end,
+        // since `async-nats` owns reconnecting without calling back through
+        // `redial::connected` (ledger 1424: see [`PUBLISHING`]).
+        async_nats::Event::Disconnected => {
+            metrics::gauge!(PUBLISHING).set(0.0);
+            tracing::warn!(
+                "disconnected from the broker; no invalidation is being published until it \
+                 reconnects"
+            );
+        }
+        async_nats::Event::Connected => {
+            metrics::gauge!(PUBLISHING).set(1.0);
+            tracing::info!("connected to the broker");
+        }
+        async_nats::Event::ClientError(e) => {
+            tracing::warn!(error = %e, "the broker connection reported a client error");
+        }
+        other => tracing::info!(event = %other, "broker event"),
+    }
+}
+
+#[cfg(test)]
+mod tests;
