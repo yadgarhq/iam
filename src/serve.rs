@@ -56,7 +56,7 @@
 
 use tonic::transport::Server;
 
-pub use yadgar_lifecycle::serve_tls::{ServeTlsError, ServerTls, LISTEN};
+pub use yadgar_lifecycle::serve_tls::{ClientAuth, ServeTlsError, ServerTls, LISTEN};
 
 /// The values block this listener's keys render from: `tls.enabled`,
 /// `tls.clientAuth` and the rest. Every refusal names `<CHART_KEY>.<leaf>`, so

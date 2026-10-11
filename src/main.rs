@@ -274,12 +274,14 @@ async fn serve_and_drain(
     let signals = shutdown().map_err(|e| {
         format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
     })?;
-    // `tls` is recorded because "is this listener encrypted?" must be answerable
-    // from the boot log rather than inferred from which variables somebody
-    // believes they set.
+    // `tls` and `client_auth` (ADR-0854, ledger 1422): the posture must be
+    // answerable from the boot log, not inferred from which variables
+    // somebody believes they set. Cleartext's mode is always `off`, so the
+    // `map_or` fallback below is never a guess.
     tracing::info!(
         %addr,
         tls = listen_tls.is_some(),
+        client_auth = %listen_tls.map_or(serve::ClientAuth::Off, |t| t.client_auth()),
         watching = watch_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
