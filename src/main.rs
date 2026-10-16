@@ -150,6 +150,61 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     boot::metrics()?;
 
+    let (watch_inputs, invalidator, enrolment) =
+        broker_and_watch(listen_tls.as_ref(), db_tls.as_ref(), &config).await?;
+
+    let floors = boot::response_floors()?;
+
+    let addr: SocketAddr = boot::env_required("LISTEN")?
+        .parse()
+        .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
+
+    // THE CHECK RUNS AFTER BOOT, and the channel it uses is the SAME lazy one
+    // every RPC uses — a clone, not a second dial.
+    //
+    // INGREDIENTS AND NOT A FUTURE, deliberately. A `key_check` future built
+    // here could be dropped and replaced with `std::future::pending()` at the
+    // call site below: that compiles, passes the suite and passes clippy, and
+    // nothing in this file is reachable from a test. `key_identity::Check` has
+    // no such mutation, because the future is built inside the library where
+    // `until_stopped_with`'s own test reddens.
+    let key_check = key_identity::Check::new(db.clone(), identity, key_identity::Retry::standard());
+
+    serve_and_drain(
+        server,
+        addr,
+        Iam::new(keys, db, invalidator, floors, enrolment),
+        listen_tls.as_ref(),
+        watch_inputs,
+        schedule,
+        key_check,
+    )
+    .await
+}
+
+/// The broker hop and the watch set, in the order `run` always built them:
+/// the broker credential, its transport, the enrolment settings, the watch set
+/// assembled from all of it, the exporter-backed gauge, and last the connection
+/// to the broker.
+///
+/// SPLIT OUT OF [`run`] (ledger 1498) to keep that function under ADR-0635's
+/// 120-line ceiling. It is a straight lift of that block: no read, no error and
+/// no ordering moved, and the one `await` is the `Invalidator::connect` that
+/// was already the last thing the block did. `enrolment` is handed back because
+/// `Iam::new` takes it after the watch set has borrowed it. The caller must have
+/// run `boot::metrics()` first: the gauge exported here needs the recorder.
+async fn broker_and_watch(
+    listen_tls: Option<&serve::ServerTls>,
+    db_tls: Option<&yadgar_iam::upstream::UpstreamTls>,
+    config: &rotate::Configuration,
+) -> Result<
+    (
+        rotate::Inputs,
+        yadgar_iam::invalidate::Invalidator,
+        Option<yadgar_iam::service::EnrolmentConfig>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     // THE CREDENTIAL IS READ BEFORE THE CONNECTION IS ATTEMPTED, and its absence
     // is the one thing here that DOES gate startup. The distinction is the same
     // one D69 draws everywhere else: an unreachable broker is an outage of one
@@ -193,12 +248,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // two cannot share that impl. ONE CALL, AND THE SAME ONE A TEST MAKES: deleting a
     // member from `rotate::watch_set`'s list turns `tests/assembly.rs` red.
     let watch_inputs = rotate::watch_set(
-        listen_tls.as_ref(),
-        db_tls.as_ref(),
+        listen_tls,
+        db_tls,
         nats_credentials.as_ref(),
         nats_tls.as_ref(),
         enrolment.as_ref(),
-        &config,
+        config,
     );
 
     // AFTER THE EXPORTER, NEVER BEFORE IT: a value recorded while there is no
@@ -213,34 +268,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         nats_tls,
     )
     .await;
-
-    let floors = boot::response_floors()?;
-
-    let addr: SocketAddr = boot::env_required("LISTEN")?
-        .parse()
-        .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
-
-    // THE CHECK RUNS AFTER BOOT, and the channel it uses is the SAME lazy one
-    // every RPC uses — a clone, not a second dial.
-    //
-    // INGREDIENTS AND NOT A FUTURE, deliberately. A `key_check` future built
-    // here could be dropped and replaced with `std::future::pending()` at the
-    // call site below: that compiles, passes the suite and passes clippy, and
-    // nothing in this file is reachable from a test. `key_identity::Check` has
-    // no such mutation, because the future is built inside the library where
-    // `until_stopped_with`'s own test reddens.
-    let key_check = key_identity::Check::new(db.clone(), identity, key_identity::Retry::standard());
-
-    serve_and_drain(
-        server,
-        addr,
-        Iam::new(keys, db, invalidator, floors, enrolment),
-        listen_tls.as_ref(),
-        watch_inputs,
-        schedule,
-        key_check,
-    )
-    .await
+    Ok((watch_inputs, invalidator, enrolment))
 }
 
 /// Serve until a signal, a rotation or the key-identity check ends it, then
