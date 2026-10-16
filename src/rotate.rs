@@ -173,6 +173,39 @@ impl Material for EnrolmentConfig {
     }
 }
 
+/// The broker hop's OWN transport (B-N3, ADR-0885): its CA, the client
+/// certificate this service presents to the broker, and that certificate's key.
+///
+/// **A NEWTYPE, because the type underneath is `iam-db`'s too.** `nats_tls` is
+/// an [`UpstreamTls`] like `upstream`, and that type's own [`Material`] impl
+/// folds its client leaf as the PRIMARY `Presented::Client` leaf. Folding the
+/// broker's through the same impl would replace `iam-db`'s, so this one names
+/// its leaf `"broker"` with `File::named_certificate` (`yadgar-lifecycle`
+/// v0.2.21, ledger 1417) and both are kept: each is watched, and each exports
+/// its own `CERTIFICATE_NOT_AFTER` series, the broker's carrying
+/// `name="broker"`.
+///
+/// The client pair is `Some`/`Some` or `None`/`None`, for the reason
+/// `UpstreamTls`'s own impl gives.
+struct Broker<'a>(&'a UpstreamTls);
+
+impl Material for Broker<'_> {
+    fn files(&self) -> Vec<File<'_>> {
+        let mut files = vec![File::read(self.0.ca_file())];
+        if let (Some(certificate), Some(key)) =
+            (self.0.client_certificate_file(), self.0.client_key_file())
+        {
+            files.push(File::named_certificate(
+                Presented::Client,
+                "broker",
+                certificate,
+            ));
+            files.push(File::read(key));
+        }
+        files
+    }
+}
+
 /// Everything this deployment read at boot, hashed as it was read.
 ///
 /// **THE LIST IS THE ASSERTION, and this service's list is the longest in the
@@ -181,27 +214,15 @@ impl Material for EnrolmentConfig {
 /// argument needs a branch at the call site — which is what let the four
 /// per-role builder methods this module used to carry collapse into one trait.
 ///
-/// **`nats_tls` IS NOT FOLDED THROUGH [`UpstreamTls`]'s OWN `Material` IMPL,
-/// AND THAT IS DELIBERATE (B-N3, ADR-0885).** `yadgar_lifecycle::rotate::Inputs`
-/// keeps exactly ONE `Leaf` per [`Presented`] kind (`certificate` overwrites
-/// whatever the kind already held, keyed on the kind alone, never on the
-/// path) — true of `upstream`'s own client leaf already, harmless there
-/// because nothing else in this service presents one. ADR-0885 gives the
-/// broker hop its OWN client certificate, independent of `iamDb.tls`'s, so a
-/// deployment presenting both would have TWO `Presented::Client` leaves —
-/// and folding the second one through the same impl would silently
-/// overwrite the first in `CERTIFICATE_NOT_AFTER{kind="client"}`'s gauge,
-/// reporting only whichever leaf this function happened to fold last.
-///
-/// **ROTATION SAFETY IS NOT WHAT THIS COSTS.** `Inputs::also` de-duplicates
-/// and hashes by PATH, not by kind, so the broker's CA, its client
-/// certificate and its key are watched and exit-on-change exactly as every
-/// other file here does — an expired or rotated broker leaf still restarts
-/// this pod (ADR-0516). What is lost is ONLY the expiry GAUGE for this one
-/// leaf; see the PR that added this comment for the measurement and the
-/// follow-up this gap was filed as (a per-path, not per-kind, gauge in
-/// `yadgar-lifecycle` — out of this repository's reach while that crate is
-/// pinned by tag).
+/// **`nats_tls` IS FOLDED AS A [`Broker`], NOT THROUGH [`UpstreamTls`]'s OWN
+/// `Material` IMPL (B-N3, ADR-0885, ledger 1439).** ADR-0885 gives the broker
+/// hop its OWN client certificate, independent of `iamDb.tls`'s, so a
+/// deployment presenting both holds TWO `Presented::Client` leaves. The
+/// unnamed one stays `iam-db`'s, exactly as before; the broker's is named
+/// `"broker"`, so `CERTIFICATE_NOT_AFTER` carries a series for each and
+/// neither replaces the other. Until `yadgar-lifecycle` v0.2.21 the crate kept
+/// one leaf per kind, so the broker's files were watched by path only and its
+/// leaf had no expiry gauge at all.
 ///
 /// **THE MOUNTED CONFIGURATION DOCUMENT IS THE LAST MEMBER, AND THE ONLY ONE
 /// THAT IS NEVER ABSENT (step 2a).** `config` is `shared/shared.yaml`, mounted
@@ -240,25 +261,14 @@ pub fn watch_set(
     enrolment: Option<&EnrolmentConfig>,
     config: &Configuration,
 ) -> Inputs {
-    // THE SAME FOLD `Inputs::of` PERFORMS, split around the one member that
-    // is not a plain `Material` call: `nats_tls`'s files are watched by
-    // `also` (see this function's own doc), positioned here, between
-    // `broker` and `enrolment`, so a deployment's watched-files list reads
-    // in the same order its arguments do — `config` stays genuinely LAST.
-    let inputs = Inputs::new(SERVICE)
+    // THE SAME FOLD `Inputs::of` PERFORMS, one `take` per argument in
+    // argument order, so a deployment's watched-files list reads in the same
+    // order its arguments do — `config` stays genuinely LAST.
+    Inputs::new(SERVICE)
         .take(&listener)
         .take(&upstream)
-        .take(&broker);
-    let inputs = match nats_tls {
-        None => inputs,
-        Some(tls) => {
-            let inputs = inputs.also(tls.ca_file());
-            match (tls.client_certificate_file(), tls.client_key_file()) {
-                (Some(certificate), Some(key)) => inputs.also(certificate).also(key),
-                // `UpstreamTls` holds both or neither, so this arm is "neither".
-                _ => inputs,
-            }
-        }
-    };
-    inputs.take(&enrolment).take(config)
+        .take(&broker)
+        .take(&nats_tls.map(Broker))
+        .take(&enrolment)
+        .take(config)
 }

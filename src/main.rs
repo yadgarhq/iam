@@ -187,10 +187,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // SIX MATERIALS, THREE OF WHICH ARE NOT TRANSPORT (the broker password
     // and the enrolment CA, token payload; the mounted configuration
     // document, the only one never absent). THE BROKER'S OWN CLIENT LEAF
-    // (B-N3, ADR-0885) IS THE SIXTH, watched BY PATH rather than through
-    // `UpstreamTls`'s own `Material` impl — see `rotate::watch_set`'s own
-    // doc for why a second `Presented::Client` leaf cannot share that impl
-    // with `iam-db`'s. ONE CALL, AND THE SAME ONE A TEST MAKES: deleting a
+    // (B-N3, ADR-0885) IS THE SIXTH, folded as a NAMED `Presented::Client`
+    // leaf beside `iam-db`'s unnamed one rather than through `UpstreamTls`'s
+    // own `Material` impl — see `rotate::watch_set`'s own doc for why the
+    // two cannot share that impl. ONE CALL, AND THE SAME ONE A TEST MAKES: deleting a
     // member from `rotate::watch_set`'s list turns `tests/assembly.rs` red.
     let watch_inputs = rotate::watch_set(
         listen_tls.as_ref(),
@@ -258,7 +258,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// deleted, and a future built here could be dropped, and the whole suite would
 /// still pass either way.
 async fn serve_and_drain(
-    mut server: Server,
+    server: Server,
     addr: SocketAddr,
     iam: Iam,
     listen_tls: Option<&serve::ServerTls>,
@@ -274,40 +274,9 @@ async fn serve_and_drain(
     let signals = shutdown().map_err(|e| {
         format!("the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one")
     })?;
-    // `tls` and `client_auth` (ADR-0854, ledger 1422): the posture must be
-    // answerable from the boot log, not inferred from which variables
-    // somebody believes they set. Cleartext's mode is always `off`, so the
-    // `map_or` fallback below is never a guess.
-    tracing::info!(
-        %addr,
-        tls = listen_tls.is_some(),
-        client_auth = %listen_tls.map_or(serve::ClientAuth::Off, |t| t.client_auth()),
-        watching = watch_inputs.watched().len(),
-        rotation_poll_secs = schedule.poll().as_secs(),
-        rotation_splay_max_secs = schedule.splay_max().as_secs(),
-        drain_budget_secs = DRAIN_BUDGET.as_secs(),
-        "iam listening"
-    );
+    announce(addr, listen_tls, &watch_inputs, &schedule);
 
-    // THE SERVER IS SPAWNED WITH A ONESHOT AS ITS SHUTDOWN FUTURE, and the wait
-    // happens OUTSIDE it. `drain_within` starts the budget's clock when
-    // shutdown is REQUESTED; a `timeout` wrapped round the serving future itself
-    // would fix its deadline at boot and end the process 25 seconds later on
-    // every boot, having asked nothing to stop. That defect shipped on this
-    // branch, and `yadgar-lifecycle`'s own `tests/drain.rs` is what keeps it
-    // dead.
-    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
-    let serving = tokio::spawn(
-        server
-            .add_service(IamServiceServer::new(iam))
-            // ONE DRAIN PATH, TWO REASONS TO TAKE IT. `serve_with_shutdown` stops
-            // accepting and lets in-flight calls finish, so the rotation exit
-            // gets the same drain a signal does rather than a second mechanism
-            // beside it.
-            .serve_with_shutdown(addr, async {
-                let _ = stop_requested.await;
-            }),
-    );
+    let (serving, ask_to_stop) = spawn_serving(server, addr, iam);
 
     // WHAT ENDS THE SERVE, and nothing else does. THREE ARMS NOW, and only one
     // of them makes the exit non-zero — which is why the select lives in the
@@ -328,7 +297,107 @@ async fn serve_and_drain(
         );
     };
 
-    let overran = match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
+    let overran = drain_overran(
+        drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await,
+        addr,
+    )?;
+
+    // AFTER THE DRAIN AND OUTSIDE [`drain_overran`]'S MATCH, deliberately. A key-identity
+    // refusal whose drain also overran must still exit non-zero: putting this
+    // inside that `Finished` arm is the one-line mutation that silently returns 0
+    // on exactly the pod that most needs to stop. `stop` has completed by the
+    // time `drain_within` returns, so the verdict is always there; a lost
+    // channel is an ordinary stop rather than an invented refusal.
+    //
+    // `.to_string()` for the reason `boot` gives five times over: it dates
+    // from when `main` returned `Result` and Rust printed a bare `?` here with
+    // Debug. `main` prints Display now (ledger 1258), so this stays as the
+    // paragraph an operator has to act on.
+    ended_rx
+        .await
+        .unwrap_or(key_identity::Ended::Ordinary)
+        .into_exit(overran)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Say, once, what this process is listening with and what it is watching.
+///
+/// SPLIT OUT OF [`serve_and_drain`] (ledger 1439) to keep that function under
+/// ADR-0635's 120-line ceiling; it is a log line and nothing else, so it moves
+/// no ordering. It is called after the signal handlers are armed and before
+/// the server is spawned, exactly where the block it replaced sat.
+fn announce(
+    addr: SocketAddr,
+    listen_tls: Option<&serve::ServerTls>,
+    watch_inputs: &rotate::Inputs,
+    schedule: &rotate::Schedule,
+) {
+    // `tls` and `client_auth` (ADR-0854, ledger 1422): the posture must be
+    // answerable from the boot log, not inferred from which variables
+    // somebody believes they set. Cleartext's mode is always `off`, so the
+    // `map_or` fallback below is never a guess.
+    tracing::info!(
+        %addr,
+        tls = listen_tls.is_some(),
+        client_auth = %listen_tls.map_or(serve::ClientAuth::Off, |t| t.client_auth()),
+        watching = watch_inputs.watched().len(),
+        rotation_poll_secs = schedule.poll().as_secs(),
+        rotation_splay_max_secs = schedule.splay_max().as_secs(),
+        drain_budget_secs = DRAIN_BUDGET.as_secs(),
+        "iam listening"
+    );
+}
+
+/// Spawn the gRPC server with a oneshot as its shutdown future, and hand back
+/// the task and the sender that asks it to stop.
+///
+/// SPLIT OUT OF [`serve_and_drain`] (ledger 1439). The caller must already
+/// have armed `shutdown()` before calling this: that ordering stays in
+/// `serve_and_drain`, where its comment explains it.
+fn spawn_serving(
+    mut server: Server,
+    addr: SocketAddr,
+    iam: Iam,
+) -> (
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    // THE SERVER IS SPAWNED WITH A ONESHOT AS ITS SHUTDOWN FUTURE, and the wait
+    // happens OUTSIDE it. `drain_within` starts the budget's clock when
+    // shutdown is REQUESTED; a `timeout` wrapped round the serving future itself
+    // would fix its deadline at boot and end the process 25 seconds later on
+    // every boot, having asked nothing to stop. That defect shipped on this
+    // branch, and `yadgar-lifecycle`'s own `tests/drain.rs` is what keeps it
+    // dead.
+    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(
+        server
+            .add_service(IamServiceServer::new(iam))
+            // ONE DRAIN PATH, TWO REASONS TO TAKE IT. `serve_with_shutdown` stops
+            // accepting and lets in-flight calls finish, so the rotation exit
+            // gets the same drain a signal does rather than a second mechanism
+            // beside it.
+            .serve_with_shutdown(addr, async {
+                let _ = stop_requested.await;
+            }),
+    );
+    (serving, ask_to_stop)
+}
+
+/// Turn the drain's outcome into whether it overran, refusing on a serving
+/// task that ended with an error.
+///
+/// SPLIT OUT OF [`serve_and_drain`] (ledger 1439). It decides ONLY the drain's
+/// half of the exit: the key-identity verdict is applied by the caller AFTER
+/// this returns, never inside the `Finished` arm here — see the caller's
+/// comment for why that placement is the point.
+fn drain_overran(
+    drain: Drain<Result<(), tonic::transport::Error>>,
+    addr: SocketAddr,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(match drain {
         Drain::Finished(result) => {
             // `refusal` rather than a bare `?` (ledger 733, ledger 740): a
             // `tonic::transport::Error` — what the serving task returns when
@@ -356,24 +425,5 @@ async fn serve_and_drain(
             );
             true
         }
-    };
-
-    // AFTER THE DRAIN AND OUTSIDE THE MATCH ABOVE, deliberately. A key-identity
-    // refusal whose drain also overran must still exit non-zero: putting this
-    // inside the `Finished` arm is the one-line mutation that silently returns 0
-    // on exactly the pod that most needs to stop. `stop` has completed by the
-    // time `drain_within` returns, so the verdict is always there; a lost
-    // channel is an ordinary stop rather than an invented refusal.
-    //
-    // `.to_string()` for the reason `boot` gives five times over: it dates
-    // from when `main` returned `Result` and Rust printed a bare `?` here with
-    // Debug. `main` prints Display now (ledger 1258), so this stays as the
-    // paragraph an operator has to act on.
-    ended_rx
-        .await
-        .unwrap_or(key_identity::Ended::Ordinary)
-        .into_exit(overran)
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    })
 }
