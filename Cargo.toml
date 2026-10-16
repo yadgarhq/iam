@@ -44,8 +44,12 @@ tonic-prost = "0.14"
 # `rustls-pki-types` dependency it decoded PEM with, are deleted rather than
 # kept beside it.
 #
+# v0.2.21 (ledger 1439) for `File::named_certificate`: the broker hop's client
+# leaf is kept beside `iam-db`'s rather than replacing it, so each exports its
+# own expiry series (see `rotate::watch_set`).
+#
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.20", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.21", features = [
   "serve-tls",
 ] }
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a

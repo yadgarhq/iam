@@ -62,11 +62,11 @@ const CLIENT_NOT_AFTER: i64 = 1_844_640_000; // 2028-06-15T00:00:00Z
 /// The BROKER's OWN client leaf's expiry (B-N3, ADR-0885) — A THIRD,
 /// DISTINCT DATE, two years past `CLIENT_NOT_AFTER`'s. A leaf that merely
 /// reused `client_leaf`'s bytes under a second file name would make
-/// `the_brokers_own_client_leaf_is_watched_without_touching_iam_dbs_gauge`
-/// vacuous: folding it through the SAME `Presented::Client` slot
+/// `the_brokers_own_client_leaf_has_its_own_named_gauge_beside_iam_dbs`
+/// vacuous: folding it into the SAME unnamed `Presented::Client` slot
 /// `rotate::watch_set` deliberately avoids would overwrite with an
 /// identical value, and the case would pass whether or not that avoidance
-/// held. A distinct expiry is what makes "the gauge still reports iam-db's"
+/// held. A distinct expiry is what makes "the unnamed client series is still iam-db's"
 /// a claim a mutation can falsify.
 const BROKER_CLIENT_NOT_AFTER: i64 = 1_907_712_000; // 2030-06-15T00:00:00Z
 
@@ -517,7 +517,7 @@ fn each_configured_material_contributes_on_its_own() {
     );
 
     // THE BROKER'S OWN TRANSPORT (B-N3, ADR-0885): its CA and its client pair
-    // are watched by PATH, on their own, independent of `iam-db`'s.
+    // are watched at their OWN paths, independent of `iam-db`'s.
     assert_eq!(
         rotate::watch_set(
             None,
@@ -541,20 +541,24 @@ fn each_configured_material_contributes_on_its_own() {
 
 /// ADR-0885's WHOLE POINT, PROVED: the broker's client leaf is watched at
 /// its OWN path alongside `iam-db`'s, and the two neither collide nor
-/// silently replace each other in the watched-files list.
+/// silently replace each other — in the watched-files list OR in the gauge.
 ///
-/// **THE GAUGE IS THE OTHER HALF, AND IT DOES NOT DOUBLE.** `rotate.rs`'s
-/// own doc explains why: `yadgar_lifecycle::rotate::Inputs` keeps one
-/// `Leaf` per `Presented` kind, so a second `Presented::Client` leaf would
-/// overwrite `iam-db`'s in `CERTIFICATE_NOT_AFTER{kind="client"}` — this is
-/// why the broker's leaf is watched by `Inputs::also` rather than folded
-/// through `UpstreamTls`'s `Material` impl. This case asserts the
-/// consequence directly: with BOTH client leaves configured, the gauge
-/// still emits exactly two series — one `serving`, one `client` — and the
-/// `client` one is still `iam-db`'s own expiry, unperturbed by the broker's
-/// leaf being watched at all.
+/// **THE BROKER LEAF HAS ITS OWN EXPIRY SERIES NOW (ledger 1439).**
+/// `rotate::watch_set` folds it through `File::named_certificate` with the
+/// name `"broker"` (`yadgar-lifecycle` v0.2.21, ledger 1417), so
+/// `CERTIFICATE_NOT_AFTER` carries a THIRD label set,
+/// `{service="iam", kind="client", name="broker"}`, beside `iam-db`'s
+/// unnamed `{service="iam", kind="client"}`. Before that the broker leaf was
+/// watched by path only and had NO expiry gauge at all.
+///
+/// **EACH SERIES IS LOOKED UP BY ITS LABELS, NEVER BY POSITION**, and each
+/// assertion kills a distinct mutant. Fold the broker leaf as a plain
+/// `File::read` (the state before this change) and the named series is
+/// ABSENT. Fold it as an unnamed `File::certificate` and it overwrites
+/// `iam-db`'s, so the unnamed series reads `BROKER_CLIENT_NOT_AFTER` and
+/// the named one is absent. The count pins that nothing else appears.
 #[test]
-fn the_brokers_own_client_leaf_is_watched_without_touching_iam_dbs_gauge() {
+fn the_brokers_own_client_leaf_has_its_own_named_gauge_beside_iam_dbs() {
     // THE PRECONDITION THIS WHOLE CASE RESTS ON: the two leaves' expiries
     // must actually differ, or an implementation that overwrote iam-db's
     // with the broker's would pass this case by accident.
@@ -583,47 +587,55 @@ fn the_brokers_own_client_leaf_is_watched_without_touching_iam_dbs_gauge() {
 
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
-    metrics::with_local_recorder(&recorder, || {
-        rotate::watch_set(
-            None,
-            Some(&upstream_tls(&mount)),
-            None,
-            Some(&nats_tls_fixture(&mount)),
-            None,
-            &config,
-        )
-        .export_not_after()
-    });
-    let emitted = snapshotter.snapshot().into_vec();
-    assert_eq!(
-        emitted.len(),
-        1,
-        "with no listener configured, exactly one gauge — iam-db's client leaf — must \
-         be published; a second series here would mean the broker's leaf gained its own \
-         gauge, which this repository has no `kind` label for: {emitted:?}"
-    );
-    let (composite, _unit, _description, value) = &emitted[0];
-    let labels: Vec<(String, String)> = composite
-        .key()
-        .labels()
-        .map(|l| (l.key().to_string(), l.value().to_string()))
+    metrics::with_local_recorder(&recorder, || inputs.export_not_after());
+
+    let series: Vec<(Vec<(String, String)>, f64)> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(composite, _unit, _description, value)| {
+            let key = composite.key();
+            assert_eq!(key.name(), CERTIFICATE_NOT_AFTER);
+            let labels = key
+                .labels()
+                .map(|l| (l.key().to_string(), l.value().to_string()))
+                .collect();
+            let seconds = match value {
+                DebugValue::Gauge(seconds) => seconds.into_inner(),
+                other => panic!("expected a gauge, got {other:?}"),
+            };
+            (labels, seconds)
+        })
         .collect();
+    let find = |wanted: &[(&str, &str)]| {
+        let wanted: Vec<(String, String)> = wanted
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        series
+            .iter()
+            .find(|(labels, _)| *labels == wanted)
+            .map(|(_, seconds)| *seconds)
+    };
+
     assert_eq!(
-        labels,
-        vec![
-            ("service".to_string(), "iam".to_string()),
-            ("kind".to_string(), "client".to_string()),
-        ]
+        find(&[("service", "iam"), ("kind", "client"), ("name", "broker")]),
+        Some(BROKER_CLIENT_NOT_AFTER as f64),
+        "the broker's client leaf must publish its OWN expiry under `name=\"broker\"`; \
+         absent means it is watched by path only and its expiry is invisible: {series:?}"
     );
-    match value {
-        DebugValue::Gauge(seconds) => assert_eq!(
-            seconds.into_inner(),
-            CLIENT_NOT_AFTER as f64,
-            "the one gauge must still be iam-db's own client leaf's expiry, unperturbed \
-             by the broker's leaf being configured and watched alongside it"
-        ),
-        other => panic!("expected a gauge, got {other:?}"),
-    }
+    assert_eq!(
+        find(&[("service", "iam"), ("kind", "client")]),
+        Some(CLIENT_NOT_AFTER as f64),
+        "the unnamed client series must still be iam-db's own leaf, not overwritten by the \
+         broker's: {series:?}"
+    );
+    assert_eq!(
+        series.len(),
+        2,
+        "with no listener configured, exactly two series — iam-db's client leaf and the \
+         broker's named one — and nothing for either CA or key: {series:?}"
+    );
 }
 
 /// THE GAUGE THIS PROCESS PUBLISHES SAYS `service = "iam"`.

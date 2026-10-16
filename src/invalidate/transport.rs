@@ -63,7 +63,7 @@ const TLS_DOMAIN: &str = "NATS_TLS_DOMAIN";
 /// Each read is marked `ADR-0523-WATCHED` even though it is never folded
 /// through [`crate::upstream::UpstreamTls`]'s own `Material` impl: see
 /// `crate::rotate::watch_set`'s own doc for why this hop's client leaf is
-/// watched by path rather than by that impl.
+/// folded as a NAMED leaf (`"broker"`) instead of by that impl.
 ///
 /// **`NATS_TLS_DOMAIN` IS REFUSED**, unlike `IAM_DB`'s and the gRPC hops'
 /// own domain override. `async-nats` verifies the broker's certificate
