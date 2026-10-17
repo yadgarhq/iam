@@ -251,6 +251,11 @@ spec:
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT
               value: {{ .Values.iamDb.port | quote }}
+            # NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1): the binary refuses
+            # an unset value, so this renders from `iamDb.requestTimeoutSeconds`
+            # unconditionally. Bounded 14..=59 in `values.schema.json`.
+            - name: IAM_DB_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.iamDb.requestTimeoutSeconds | quote }}
             # THE HOP TO iam-db, which LISTEN_TLS_ENABLED above says nothing
             # about: that one describes this pod's own listener.
             #

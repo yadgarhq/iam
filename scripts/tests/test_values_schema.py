@@ -370,6 +370,19 @@ def test_the_required_no_default_leaves_are_typed_boolean_and_required():
     assert failures == [], "\n".join(failures)
 
 
+def test_the_request_timeout_is_a_bounded_required_integer():
+    """ADR-0925 Q-C1, ledger 1490: `iamDb.requestTimeoutSeconds` ships a default
+    (30) but is typed, bounded 14..=59 and `required`. The bounds are
+    `yadgar_dial`'s; `tests/chart_request_timeout.rs` holds them to the pin."""
+    block = schema()["properties"]["iamDb"]
+    assert block["properties"]["requestTimeoutSeconds"] == {
+        "type": "integer",
+        "minimum": 14,
+        "maximum": 59,
+    }
+    assert "requestTimeoutSeconds" in block["required"]
+
+
 def test_the_required_no_default_modes_are_untyped_and_required():
     failures = required_no_default_mode_failures(schema())
     assert failures == [], "\n".join(failures)
