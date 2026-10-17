@@ -230,9 +230,14 @@ async fn a_refusal_carries_the_layer_below_transport_error() {
     let ca = MintedCa::new();
     let tls = upstream_tls(ca.path(), "not a server name");
 
-    let error = crate::upstream::connect("iam-db", 50051, Some(&tls))
-        .await
-        .expect_err("a domain rustls cannot parse must refuse before any dial");
+    let error = crate::upstream::connect(
+        "iam-db",
+        50051,
+        Some(&tls),
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect_err("a domain rustls cannot parse must refuse before any dial");
 
     assert!(
         refusal(&error).contains("invalid dns name"),

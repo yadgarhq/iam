@@ -202,3 +202,27 @@ fn an_unparsable_response_floor_names_the_variable() {
         );
     }
 }
+
+/// ADR-0925 Q-C1: `IAM_DB_REQUEST_TIMEOUT_SECONDS` has no compiled-in default, so
+/// each of these four values refuses the boot, naming the variable AND the
+/// chart key that renders it. Read before `shared.yaml`, so no mount namespace.
+#[test]
+fn a_missing_or_out_of_range_request_timeout_names_the_variable_and_the_chart_key() {
+    for bad in [None, Some("0"), Some("13"), Some("60")] {
+        let keys_dir = fresh_keys_dir();
+        let mut vars = cleartext_env(&keys_dir);
+        vars.retain(|(k, _)| *k != "IAM_DB_REQUEST_TIMEOUT_SECONDS");
+        if let Some(value) = bad {
+            vars.push(("IAM_DB_REQUEST_TIMEOUT_SECONDS", value.to_string()));
+        }
+        let line = refusal_without_mounts(&vars);
+        assert!(
+            line.contains("IAM_DB_REQUEST_TIMEOUT_SECONDS"),
+            "{bad:?}: the refusal must name the variable: {line}"
+        );
+        assert!(
+            line.contains("iamDb.requestTimeoutSeconds"),
+            "{bad:?}: the refusal must name the chart key: {line}"
+        );
+    }
+}

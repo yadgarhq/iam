@@ -312,7 +312,11 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
     // why cleartext is not the answer.
     let db_tls = upstream::UpstreamTls::from_env(upstream::IAM_DB, upstream::IAM_DB_CHART_KEY)
         .map_err(|e| e.to_string())?;
-    let db = upstream::connect(&db_host, db_port, db_tls.as_ref())
+    // NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1). Read BEFORE the dial so
+    // an unset, zero or out-of-range value refuses the boot naming the variable
+    // and `iamDb.requestTimeoutSeconds`, not after a connection is half built.
+    let request_timeout = upstream::request_timeout_from_env().map_err(|e| e.to_string())?;
+    let db = upstream::connect(&db_host, db_port, db_tls.as_ref(), request_timeout)
         .await
         // `refusal` rather than `to_string()` (ledger 733, ledger 740): see its
         // own doc comment for why this is the one site in this file that takes
@@ -324,6 +328,7 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
     tracing::info!(
         reresolve_secs = yadgar_dial::reresolve_interval().as_secs(),
         tls = db_tls.is_some(),
+        request_timeout_secs = request_timeout.as_secs(),
         "connected to iam-db"
     );
     Ok((db, db_tls))

@@ -137,6 +137,7 @@ pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
         ("LISTEN_TLS_ENABLED", "0".to_string()),
         ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
         ("IAM_DB_TLS_ENABLED", "0".to_string()),
+        ("IAM_DB_REQUEST_TIMEOUT_SECONDS", "30".to_string()),
         ("YADGAR_KEYS_DIR", keys_dir.display().to_string()),
         ("LOGIN_RESPONSE_FLOOR_MS", "0".to_string()),
         ("REDEEM_RESPONSE_FLOOR_MS", "0".to_string()),
