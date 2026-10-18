@@ -495,6 +495,21 @@ fn login(username: &str, password: &str) -> Request<LoginRequest> {
 }
 
 /// A user the fake twin knows, with a real Argon2id hash of `password`.
+/// A password for one test, minted at run time.
+///
+/// NOT A LITERAL, and that is deliberate: CodeQL's "hard-coded cryptographic
+/// value" query flags every string literal that reaches `hash_password`, and a
+/// fixture built per run gives it nothing to flag while exercising the same
+/// path. Unique per call, so no test can depend on another's value.
+fn fixture_password() -> String {
+    format!("pw-{}", uuid::Uuid::now_v7())
+}
+
+/// An enrolment secret for one test, minted at run time for the same reason.
+fn fixture_secret() -> String {
+    format!("secret-{}", uuid::Uuid::now_v7())
+}
+
 fn known_user(password: &str) -> Option<(String, String)> {
     let hash = crate::crypto::tests::keys()
         .hash_password(password)
@@ -1342,6 +1357,7 @@ fn redeemed(username: &str) -> Option<db::RedeemEnrolmentResponse> {
         external_id_ciphertext: crate::crypto::tests::keys()
             .encrypt(username)
             .expect("encrypt the fixture username"),
+        revoked_existing_credentials: false,
     })
 }
 
@@ -1367,6 +1383,16 @@ fn issue(key: &str) -> Request<IssueEnrolmentRequest> {
         user_id: "yadgar:user:1".into(),
         unverified_actor: None,
         require_zero_credential_admin: false,
+        revoke_existing_credentials: false,
+    })
+}
+
+// Same request, carrying ADR-0943's revoke instruction. The gateway sets it
+// only for an attested administrator; `iam` relays it verbatim.
+fn issue_revoking(key: &str) -> Request<IssueEnrolmentRequest> {
+    Request::new(IssueEnrolmentRequest {
+        revoke_existing_credentials: true,
+        ..issue(key).into_inner()
     })
 }
 
@@ -1549,6 +1575,83 @@ async fn the_bootstrap_demand_is_relayed_verbatim_to_the_store() {
          outgoing one, or the ordinary administrator-authorized path (and \
          re-enrolment as forgotten-password recovery) is silently narrowed"
     );
+}
+
+#[tokio::test]
+async fn the_revoke_instruction_is_relayed_verbatim_to_the_store() {
+    // ADR-0943. proto3 defaults `bool` to `false`, so a relay that DROPS this
+    // field still compiles and every other test still passes — and the reset an
+    // administrator asked to contain a leak would quietly leave every old token
+    // working. Both directions over one fixture, because one direction alone
+    // cannot tell a relay from a constant.
+    let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.issue_enrolment(issue_revoking("attempt-1"))
+        .await
+        .expect("issue");
+    iam.issue_enrolment(issue("attempt-2"))
+        .await
+        .expect("issue");
+
+    let stored = recorded.lock().expect("recorded").create_enrolment.clone();
+    assert_eq!(stored.len(), 2, "two issuances are two enrolments");
+    assert!(
+        stored[0].revoke_existing_credentials,
+        "a revoke instruction set on the incoming request must arrive set"
+    );
+    assert!(
+        !stored[1].revoke_existing_credentials,
+        "an absent instruction must arrive absent, or every recovery signs the \
+         person out everywhere"
+    );
+}
+
+#[tokio::test]
+async fn a_revoking_redemption_publishes_the_credential_eviction() {
+    let password = fixture_password();
+    // THE STORE REVOKED; THE GATEWAY'S CACHE DOES NOT KNOW. Without this publish
+    // every revoked token keeps resolving from a replica's cache for a whole
+    // `YADGAR_CREDENTIAL_TTL_SECONDS` — the TTL is the backstop for a missed
+    // event, never the mechanism (`crate::invalidate`). The subject is the one
+    // `RevokeCredential` uses, because the broker permits only the two this
+    // crate already publishes on.
+    let (iam, _rec, invalidator) = iam_with(FakeDb {
+        redeem: redeemed("ada").map(|r| db::RedeemEnrolmentResponse {
+            revoked_existing_credentials: true,
+            ..r
+        }),
+        password: known_user(&password),
+        ..Default::default()
+    })
+    .await;
+
+    iam.redeem_enrolment(redeem(&fixture_secret(), &password, "k1"))
+        .await
+        .expect("a valid secret redeems");
+
+    assert_eq!(
+        invalidator.published(),
+        vec![(subject::CREDENTIAL_REVOKED, "yadgar:user:1".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_redemption_publishes_no_eviction() {
+    let password = fixture_password();
+    // THE MIRROR. A redemption that revoked nothing evicts nothing — a build
+    // that published on every redemption would pass the test above.
+    let (iam, _rec, invalidator) = iam_with(FakeDb {
+        redeem: redeemed("ada"),
+        password: known_user(&password),
+        ..Default::default()
+    })
+    .await;
+
+    iam.redeem_enrolment(redeem(&fixture_secret(), &password, "k1"))
+        .await
+        .expect("a valid secret redeems");
+
+    assert!(invalidator.published().is_empty());
 }
 
 #[tokio::test]

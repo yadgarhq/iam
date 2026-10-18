@@ -131,6 +131,17 @@ impl Iam {
         // every one of them is indistinguishable from the others.
         let (spent, call) = self.spend_enrolment(&req, call).await?;
 
+        // ADR-0943: THE STORE REVOKED EVERY OLD CREDENTIAL IN THE REDEMPTION'S
+        // TRANSACTION, AND THE GATEWAY'S CACHE MUST HEAR OF IT. Published here,
+        // straight after the spend, because the revoke has already committed
+        // whatever happens below — a later failure must not leave it unannounced.
+        // The same subject and the same user-keyed payload `RevokeCredential`
+        // publishes. A replay reports the flag again and re-publishes, which is
+        // harmless: an eviction is idempotent.
+        if spent.revoked_existing_credentials {
+            self.invalidator.credential_revoked(&spent.user_id).await;
+        }
+
         // The username, decrypted exactly as it was encrypted. A person
         // enrolling on their first machine has no in-band way to learn it, and
         // `iam` holds no store to have remembered it in — so the store returning
@@ -394,6 +405,11 @@ impl Iam {
             // refuse: the demand would be silently dropped and the ordinary
             // path taken with nobody having checked anything.
             require_zero_credential_admin: req.get_ref().require_zero_credential_admin,
+            // RELAYED VERBATIM, for the same reason (ADR-0943). The gateway sets
+            // it only for an attested administrator; `iam-db` stores it on the
+            // enrolment and refuses it beside the demand above. Dropping it here
+            // would make an administrator's containing reset a plain one.
+            revoke_existing_credentials: req.get_ref().revoke_existing_credentials,
         });
         forward_request_id(&req, &mut create);
 
