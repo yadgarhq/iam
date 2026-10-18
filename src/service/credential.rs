@@ -1,5 +1,5 @@
-//! The credential surface: resolving one, listing them, minting one and
-//! revoking one.
+//! The credential surface: resolving one, listing them, minting one,
+//! revoking one and revoking all of one user's.
 
 use super::validate::*;
 use super::*;
@@ -255,17 +255,20 @@ impl Iam {
             // arrive on. Relaying `r.unverified_actor` today would move `None`
             // and READ AS A RELAY THAT WORKS.
             //
-            // **THE RELAY HAS EIGHT SITES AND FIVE OF THEM STILL SEND `None`**:
+            // **THE RELAY HAS NINE SITES AND FIVE OF THEM STILL SEND `None`**:
             // here, `revoke_credential`, `add_team_member`, `remove_team_member` and
             // `set_inherited_setting`. Five sites were invisible until this file
             // stopped using a rest pattern, so whoever wires the path by grepping
             // for the field would have found two.
             //
-            // **THREE RELAY FOR REAL — `set_user_admin`, `create_user` and
-            // `issue_enrolment`** — so "nothing populates the field" is not true of
-            // this service as a whole. It stays true here: those three are exactly
-            // the RPCs the gateway's administrative route reaches, and this is not
-            // one of them. The five above wait on a caller each, not on a sink;
+            // **FOUR RELAY FOR REAL — `set_user_admin`, `create_user`,
+            // `issue_enrolment` and `revoke_all_credentials`** — so "nothing
+            // populates the field" is not true of this service as a whole. It
+            // stays true here: the first three are exactly the RPCs the gateway's
+            // administrative route reaches, and the fourth relays because its
+            // contract requires it (ADR-0945), ahead of the gateway route that
+            // will call it. This is not one of them. The five above wait on a
+            // caller each, not on a sink;
             // `iam-db` v0.7.31 reads the field on four verbs and would need the
             // same additive change for `CreateCredential`, `RevokeCredential`,
             // `AddTeamMember` and `RemoveTeamMember`.
@@ -325,5 +328,67 @@ impl Iam {
             ..Default::default()
         });
         Ok(Response::new(RevokeCredentialResponse {}))
+    }
+
+    /// ADR-0945: every live credential of one user, tombstoned in one `iam-db`
+    /// transaction, then one eviction for that user.
+    pub(super) async fn revoke_all_credentials_inner(
+        &self,
+        req: Request<RevokeAllCredentialsRequest>,
+        call: Call,
+    ) -> Result<Response<RevokeAllCredentialsResponse>, Status> {
+        let r = req.get_ref();
+        // BEFORE THE UPSTREAM CALL, so a refused request reaches no store. An
+        // empty id names nobody; `check_entity_id` bounds only the length, and it
+        // is not widened here because `issue_credential` shares it.
+        let checked = if r.user_id.is_empty() {
+            Err(Status::invalid_argument("`user_id` is required"))
+        } else {
+            check_entity_id("user_id", &r.user_id)
+        };
+        if let Err(refusal) = checked {
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
+
+        let user_id = r.user_id.clone();
+        let mut upstream = Request::new(db::RevokeAllCredentialsRequest {
+            // D9's key travels, on `revoke_credential`'s reasoning. `iam-db`
+            // does not honour it yet (ledger 668), which is why the contract
+            // says a redelivery's `revoked` is not the first delivery's.
+            idempotency: r.idempotency.clone(),
+            user_id: user_id.clone(),
+            // FORWARDED, AND THE CONTRACT REQUIRES IT: `iam.proto` names relaying
+            // the actor as a requirement on THIS handler. The sink is real —
+            // `iam-db`#94 records it through `record_actor`. Audit-only
+            // (ADR-0534): forwarded exactly as received, `None` stays `None`, and
+            // nothing here authorises on it.
+            unverified_actor: r.unverified_actor.clone(),
+        });
+        forward_request_id(&req, &mut upstream);
+
+        let done = self
+            .client()
+            .revoke_all_credentials(upstream)
+            .await
+            .map_err(upstream_failed)?
+            .into_inner();
+
+        // AFTER THE COMMIT AND WHATEVER `revoked` IS (ADR-0945). The count is
+        // what THIS delivery changed, so a retry after a lost response answers 0
+        // for tokens a gateway may still cache; branching on it would skip the
+        // eviction exactly then. The id published is the one validated above:
+        // the store's response carries no user id. `publish` never fails its
+        // caller, so a broker outage logs and this still answers `OK`; the
+        // gateway credential TTL bounds the gap.
+        self.invalidator.credential_revoked(&user_id).await;
+
+        call.finish(Outcome {
+            status: "OK",
+            ..Default::default()
+        });
+        Ok(Response::new(RevokeAllCredentialsResponse {
+            revoked: done.revoked,
+        }))
     }
 }

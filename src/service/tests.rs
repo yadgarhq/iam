@@ -61,15 +61,20 @@ struct Recorded {
     /// `..Default::default()`, so no test could see a field that never left —
     /// and the fake did not even keep the request to look at.
     revoke_credential: Vec<db::RevokeCredentialRequest>,
+    /// ADR-0945's revoke-all, recorded BEFORE any scripted refusal so a test can
+    /// tell "the store refused" from "the store was never asked". The second is
+    /// what a validation refusal must produce, and only an empty vector says so.
+    revoke_all_credentials: Vec<db::RevokeAllCredentialsRequest>,
     create_user: Vec<db::CreateUserRequest>,
     add_team_member: Vec<db::AddTeamMemberRequest>,
     remove_team_member: Vec<db::RemoveTeamMemberRequest>,
-    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and since ledger 612 one
-    /// of three: `create_user` and `create_enrolment` above carry ADR-0534's actor
-    /// too. The five administrative writes the gateway does not reach still forward
-    /// `unverified_actor: None`, so recording the request buys nothing there but
-    /// the field list. On these three a hard-coded `None` answers `Ok` exactly like
-    /// a working relay — so the forwarded request is the only oracle.
+    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and now one of four:
+    /// `create_user` and `create_enrolment` above carry ADR-0534's actor too since
+    /// ledger 612, and `revoke_all_credentials` since ADR-0945. The five
+    /// administrative writes that still forward `unverified_actor: None` buy
+    /// nothing from a recorded request but the field list. On these four a
+    /// hard-coded `None` answers `Ok` exactly like a working relay — so the
+    /// forwarded request is the only oracle.
     set_user_admin: Vec<db::SetUserAdminRequest>,
 }
 
@@ -116,6 +121,13 @@ struct FakeDb {
     /// the presented secret is looked up. Without this field the fake can only
     /// answer, so no test could see what `iam` does with that error.
     redeem_fails: Option<(tonic::Code, &'static str)>,
+    /// What `RevokeAllCredentials` answers as `revoked`. NONZERO in the test that
+    /// pins the count, because `0` is prost's default and a handler that dropped
+    /// the store's number would still answer it.
+    revoke_all_answer: u32,
+    /// A `(code, message)` to fail `RevokeAllCredentials` with: `NOT_FOUND` is
+    /// the store's answer for a user id with no `iam_user` row at all.
+    revoke_all_fails: Option<(tonic::Code, &'static str)>,
     recorded: Arc<Mutex<Recorded>>,
 }
 
@@ -290,6 +302,23 @@ impl IamDbService for FakeDb {
             .push(req.into_inner());
         Ok(Response::new(db::RevokeCredentialResponse {
             user_id: "yadgar:user:1".into(),
+        }))
+    }
+
+    async fn revoke_all_credentials(
+        &self,
+        req: Request<db::RevokeAllCredentialsRequest>,
+    ) -> Result<Response<db::RevokeAllCredentialsResponse>, Status> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .revoke_all_credentials
+            .push(req.into_inner());
+        if let Some((code, message)) = self.revoke_all_fails {
+            return Err(Status::new(code, message));
+        }
+        Ok(Response::new(db::RevokeAllCredentialsResponse {
+            revoked: self.revoke_all_answer,
         }))
     }
 
@@ -1100,6 +1129,294 @@ async fn revoking_a_credential_publishes_the_invalidation() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-0945's revoke-all verb.
+// ---------------------------------------------------------------------------
+
+/// The key every `RevokeAllCredentials` in these tests carries.
+const REVOKE_ALL_KEY: &str = "01J0000000000000000000000R";
+
+/// The user every `RevokeAllCredentials` in these tests names. NOT the fake's
+/// `RevokeCredential` echo `"yadgar:user:1"`, so a handler that published some
+/// other id than the one it was asked about cannot pass by coincidence.
+const REVOKE_ALL_USER: &str = "yadgar:user:target";
+
+fn revoke_all(
+    user_id: &str,
+    actor: Option<UnverifiedActor>,
+) -> Request<RevokeAllCredentialsRequest> {
+    Request::new(RevokeAllCredentialsRequest {
+        idempotency: Some(Idempotency {
+            key: REVOKE_ALL_KEY.into(),
+        }),
+        user_id: user_id.into(),
+        unverified_actor: actor,
+    })
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_relays_the_key_the_user_and_the_actor() {
+    // THE CONTRACT DEMANDS THIS RELAY (`iam.proto`, RevokeAllCredentialsRequest:
+    // "relay the actor to `iam-db`"), and `iam-db`#94 reads the field.
+    //
+    // MUTATION THIS CATCHES: `unverified_actor: None`, copied from the five sites
+    // that still send it. It answers `Ok` and publishes, so the forwarded request
+    // is the only oracle. The WHOLE request is compared, so a dropped key or a
+    // rewritten user id is caught here too.
+    //
+    // BOTH ARMS, because a relay that fabricates `Some(UnverifiedActor { user_id:
+    // "" })` for a caller that sent nothing hides a real id that was dropped.
+    for actor in [
+        Some(UnverifiedActor {
+            user_id: "yadgar:user:admin".into(),
+        }),
+        None,
+    ] {
+        let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+        iam.revoke_all_credentials(revoke_all(REVOKE_ALL_USER, actor.clone()))
+            .await
+            .expect("revoke all");
+
+        assert_eq!(
+            rec.lock().expect("recorded").revoke_all_credentials,
+            vec![db::RevokeAllCredentialsRequest {
+                idempotency: Some(Idempotency {
+                    key: REVOKE_ALL_KEY.into()
+                }),
+                user_id: REVOKE_ALL_USER.into(),
+                unverified_actor: actor,
+            }],
+            "the store must be asked what the caller asked for, actor included"
+        );
+    }
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_publishes_the_eviction_for_the_user() {
+    // D72: an event that does not fire is a credential that keeps working, for
+    // up to `YADGAR_CREDENTIAL_TTL_SECONDS` on every gateway replica.
+    let (iam, _rec, invalidator) = iam_with(FakeDb {
+        revoke_all_answer: 2,
+        ..Default::default()
+    })
+    .await;
+
+    iam.revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect("revoke all");
+
+    assert_eq!(
+        invalidator.published(),
+        vec![(subject::CREDENTIAL_REVOKED, REVOKE_ALL_USER.to_string())],
+        "one eviction, for the user named, on the revocation subject"
+    );
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_publishes_even_when_nothing_was_revoked() {
+    // `revoked` counts what THIS DELIVERY changed, and `iam-db` does not honour
+    // idempotency keys (ledger 668). A retry after a lost response answers 0
+    // although the first delivery revoked tokens a gateway may still cache. So
+    // the publish cannot branch on the count: the contract says "WHATEVER
+    // `revoked` IS".
+    //
+    // MUTATION THIS CATCHES: `if got.revoked > 0 { publish }`.
+    let (iam, _rec, invalidator) = iam_with(FakeDb {
+        revoke_all_answer: 0,
+        ..Default::default()
+    })
+    .await;
+
+    let answered = iam
+        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect("revoke all")
+        .into_inner();
+
+    assert_eq!(answered.revoked, 0, "zero is a success and not an error");
+    assert_eq!(
+        invalidator.published(),
+        vec![(subject::CREDENTIAL_REVOKED, REVOKE_ALL_USER.to_string())],
+        "the eviction fires when the count is zero"
+    );
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_publishes_nothing_when_the_store_fails() {
+    // NOTHING COMMITTED, SO NOTHING TO EVICT. Publishing first would evict on a
+    // failed write; the publish comes after the upstream call for that reason.
+    let (iam, rec, invalidator) = iam_with(FakeDb {
+        revoke_all_fails: Some((tonic::Code::Unavailable, "storage unavailable")),
+        ..Default::default()
+    })
+    .await;
+
+    let refused = iam
+        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect_err("the store failed");
+
+    assert_eq!(
+        refused.code(),
+        tonic::Code::Unavailable,
+        "the code passes through"
+    );
+    assert_eq!(
+        rec.lock().expect("recorded").revoke_all_credentials.len(),
+        1,
+        "the store was asked"
+    );
+    assert!(
+        invalidator.published().is_empty(),
+        "no eviction for a write that did not commit"
+    );
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_for_an_unknown_user_stays_not_found() {
+    // THE GATEWAY MAPS THIS CODE TO 404 (ADR-0945 decision 4). `upstream_failed`
+    // keeps the code and replaces the words, so a NOT_FOUND rewritten to anything
+    // else here would reach the administrator as a 5xx for a typo.
+    let (iam, _rec, invalidator) = iam_with(FakeDb {
+        revoke_all_fails: Some((tonic::Code::NotFound, "no iam_user row for that id")),
+        ..Default::default()
+    })
+    .await;
+
+    let refused = iam
+        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect_err("no such user");
+
+    assert_eq!(
+        refused.code(),
+        tonic::Code::NotFound,
+        "NOT_FOUND passes through"
+    );
+    assert!(
+        !refused.message().contains("iam_user"),
+        "the store's words do not cross the boundary"
+    );
+    assert!(
+        invalidator.published().is_empty(),
+        "no eviction for a user the store does not have"
+    );
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_returns_the_stores_count() {
+    // NONZERO, because 0 is prost's default and a handler that answered
+    // `RevokeAllCredentialsResponse::default()` would pass a zero.
+    let (iam, _rec, _inv) = iam_with(FakeDb {
+        revoke_all_answer: 3,
+        ..Default::default()
+    })
+    .await;
+
+    let answered = iam
+        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect("revoke all")
+        .into_inner();
+
+    assert_eq!(answered.revoked, 3, "the store's count passes through");
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_refuses_a_malformed_user_id_without_asking_the_store() {
+    // 96 CHARACTERS IS `MAX_ENTITY_ID_CHARS`, the width of `iam_user.id`. Both
+    // refusals are this service's own: an empty id names nobody, and an
+    // over-long one would come back from the store as UNAVAILABLE "storage
+    // unavailable", which implicates a database that is working (ADR-0512).
+    for user_id in [String::new(), "u".repeat(97)] {
+        let (iam, rec, invalidator) = iam_with(FakeDb::default()).await;
+
+        let refused = iam
+            .revoke_all_credentials(revoke_all(&user_id, None))
+            .await
+            .expect_err("a malformed user_id is refused");
+
+        assert_eq!(
+            refused.code(),
+            tonic::Code::InvalidArgument,
+            "a malformed user_id is INVALID_ARGUMENT"
+        );
+        assert!(
+            rec.lock()
+                .expect("recorded")
+                .revoke_all_credentials
+                .is_empty(),
+            "the store is never asked about a malformed user_id"
+        );
+        assert!(
+            invalidator.published().is_empty(),
+            "nothing is evicted for a refused request"
+        );
+    }
+
+    // THE OTHER SIDE OF THE BOUND: exactly 96 characters is accepted.
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+    iam.revoke_all_credentials(revoke_all(&"u".repeat(96), None))
+        .await
+        .expect("a 96-character user_id is accepted");
+    assert_eq!(
+        rec.lock().expect("recorded").revoke_all_credentials.len(),
+        1,
+        "a 96-character user_id reaches the store"
+    );
+}
+
+#[tokio::test]
+async fn revoking_all_credentials_answers_ok_when_the_broker_is_unreachable() {
+    // A FAILED PUBLISH DOES NOT FAIL THE CALL (ADR-0945 decision 3): the
+    // revocation has committed, and an error here would send the caller to
+    // retry a write that already happened. The gateway credential TTL bounds the
+    // gap. A CONFIGURED broker that cannot be reached, not the harness's
+    // unconfigured one, so the publish genuinely attempts and fails.
+    //
+    // A REGRESSION GUARD MORE THAN A RED: `Invalidator::publish` returns `()`, so
+    // the type already makes the failure invisible to this handler. This pins
+    // that it stays so.
+    let (channel, _rec) = twin(FakeDb {
+        revoke_all_answer: 1,
+        ..Default::default()
+    })
+    .await;
+    let invalidator = Invalidator::connect(Some("nats://127.0.0.1:1"), None, None).await;
+    let iam = Iam::new(
+        crate::crypto::tests::keys(),
+        channel,
+        invalidator.clone(),
+        ResponseFloors {
+            login: NOMINAL_FLOOR,
+            redeem: NOMINAL_FLOOR,
+        },
+        enrolment_config(),
+    );
+    warnings_from_here();
+
+    assert!(
+        !invalidator.is_publishing(),
+        "the broker is unreachable, so the publish fails"
+    );
+    let answered = iam
+        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect("a failed publish does not fail the call")
+        .into_inner();
+
+    assert_eq!(
+        answered.revoked, 1,
+        "the store's count still passes through"
+    );
+    assert_eq!(
+        invalidator.published(),
+        vec![(subject::CREDENTIAL_REVOKED, REVOKE_ALL_USER.to_string())],
+        "the publish was attempted"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // D73's promote verb.
 // ---------------------------------------------------------------------------
 
@@ -1230,7 +1547,8 @@ async fn a_promotion_the_store_refuses_invalidates_nothing() {
 async fn the_promote_verb_relays_the_actor_the_caller_asserted() {
     // ADR-0534's RELAY, AND THIS WAS ITS FIRST SITE WITH A SOURCE. `create_user`
     // and `issue_enrolment` acquired one too (ledger 612) — those three are the
-    // RPCs the gateway's administrative route reaches. The five writes it does not
+    // RPCs the gateway's administrative route reaches — and
+    // `revoke_all_credentials` relays because its contract requires it (ADR-0945). The five writes it does not
     // reach still forward `unverified_actor: None` because nothing populates the
     // field there.
     //
