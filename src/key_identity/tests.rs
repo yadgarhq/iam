@@ -150,6 +150,13 @@ impl IamDbService for FakeTwin {
         unimplemented!("the key-identity check never calls this arm")
     }
 
+    async fn revoke_all_credentials(
+        &self,
+        _r: Request<db::RevokeAllCredentialsRequest>,
+    ) -> Result<Response<db::RevokeAllCredentialsResponse>, Status> {
+        unimplemented!("the key-identity check never calls this arm")
+    }
+
     async fn list_credentials(
         &self,
         _r: Request<db::ListCredentialsRequest>,

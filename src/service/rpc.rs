@@ -171,9 +171,10 @@ impl IamService for Iam {
     /// would be a second place for it to be wrong.
     ///
     /// **THE ACTOR IS RELAYED, AND THIS WAS THE FIRST SITE ON THIS SERVICE THAT
-    /// DID.** `create_user` and `issue_enrolment` relay too since ledger 612, so a
-    /// reader grepping the field now finds three — this paragraph records which one
-    /// came first, not which one is alone. ADR-0534's field is audit-only: it is
+    /// DID.** `create_user` and `issue_enrolment` relay too since ledger 612, and
+    /// `revoke_all_credentials` since ADR-0945, so a reader grepping the field now
+    /// finds four — this paragraph records which one came first, not which one is
+    /// alone. ADR-0534's field is audit-only: it is
     /// asserted by the gateway, verified by nothing on the wire, and MUST NOT be an
     /// authorisation input. So it is forwarded exactly as received, and `None`
     /// stays `None`.
@@ -315,6 +316,22 @@ impl IamService for Iam {
         let rid = request_id_of(&req);
         let call = Call::start(SERVICE, "RevokeCredential", Kind::Write, tel(rid, ""));
         self.revoke_credential_inner(req, call).await
+    }
+
+    /// Revoke every live credential one user holds, and publish the eviction
+    /// (ADR-0945).
+    ///
+    /// **ONE HOP.** `iamdb.v1.RevokeAllCredentials` locks the user row and
+    /// tombstones every live credential in one transaction; this handler
+    /// validates `user_id`, relays the actor and publishes CREDENTIAL_REVOKED
+    /// after the commit, whatever the count. See `revoke_all_credentials_inner`.
+    async fn revoke_all_credentials(
+        &self,
+        req: Request<RevokeAllCredentialsRequest>,
+    ) -> Result<Response<RevokeAllCredentialsResponse>, Status> {
+        let rid = request_id_of(&req);
+        let call = Call::start(SERVICE, "RevokeAllCredentials", Kind::Write, tel(rid, ""));
+        self.revoke_all_credentials_inner(req, call).await
     }
 
     async fn create_user(
