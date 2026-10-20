@@ -3,6 +3,32 @@
 Commands for a human to run, and orderings a human must decide. Nothing here is
 applied automatically.
 
+## iam admits only `gateway-caller` on every verb (ADR-0972, ledger 1629)
+
+**Breaking: a caller whose verified client certificate does not name
+`gateway-caller` gets `PERMISSION_DENIED` on every `IamService` RPC.** No name
+is refused too: `tls.clientAuth: "off"`, `optional` with no certificate, or a
+cleartext listener. Each refusal increments `yadgar_iam_caller_refused`,
+labelled `caller` with the presented name or `none`. A refused call reaches no
+`iam-db` verb.
+
+Before the roll, check the live gateway leaf. A wrong name is an
+authentication outage once the gateway cache expires:
+
+```bash
+kubectl --context kind-yadgar -n yadgar get secret gateway-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject
+```
+
+Expect `CN = gateway-caller` exactly. The full A0 sequence — the iam-db
+`iam-caller` check, and the `task-client-tls` wrong-name probe after the roll
+— is in `yadgarhq/docs` `plans/admin-and-client-gaps.md` §1.
+
+The key-identity check now reads iam-db's `PERMISSION_DENIED` as permanent,
+at ERROR, naming iam-db's caller gate. The pod stays Ready (`NotYet`).
+
+Revert is a straight `git revert`, or a pin back to the previous image.
+
 ## The broker hop's TLS switch is now required (B-N3, ADR-0852, ADR-0845, ADR-0885)
 
 **Breaking: `nats.tls.enabled` must be set to `true` or `false` explicitly.**
