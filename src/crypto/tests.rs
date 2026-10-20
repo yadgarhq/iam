@@ -30,6 +30,23 @@ pub(crate) fn keys_of(encryption: [u8; 32], blind_index: [u8; 32]) -> Keys {
     }
 }
 
+/// [`keys`], with the dummy hash minted from `plaintext` instead of the fixed
+/// one. For a test that must submit the one password the dummy verification
+/// ACCEPTS — the auth-bypass witness in `service::tests` — without that
+/// password being a literal (CodeQL's hard-coded-credential query).
+pub(crate) fn keys_with_dummy(plaintext: &str) -> Keys {
+    Keys {
+        dummy_hash: PasswordHasher::hash_password_with_salt(
+            &Argon2::default(),
+            plaintext.as_bytes(),
+            &[3u8; 16],
+        )
+        .unwrap()
+        .to_string(),
+        ..keys()
+    }
+}
+
 #[test]
 fn a_name_round_trips() {
     let k = keys();

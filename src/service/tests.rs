@@ -530,15 +530,19 @@ async fn iam_with_floors(
     floors: ResponseFloors,
     enrolment: Option<EnrolmentConfig>,
 ) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    iam_with_keys(fake, crate::crypto::tests::keys(), floors, enrolment).await
+}
+
+/// [`iam_with_floors`], holding `keys` rather than the shared fixture.
+async fn iam_with_keys(
+    fake: FakeDb,
+    keys: Keys,
+    floors: ResponseFloors,
+    enrolment: Option<EnrolmentConfig>,
+) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
     let (channel, recorded) = twin(fake).await;
     let invalidator = Invalidator::connect(None, None, None).await;
-    let iam = Iam::new(
-        crate::crypto::tests::keys(),
-        channel,
-        invalidator.clone(),
-        floors,
-        enrolment,
-    );
+    let iam = Iam::new(keys, channel, invalidator.clone(), floors, enrolment);
     // LAST, and both halves of that matter. It installs the WARN tap, so no login
     // any test performs can precede the global subscriber; and it drains this
     // thread's list, so setup noise — `Invalidator::connect(None)` warns that it
@@ -639,14 +643,17 @@ async fn a_failed_login_issues_no_credential() {
     // `login` proceeds, and `CreateCredential` is called with user_id "" — a
     // working bearer token for nobody. That is a successful login, so no
     // assertion on the error can catch it; only the absence of the write can.
-    // "x" for the unknown-username case DELIBERATELY. The test fixture's dummy
-    // hash is the hash of "x", so this is the one submitted password for which
-    // the dummy verification SUCCEEDS — which is what makes the bypass reachable
-    // here at all. Any other password fails against the dummy on its own and the
-    // assertion below would hold with `stored.is_some()` already deleted.
+    // THE DUMMY'S OWN PLAINTEXT for the unknown-username case, DELIBERATELY.
+    // Each `Iam` here holds keys whose dummy hash is minted from `dummy`, so it
+    // is the one submitted password for which the dummy verification SUCCEEDS —
+    // which is what makes the bypass reachable here at all. Any other password
+    // fails against the dummy on its own and the assertion below would hold with
+    // `stored.is_some()` already deleted. A run-time fixture, not the shared
+    // fixture's literal, so no hard-coded credential reaches `login`.
+    let dummy = fixture_password();
     let wrong = fixture_password();
     for (name, fake, password) in [
-        ("unknown username", FakeDb::default(), "x"),
+        ("unknown username", FakeDb::default(), &dummy),
         (
             "wrong password",
             FakeDb {
@@ -656,7 +663,12 @@ async fn a_failed_login_issues_no_credential() {
             &wrong,
         ),
     ] {
-        let (iam, recorded, _inv) = iam_with(fake).await;
+        let floors = ResponseFloors {
+            login: NOMINAL_FLOOR,
+            redeem: NOMINAL_FLOOR,
+        };
+        let keys = crate::crypto::tests::keys_with_dummy(&dummy);
+        let (iam, recorded, _inv) = iam_with_keys(fake, keys, floors, enrolment_config()).await;
         iam.login_as(Some(GATEWAY_CALLER), login("max", password))
             .await
             .expect_err("a failed login must not succeed");
