@@ -16,8 +16,15 @@
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use metrics_util::MetricKind;
 
-use super::super::caller::{CALLER_REFUSED, NO_CALLER};
+use super::super::caller::NO_CALLER;
 use super::*;
+
+/// A LITERAL, never `caller::CALLER_REFUSED` (ADR-0599): a series name
+/// asserted through the constant that produced it passes straight through a
+/// rename, and the probe text and dashboards query this exact name. `_total`
+/// is the estate's counter convention (`yadgar_calls_total`,
+/// `yadgar_iamdb_caller_refused_total`).
+const CALLER_REFUSED_SERIES: &str = "yadgar_iam_caller_refused_total";
 
 /// A real leaf name `platform` issues under the same internal authority, so it
 /// verifies at the handshake and reaches the gate. Not the gateway's.
@@ -424,7 +431,7 @@ fn refused_count(
 ) -> Option<u64> {
     snapshot.iter().find_map(|(key, value)| {
         let named = key.kind() == MetricKind::Counter
-            && key.key().name() == CALLER_REFUSED
+            && key.key().name() == CALLER_REFUSED_SERIES
             && key
                 .key()
                 .labels()

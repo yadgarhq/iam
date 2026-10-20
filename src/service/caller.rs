@@ -58,7 +58,11 @@ pub const GATEWAY_CALLER: &str = "gateway-caller";
 /// **THE LABEL IS BOUNDED (D67).** A presented name reaches this label only
 /// after the handshake verified its leaf against the internal authority, so
 /// its values are the leaves `platform` issued, plus `none`.
-pub const CALLER_REFUSED: &str = "yadgar_iam_caller_refused";
+///
+/// **`_total` IN THE NAME**, the estate's counter convention
+/// (`yadgar_calls_total`, `yadgar_iamdb_caller_refused_total`). The exporter
+/// adds no suffix of its own, so the name here is the name scraped.
+pub const CALLER_REFUSED: &str = "yadgar_iam_caller_refused_total";
 
 /// The `caller` label value for a call that presented no common name.
 pub const NO_CALLER: &str = "none";

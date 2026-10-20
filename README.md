@@ -37,7 +37,7 @@ Everything a credential store has no business doing itself (D72):
   the verified client certificate's common name and admits `gateway-caller`
   alone. Any other name, or none (`tls.clientAuth: "off"`), gets
   `PERMISSION_DENIED` before any `iam-db` call, and increments
-  `yadgar_iam_caller_refused{caller}`. mTLS proves "one of ours"; the name
+  `yadgar_iam_caller_refused_total{caller}`. mTLS proves "one of ours"; the name
   proves "which one". See `src/service/caller.rs`.
 
 ## Enrolment: the admin creates the account, the person sets the password

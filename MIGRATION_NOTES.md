@@ -8,7 +8,7 @@ applied automatically.
 **Breaking: a caller whose verified client certificate does not name
 `gateway-caller` gets `PERMISSION_DENIED` on every `IamService` RPC.** No name
 is refused too: `tls.clientAuth: "off"`, `optional` with no certificate, or a
-cleartext listener. Each refusal increments `yadgar_iam_caller_refused`,
+cleartext listener. Each refusal increments `yadgar_iam_caller_refused_total`,
 labelled `caller` with the presented name or `none`. A refused call reaches no
 `iam-db` verb.
 
