@@ -708,9 +708,9 @@ CLIENT_AUTH_NOT_A_STRING_SENTENCE = (
 )
 # K1 (ADR-0972): `"off"` is refused by name.
 CLIENT_AUTH_OFF_SENTENCE = (
-    'iam: tls.clientAuth is "off", which iam refuses: iam admits a caller by the name in '
-    'its client certificate, and "off" verifies no certificate, so every RPC would be '
-    'refused (ADR-0972). Set tls.clientAuth to "required", and name the client CA in '
+    'iam: tls.clientAuth is "off", which iam refuses while tls.enabled is true: iam admits '
+    'a caller by the name in its client certificate, and "off" verifies no certificate, so '
+    'every RPC would be refused (ADR-0972). Set tls.clientAuth to "required", and name the client CA in '
     "tls.clientCaSecret and tls.clientCaSecretKey."
 )
 CLIENT_AUTH_UNKNOWN_SENTENCE = (
@@ -719,7 +719,8 @@ CLIENT_AUTH_UNKNOWN_SENTENCE = (
 
 CLIENT_AUTH_WITHOUT_TLS_SENTENCE = (
     'iam: tls.clientAuth is "{mode}" but tls.enabled is false: a cleartext listener '
-    "cannot verify a client certificate. Set tls.enabled to true (ADR-0854, ADR-0972)."
+    "cannot verify a client certificate. Set tls.enabled to true, or tls.clientAuth "
+    'to "off" (ADR-0854).'
 )
 CLIENT_AUTH_WITHOUT_CA_SENTENCE = (
     'iam: tls.clientAuth is "{mode}" but tls.clientCaSecret names no Secret, so there '
@@ -815,8 +816,8 @@ def test_client_auth_non_string_is_refused_by_name(tmp_path):
 
 
 def test_client_auth_off_is_refused_by_name(tmp_path):
-    """K1 (ADR-0972), the constructed red case. `"off"` is refused whatever
-    sits beside it: TLS on or off, a client CA named or not. The sentence is
+    """K1 (ADR-0972), the constructed red case. `"off"` with TLS on is refused
+    whatever sits beside it: a client CA named or not. The sentence is
     the render check's own, reached with schema validation ON.
 
     MUTATION: deleting the `eq .Values.tls.clientAuth "off"` arm turns this
@@ -828,13 +829,26 @@ def test_client_auth_off_is_refused_by_name(tmp_path):
             'tls: {enabled: true, clientAuth: "off", clientCaSecret: iam-client-ca, '
             "clientCaSecretKey: ca.crt}\n",
         ),
-        ("tls-off", 'tls: {enabled: false, clientAuth: "off"}\n'),
     ):
         overlay = values_file(tmp_path / f"{label}.yaml", tls)
         result = render(CHART, "--values", str(overlay))
         assert result.returncode != 0, f"{label}: clientAuth: off must refuse"
         assert CLIENT_AUTH_OFF_SENTENCE in result.stderr, result.stderr
         assert SCHEMA_WRAPPER not in result.stderr, result.stderr
+
+
+def test_client_auth_off_with_tls_off_still_renders(tmp_path):
+    """ADR-0972 fail-closed: a cleartext listener (the D80 all-off render) has
+    no client certificate name, so the binary refuses every call at runtime;
+    the chart renders `"off"` there and the render opens no path.
+
+    MUTATION: dropping `.Values.tls.enabled` from the off arm turns this red."""
+    overlay = values_file(tmp_path / "off-cleartext.yaml", 'tls: {enabled: false, clientAuth: "off"}\n')
+    result = render(CHART, "--values", str(overlay))
+    assert result.returncode == 0, result.stderr
+    assert env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
+    assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
 
 
 def test_client_auth_off_is_refused_by_name_over_bare_switches():
