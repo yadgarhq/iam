@@ -21,11 +21,14 @@
 # chart rather than two.
 #
 # `tls.clientAuth` (B-U5, ADR-0854; K-8 step 3) has no default either, and is
-# stated at `"off"` — the value the parent fixture (B-P1) states for every
-# server — QUOTED, because YAML reads a bare off as false.
+# stated at `"required"` with the client CA named (K1, ADR-0972): the chart
+# refuses `"off"` at render, because iam admits a caller by the name in its
+# client certificate. QUOTED, because YAML reads a bare off as false.
 tls:
   enabled: true
-  clientAuth: "off"
+  clientAuth: "required"
+  clientCaSecret: iam-tls
+  clientCaSecretKey: ca.crt
 iamDb:
   tls:
     enabled: true

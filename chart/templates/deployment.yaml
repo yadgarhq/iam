@@ -226,16 +226,20 @@ spec:
             - name: LISTEN_TLS_KEY_FILE
               value: /var/run/secrets/iam-tls/tls-key.pem
             {{- end }}
-            # RENDERED UNCONDITIONALLY TOO, OUTSIDE `tls.enabled` (B-U5,
-            # ADR-0854): the binary reads LISTEN_TLS_CLIENT_AUTH whether TLS is
-            # on or off and refuses it absent, so withholding it from a
-            # cleartext deployment would make that deployment refuse to boot.
-            # `templates/render-checks.yaml` refuses an absent, non-string or
-            # unknown value, and a verifying mode with TLS off or no CA Secret.
-            # Placed after the two paths, where the expand rendered it, so a
-            # TLS deployment at `off` renders the same env list as before.
+            # ADR-0975: ALWAYS RENDERED, because the binary reads
+            # LISTEN_TLS_CLIENT_AUTH whether TLS is on or off and refuses it
+            # absent (lifecycle `ServerTls::from_lookup`), and refuses any value
+            # but "off" beside a cleartext listener. With TLS on it is the
+            # operator's mode (`render-checks.yaml` refuses "off" and validates
+            # the rest). With TLS off it is the CONSTANT "off": the user's value
+            # is ignored and not validated, so a cleartext listener boots, sees
+            # no client certificate name, and refuses every RPC (ADR-0972).
             - name: LISTEN_TLS_CLIENT_AUTH
+              {{- if .Values.tls.enabled }}
               value: {{ .Values.tls.clientAuth | quote }}
+              {{- else }}
+              value: "off"
+              {{- end }}
             {{- if and .Values.tls.enabled .Values.tls.clientCaSecret }}
             # THE AUTHORITY this listener checks a CLIENT certificate against
             # when `tls.clientAuth` is `optional` or `required` (B-U5). A PATH,
