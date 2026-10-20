@@ -173,18 +173,87 @@ impl Iam {
         Ok(Response::new(resp))
     }
 
-    /// TAKES ONLY THE `Call`, because it reads nothing from the request: it
-    /// refuses every one of them. The parameter list says so rather than
-    /// leaving a reader to check.
+    /// ListCredentials: one hop to `iamdb.v1.ListCredentials`, then a projection.
+    ///
+    /// **NO ADDITIONAL AUTHORITY IS ENFORCED HERE, AND THAT IS DELIBERATE.**
+    /// `iam.proto` says who may call this RPC "is service policy rather than
+    /// contract shape" and that the gateway is where it is decided. This service
+    /// cannot verify a caller's identity (ADR-0534), so a check here would
+    /// authorise on an unverifiable field. The gate in `caller.rs` admits only
+    /// the gateway's certificate, exactly as it does for `revoke_credential`;
+    /// restricting the verb to an attested administrator is the gateway route's
+    /// job.
+    ///
+    /// **THE ACTOR IS NOT RELAYED, BECAUSE THE FIELD DOES NOT EXIST ON THE HOP.**
+    /// `iamdb.v1.ListCredentialsRequest` (proto v1.19.0) has no
+    /// `unverified_actor`, unlike `iam.v1.ListCredentialsRequest`. Nothing is
+    /// fabricated to fill the gap, and this is not one of the `None` sites in
+    /// `issue_credential`'s comment: those send a field that exists.
+    ///
+    /// **A REVOKED ROW IS DROPPED HERE TOO.** The contract omits it and `iam-db`
+    /// does too. An entry leaving the list is how a caller sees a revocation
+    /// land, so a store that broke the rule must not turn a tombstone into a
+    /// live-looking entry. An EXPIRED row is returned: `expires_at` says so.
+    ///
+    /// **THE PROJECTION DROPS `user_id` AND `revoked_at`.** `iam.v1.Credential`
+    /// carries neither, and never a token or its hash.
     pub(super) async fn list_credentials_inner(
         &self,
+        req: Request<ListCredentialsRequest>,
         call: Call,
     ) -> Result<Response<ListCredentialsResponse>, Status> {
-        call.fail("UNIMPLEMENTED");
-        Err(Status::unimplemented(
-            "ListCredentials is not implemented yet; an orphaned credential is \
-             currently findable only in the store",
-        ))
+        let r = req.get_ref();
+        // BEFORE THE UPSTREAM CALL, so a refused request reaches no store. An
+        // empty id names nobody. A negative page size is refused rather than
+        // read as the default, because the contract gives it no meaning.
+        let checked = if r.user_id.is_empty() {
+            Err(Status::invalid_argument("`user_id` is required"))
+        } else if r.page_size < 0 {
+            Err(Status::invalid_argument("`page_size` must not be negative"))
+        } else {
+            check_entity_id("user_id", &r.user_id)
+                .and_then(|()| check_entity_id("page_token", &r.page_token))
+        };
+        if let Err(refusal) = checked {
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
+
+        let mut upstream = Request::new(db::ListCredentialsRequest {
+            user_id: r.user_id.clone(),
+            page_size: r.page_size,
+            page_token: r.page_token.clone(),
+        });
+        forward_request_id(&req, &mut upstream);
+
+        let got = self
+            .client()
+            .list_credentials(upstream)
+            .await
+            .map_err(upstream_failed)?
+            .into_inner();
+
+        let credentials: Vec<Credential> = got
+            .credentials
+            .into_iter()
+            .filter(|c| c.revoked_at.is_none())
+            .map(|c| Credential {
+                id: c.id,
+                label: c.label,
+                created_at: c.created_at,
+                expires_at: c.expires_at,
+            })
+            .collect();
+
+        call.finish(Outcome {
+            status: "OK",
+            rows: credentials.len() as u32,
+            ..Default::default()
+        });
+        Ok(Response::new(ListCredentialsResponse {
+            credentials,
+            next_page_token: got.next_page_token,
+        }))
     }
 
     pub(super) async fn issue_credential_inner(
@@ -255,23 +324,24 @@ impl Iam {
             // arrive on. Relaying `r.unverified_actor` today would move `None`
             // and READ AS A RELAY THAT WORKS.
             //
-            // **THE RELAY HAS NINE SITES AND FIVE OF THEM STILL SEND `None`**:
-            // here, `revoke_credential`, `add_team_member`, `remove_team_member` and
-            // `set_inherited_setting`. Five sites were invisible until this file
+            // **THE RELAY HAS NINE SITES AND FOUR OF THEM STILL SEND `None`**:
+            // here, `add_team_member`, `remove_team_member` and
+            // `set_inherited_setting`. The sites were invisible until this file
             // stopped using a rest pattern, so whoever wires the path by grepping
-            // for the field would have found two.
+            // for the field would have found only some of them.
             //
-            // **FOUR RELAY FOR REAL — `set_user_admin`, `create_user`,
-            // `issue_enrolment` and `revoke_all_credentials`** — so "nothing
-            // populates the field" is not true of this service as a whole. It
-            // stays true here: the first three are exactly the RPCs the gateway's
-            // administrative route reaches, and the fourth relays because its
-            // contract requires it (ADR-0945), ahead of the gateway route that
-            // will call it. This is not one of them. The five above wait on a
-            // caller each, not on a sink;
-            // `iam-db` v0.7.31 reads the field on four verbs and would need the
-            // same additive change for `CreateCredential`, `RevokeCredential`,
-            // `AddTeamMember` and `RemoveTeamMember`.
+            // **FIVE RELAY FOR REAL — `set_user_admin`, `create_user`,
+            // `issue_enrolment`, `revoke_all_credentials` and
+            // `revoke_credential`** — so "nothing populates the field" is not
+            // true of this service as a whole. It stays true here: the first
+            // three are exactly the RPCs the gateway's administrative route
+            // reaches, and the last two relay because their contracts require it
+            // (ADR-0945, ledger 1627), ahead of the gateway routes that will call
+            // them. This is not one of them. The four that send `None` wait on a
+            // caller each, not on a sink. `iam-db` already reads the field on
+            // `RevokeCredential`, so that site's half of the change is done. The
+            // same additive change is still needed on `iam-db` for
+            // `CreateCredential`, `AddTeamMember` and `RemoveTeamMember`.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut create);
@@ -304,10 +374,12 @@ impl Iam {
             // delivery a replay rather than a second write.
             idempotency: req.get_ref().idempotency.clone(),
             credential_id: req.get_ref().credential_id.clone(),
-            // NOT FORWARDED, for the reason given at `issue_credential`: nothing
-            // populates the field, so a relay would move `None` and read as one
-            // that works. One of that comment's five remaining relay sites.
-            unverified_actor: None,
+            // FORWARDED (ledger 1627). `iam-db` records it through
+            // `record_actor` on this verb. Audit-only (ADR-0534): forwarded
+            // exactly as received, `None` stays `None`, and nothing here
+            // authorises on it. An empty actor is never fabricated to fill the
+            // field.
+            unverified_actor: req.get_ref().unverified_actor.clone(),
         });
         forward_request_id(&req, &mut upstream);
 

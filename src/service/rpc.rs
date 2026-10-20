@@ -120,14 +120,9 @@ impl IamService for Iam {
             .await
     }
 
-    /// NOT IMPLEMENTED IN THIS CHANGE, and named rather than silently absent.
-    ///
-    /// This RPC exists in the contract BECAUSE of `RedeemEnrolment`'s residual: a
-    /// lost redemption response leaves a credential nobody holds, and without
-    /// this list it is reachable only by someone with direct access to the
-    /// database. Shipping the residual before its remedy is a deliberate,
-    /// recorded gap — `UNIMPLEMENTED` is what makes it visible to a caller
-    /// instead of an empty list that looks like an answer.
+    /// List one user's live credentials, so the orphan a lost redemption
+    /// response leaves can be found and withdrawn. See
+    /// `list_credentials_inner` in `credential.rs` for the relay and its rules.
     async fn list_credentials(
         &self,
         req: Request<ListCredentialsRequest>,
@@ -146,8 +141,8 @@ impl IamService for Iam {
     ///
     /// **THE ACTOR IS RELAYED, AND THIS WAS THE FIRST SITE ON THIS SERVICE THAT
     /// DID.** `create_user` and `issue_enrolment` relay too since ledger 612, and
-    /// `revoke_all_credentials` since ADR-0945, so a reader grepping the field now
-    /// finds four — this paragraph records which one came first, not which one is
+    /// `revoke_all_credentials` since ADR-0945, and `revoke_credential` since
+    /// ledger 1627, so a reader grepping the field now finds five — this paragraph records which one came first, not which one is
     /// alone. ADR-0534's field is audit-only: it is
     /// asserted by the gateway, verified by nothing on the wire, and MUST NOT be an
     /// authorisation input. So it is forwarded exactly as received, and `None`

@@ -194,13 +194,6 @@ impl Iam {
         self.issue_enrolment_inner(req, call).await
     }
 
-    /// GATED BEFORE THE `UNIMPLEMENTED` ANSWER: a refused caller learns that it
-    /// is refused, not which verbs this build serves.
-    ///
-    /// INSTRUMENTED EVEN THOUGH IT REFUSES (D67). A handler that emits nothing
-    /// is indistinguishable from one nobody called, so an operator asking
-    /// whether anything has needed this RPC yet would read silence as an
-    /// answer. `fail` is what makes "asked for, and refused" countable.
     pub(super) async fn list_credentials_as(
         &self,
         caller: Option<&str>,
@@ -213,7 +206,7 @@ impl Iam {
             tel(request_id_of(&req), &req.get_ref().user_id),
         );
         let call = admitted(caller, call)?;
-        self.list_credentials_inner(call).await
+        self.list_credentials_inner(req, call).await
     }
 
     pub(super) async fn set_user_admin_as(
@@ -231,7 +224,8 @@ impl Iam {
         self.set_user_admin_inner(req, call).await
     }
 
-    /// Gated before the `UNIMPLEMENTED` answer, as [`Self::list_credentials_as`].
+    /// Gated before the `UNIMPLEMENTED` answer: a refused caller learns that it is
+    /// refused, not which verbs this build serves.
     pub(super) async fn set_rate_limit_override_as(
         &self,
         caller: Option<&str>,

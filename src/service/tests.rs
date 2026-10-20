@@ -76,14 +76,20 @@ struct Recorded {
     create_user: Vec<db::CreateUserRequest>,
     add_team_member: Vec<db::AddTeamMemberRequest>,
     remove_team_member: Vec<db::RemoveTeamMemberRequest>,
-    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and now one of four:
+    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and now one of five:
     /// `create_user` and `create_enrolment` above carry ADR-0534's actor too since
-    /// ledger 612, and `revoke_all_credentials` since ADR-0945. The five
-    /// administrative writes that still forward `unverified_actor: None` buy
-    /// nothing from a recorded request but the field list. On these four a
+    /// ledger 612, and `revoke_all_credentials` since ADR-0945 and
+    /// `revoke_credential` since ledger 1627. The four administrative writes
+    /// that still forward `unverified_actor: None` buy nothing from a recorded
+    /// request but the field list. On these five a
     /// hard-coded `None` answers `Ok` exactly like a working relay — so the
     /// forwarded request is the only oracle.
     set_user_admin: Vec<db::SetUserAdminRequest>,
+    /// `ListCredentials`, recorded BEFORE any scripted refusal, with the
+    /// request-id header each one carried (`None` when it carried none). An
+    /// EMPTY first vector is what says the store was never asked.
+    list_credentials: Vec<db::ListCredentialsRequest>,
+    list_request_ids: Vec<Option<String>>,
 }
 
 /// A stand-in for `iam-db`: answers from a fixed script and records the asking.
@@ -136,6 +142,11 @@ struct FakeDb {
     /// A `(code, message)` to fail `RevokeAllCredentials` with: `NOT_FOUND` is
     /// the store's answer for a user id with no `iam_user` row at all.
     revoke_all_fails: Option<(tonic::Code, &'static str)>,
+    /// What `ListCredentials` answers. The default is an EMPTY list, which is a
+    /// real answer of the store's: a user holding nothing live.
+    list_answer: db::ListCredentialsResponse,
+    /// A `(code, message)` to fail `ListCredentials` with.
+    list_fails: Option<(tonic::Code, &'static str)>,
     recorded: Arc<Mutex<Recorded>>,
 }
 
@@ -253,10 +264,22 @@ impl IamDbService for FakeDb {
 
     async fn list_credentials(
         &self,
-        _req: Request<db::ListCredentialsRequest>,
+        req: Request<db::ListCredentialsRequest>,
     ) -> Result<Response<db::ListCredentialsResponse>, Status> {
         self.asked();
-        Ok(Response::new(db::ListCredentialsResponse::default()))
+        let header = req
+            .metadata()
+            .get("x-yadgar-request-id")
+            .map(|v| v.to_str().unwrap_or_default().to_string());
+        {
+            let mut seen = self.recorded.lock().expect("recorded");
+            seen.list_request_ids.push(header);
+            seen.list_credentials.push(req.into_inner());
+        }
+        if let Some((code, message)) = self.list_fails {
+            return Err(Status::new(code, message));
+        }
+        Ok(Response::new(self.list_answer.clone()))
     }
 
     async fn set_user_admin(
@@ -1222,7 +1245,7 @@ async fn revoking_all_credentials_relays_the_key_the_user_and_the_actor() {
     // THE CONTRACT DEMANDS THIS RELAY (`iam.proto`, RevokeAllCredentialsRequest:
     // "relay the actor to `iam-db`"), and `iam-db`#94 reads the field.
     //
-    // MUTATION THIS CATCHES: `unverified_actor: None`, copied from the five sites
+    // MUTATION THIS CATCHES: `unverified_actor: None`, copied from the four sites
     // that still send it. It answers `Ok` and publishes, so the forwarded request
     // is the only oracle. The WHOLE request is compared, so a dropped key or a
     // rewritten user id is caught here too.
@@ -1621,7 +1644,8 @@ async fn the_promote_verb_relays_the_actor_the_caller_asserted() {
     // ADR-0534's RELAY, AND THIS WAS ITS FIRST SITE WITH A SOURCE. `create_user`
     // and `issue_enrolment` acquired one too (ledger 612) — those three are the
     // RPCs the gateway's administrative route reaches — and
-    // `revoke_all_credentials` relays because its contract requires it (ADR-0945). The five writes it does not
+    // `revoke_all_credentials` and `revoke_credential` relay because their
+    // contracts require it (ADR-0945, ledger 1627). The four writes it does not
     // reach still forward `unverified_actor: None` because nothing populates the
     // field there.
     //
@@ -2879,27 +2903,12 @@ fn an_absent_ca_is_a_deployment_and_an_empty_one_is_a_mistake() {
 
 // ---------------------------------------------------------------------------
 // What v1.6.0 added and this service still does NOT implement. `SetUserAdmin`
-// was a member until D73's promote verb was built; the two below are not.
+// and `ListCredentials` were members until they were built; the one below is not.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn the_unbuilt_rpcs_refuse_rather_than_answering() {
-    // MUTATION THIS CATCHES, and it is the one the doc-comment on
-    // `list_credentials` claims to prevent: returning
-    // `Ok(ListCredentialsResponse::default())`. An empty list is an ANSWER — it
-    // says this user holds no credentials — and the orphan a lost redemption
-    // response leaves is exactly what a caller would be looking for. Silence
-    // that reads as an answer is worse than a refusal.
     let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
-
-    let listed = iam
-        .list_credentials_as(
-            Some(GATEWAY_CALLER),
-            Request::new(ListCredentialsRequest::default()),
-        )
-        .await
-        .expect_err("ListCredentials is not built");
-    assert_eq!(listed.code(), tonic::Code::Unimplemented);
 
     let limit = iam
         .set_rate_limit_override_as(
@@ -4613,5 +4622,6 @@ async fn a_gateway_request_id_reaches_the_record_and_the_twin_unchanged() {
 
 // The caller gate (ADR-0972, ledger 1629): every RPC through the `_as` seam
 // and the trait methods, and the same gate through a real TLS listener.
+mod credentials;
 mod gate;
 mod gate_transport;

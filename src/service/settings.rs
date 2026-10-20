@@ -199,7 +199,7 @@ impl Iam {
             // is a source: the gateway's administrative route reaches `CreateUser`,
             // `IssueEnrolment` and `SetUserAdmin`, and this verb is not among them,
             // so relaying `r.unverified_actor` would move `None` and read as a
-            // relay that works. One of `issue_credential`'s five remaining relay
+            // relay that works. One of `issue_credential`'s four remaining `None`
             // sites; it becomes a one-line change the day a caller exists.
             //
             // THIS COMMENT PREVIOUSLY CLAIMED the upstream "still vendors v1.8.0

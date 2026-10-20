@@ -269,7 +269,7 @@ impl Iam {
             team_id: req.get_ref().team_id.clone(),
             user_id: req.get_ref().user_id.clone(),
             // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's five remaining relay sites.
+            // that comment's four remaining `None` sites.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
@@ -305,7 +305,7 @@ impl Iam {
             team_id: req.get_ref().team_id.clone(),
             user_id: req.get_ref().user_id.clone(),
             // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's five remaining relay sites.
+            // that comment's four remaining `None` sites.
             unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);

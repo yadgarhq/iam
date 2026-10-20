@@ -31,7 +31,7 @@ const CALLER_REFUSED_SERIES: &str = "yadgar_iam_caller_refused_total";
 const NOT_THE_GATEWAY: &str = "task-caller";
 
 /// The RPCs this build answers `UNIMPLEMENTED` without a hop to the twin.
-const NO_UPSTREAM: [&str; 2] = ["ListCredentials", "SetRateLimitOverride"];
+const NO_UPSTREAM: [&str; 1] = ["SetRateLimitOverride"];
 
 /// How a loop reaches the RPC.
 #[derive(Clone, Copy)]
