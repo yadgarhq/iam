@@ -4,7 +4,7 @@
 //! encrypted or hashed *here* before it crosses the storage boundary. The
 //! division is what makes a stolen database backup worthless on its own.
 //!
-//! **ONE MODULE, SEVEN FILES, SPLIT BY RPC AND NOT BY LAYER.** This file holds
+//! **ONE MODULE, EIGHT FILES, SPLIT BY RPC AND NOT BY LAYER.** This file holds
 //! what every handler needs — the [`Iam`] value, the request plumbing, the
 //! response floors, the enrolment configuration — and each submodule holds one
 //! group of RPCs together with the bounds and the validation that only those
@@ -18,7 +18,8 @@
 //! | [`admin`] | the administrative writes on a user and on a team |
 //! | [`settings`] | an inherited setting and a rate-limit override |
 //! | [`validate`] | the bounds on fields that appear in more than one request |
-//! | [`rpc`] | the `IamService` impl: contract docs, telemetry scope, dispatch |
+//! | [`rpc`] | the `IamService` impl: contract docs, and the caller handed on |
+//! | [`caller`] | the caller gate (ADR-0972): the `_as` seam, telemetry scope, floors |
 //!
 //! A BOUND STAYS WITH THE REQUEST IT WAS ARGUED FOR, which is ADR-0565's rule
 //! about re-arguing a bound per field, applied to where the bound lives. Only
@@ -42,6 +43,7 @@ use crate::pb::yadgar::iamdb::v1 as db;
 use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
 
 mod admin;
+pub mod caller;
 mod credential;
 mod enrolment;
 mod login;

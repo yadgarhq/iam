@@ -8,6 +8,15 @@
 //! that shape for a different reason — their wrappers hold the response-time
 //! floor — and every other handler now takes it too, uniformly, so that
 //! which RPC delegates says nothing about the RPC.
+//!
+//! **EVERY HANDLER IS ONE LINE NOW, AND THE LINE IS THE CALLER GATE'S SEAM**
+//! (ADR-0972 (1), ledger 1629). It reads the verified client leaf's common name
+//! BEFORE anything consumes the request — the peer chain lives on its
+//! extensions — and hands it to the RPC's `_as` method in [`super::caller`],
+//! which opens the `Call`, admits only the gateway, and then does the work.
+//! The `Call`, the telemetry scope and the response floors moved there with it.
+
+use yadgar_lifecycle::serve_tls::caller_common_name;
 
 use super::*;
 
@@ -22,9 +31,8 @@ impl IamService for Iam {
         &self,
         req: Request<ResolveCredentialRequest>,
     ) -> Result<Response<ResolveCredentialResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "ResolveCredential", Kind::Read, tel(rid, ""));
-        self.resolve_credential_inner(req, call).await
+        self.resolve_credential_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Username and password to a long-lived token. The one sign-in a person
@@ -34,18 +42,8 @@ impl IamService for Iam {
     /// the failure path — see `Iam::hold_until_floor` for why it is one rule with
     /// no branch, and `crypto::Keys::verify_password` for the leak it closes.
     async fn login(&self, req: Request<LoginRequest>) -> Result<Response<LoginResponse>, Status> {
-        // THE CLOCK STARTS BEFORE ANYTHING ELSE, and the answer is computed to
-        // completion before a single byte of it is returned. Flooring the whole
-        // handler is what makes the round trips to `iam-db` — one on every path,
-        // a second on the success path — part of what the floor covers rather
-        // than a residual outside it.
-        let started = Instant::now();
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "Login", Kind::Write, tel(rid.clone(), ""));
-        let answered = self.login_inner(req, call).await;
-        self.hold_until_floor(self.login_floor, started.elapsed())
-            .await;
-        answered
+        self.login_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// An enrolment secret and a chosen password to a credential (D73).
@@ -72,16 +70,8 @@ impl IamService for Iam {
         &self,
         req: Request<RedeemEnrolmentRequest>,
     ) -> Result<Response<RedeemEnrolmentResponse>, Status> {
-        // THE CLOCK STARTS BEFORE ANYTHING ELSE, and the answer is computed to
-        // completion before a byte of it is returned — the round trips to
-        // `iam-db` included, which is where the difference this hides arises.
-        let started = Instant::now();
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "RedeemEnrolment", Kind::Write, tel(rid, ""));
-        let answered = self.redeem_inner(req, call).await;
-        self.hold_until_floor(self.redeem_floor, started.elapsed())
-            .await;
-        answered
+        self.redeem_enrolment_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Mint the enrolment an admin hands to a person (D73).
@@ -126,14 +116,8 @@ impl IamService for Iam {
         &self,
         req: Request<IssueEnrolmentRequest>,
     ) -> Result<Response<IssueEnrolmentResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "IssueEnrolment",
-            Kind::Write,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.issue_enrolment_inner(req, call).await
+        self.issue_enrolment_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// NOT IMPLEMENTED IN THIS CHANGE, and named rather than silently absent.
@@ -148,18 +132,8 @@ impl IamService for Iam {
         &self,
         req: Request<ListCredentialsRequest>,
     ) -> Result<Response<ListCredentialsResponse>, Status> {
-        // INSTRUMENTED EVEN THOUGH IT REFUSES (D67). A handler that emits
-        // nothing is indistinguishable from one nobody called, so an operator
-        // asking whether anything has needed this RPC yet would read silence as
-        // an answer. `fail` is what makes "asked for, and refused" countable.
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "ListCredentials",
-            Kind::Read,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.list_credentials_inner(call).await
+        self.list_credentials_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Set or clear D73's admin flag, and publish the invalidation.
@@ -217,14 +191,8 @@ impl IamService for Iam {
         &self,
         req: Request<SetUserAdminRequest>,
     ) -> Result<Response<SetUserAdminResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "SetUserAdmin",
-            Kind::Write,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.set_user_admin_inner(req, call).await
+        self.set_user_admin_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// NOT IMPLEMENTED IN THIS CHANGE. D74's overrides are contract surface this
@@ -233,14 +201,8 @@ impl IamService for Iam {
         &self,
         req: Request<SetRateLimitOverrideRequest>,
     ) -> Result<Response<SetRateLimitOverrideResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "SetRateLimitOverride",
-            Kind::Write,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.set_rate_limit_override_inner(call).await
+        self.set_rate_limit_override_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Write ONE LEVEL of ADR-0522's inheritable setting: validate here, store
@@ -281,23 +243,16 @@ impl IamService for Iam {
         &self,
         req: Request<SetInheritedSettingRequest>,
     ) -> Result<Response<SetInheritedSettingResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "SetInheritedSetting", Kind::Write, tel(rid, ""));
-        self.set_inherited_setting_inner(req, call).await
+        self.set_inherited_setting_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     async fn issue_credential(
         &self,
         req: Request<IssueCredentialRequest>,
     ) -> Result<Response<IssueCredentialResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "IssueCredential",
-            Kind::Write,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.issue_credential_inner(req, call).await
+        self.issue_credential_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Revoke, and publish the invalidation.
@@ -313,9 +268,8 @@ impl IamService for Iam {
         &self,
         req: Request<RevokeCredentialRequest>,
     ) -> Result<Response<RevokeCredentialResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "RevokeCredential", Kind::Write, tel(rid, ""));
-        self.revoke_credential_inner(req, call).await
+        self.revoke_credential_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Revoke every live credential one user holds, and publish the eviction
@@ -329,32 +283,24 @@ impl IamService for Iam {
         &self,
         req: Request<RevokeAllCredentialsRequest>,
     ) -> Result<Response<RevokeAllCredentialsResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "RevokeAllCredentials", Kind::Write, tel(rid, ""));
-        self.revoke_all_credentials_inner(req, call).await
+        self.revoke_all_credentials_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     async fn create_user(
         &self,
         req: Request<CreateUserRequest>,
     ) -> Result<Response<CreateUserResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(SERVICE, "CreateUser", Kind::Write, tel(rid, ""));
-        self.create_user_inner(req, call).await
+        self.create_user_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     async fn add_team_member(
         &self,
         req: Request<AddTeamMemberRequest>,
     ) -> Result<Response<AddTeamMemberResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "AddTeamMember",
-            Kind::Write,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.add_team_member_inner(req, call).await
+        self.add_team_member_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 
     /// Removing a member narrows what that user can see, so the cached identity
@@ -363,13 +309,7 @@ impl IamService for Iam {
         &self,
         req: Request<RemoveTeamMemberRequest>,
     ) -> Result<Response<RemoveTeamMemberResponse>, Status> {
-        let rid = request_id_of(&req);
-        let call = Call::start(
-            SERVICE,
-            "RemoveTeamMember",
-            Kind::Write,
-            tel(rid, &req.get_ref().user_id),
-        );
-        self.remove_team_member_inner(req, call).await
+        self.remove_team_member_as(caller_common_name(&req).as_deref(), req)
+            .await
     }
 }
