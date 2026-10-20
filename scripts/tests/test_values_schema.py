@@ -579,17 +579,73 @@ def test_tls_enabled_true_renders_the_variable_unconditionally():
     assert env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "1"'
 
 
-def test_tls_enabled_false_renders_without_the_client_auth_variable():
-    """ADR-0974: with `tls.enabled` false the chart neither validates nor
-    renders `tls.clientAuth`. `chart/ci/values.yaml` states `required`, and
-    that cleartext render passes with no `LISTEN_TLS_CLIENT_AUTH` env, so the
-    binary sees no client certificate name and refuses every RPC (ADR-0972).
-    This is the D80 all-off shape."""
+def test_tls_enabled_false_renders_the_variable_too_rather_than_omitting_it():
+    """The chart says "0" OUT LOUD now, because the binary refuses an absent
+    value (ADR-0845). ADR-0975: `chart/ci/values.yaml` states `required`, and
+    with TLS off the chart ignores it and renders the constant "off" for
+    `LISTEN_TLS_CLIENT_AUTH` (the binary refuses it absent, and refuses any
+    other value beside a cleartext listener). This is the D80 all-off shape."""
     result = render(CHART, "--set", "tls.enabled=false")
     assert result.returncode == 0, result.stderr
     assert env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
-    assert "- name: LISTEN_TLS_CLIENT_AUTH" not in result.stdout
-    assert "- name: LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+    assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+    assert "LISTEN_TLS_CERT_FILE" not in result.stdout
+    assert "LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
+
+
+def test_both_switches_false_render_both_variables_as_zero():
+    """K-1's own 0/1 case, over BOTH switches this chart carries."""
+    result = render(CHART, "--set", "tls.enabled=false", "--set", "iamDb.tls.enabled=false")
+    assert result.returncode == 0, result.stderr
+    assert env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
+    assert env_value(result.stdout, "IAM_DB_TLS_ENABLED") == 'value: "0"'
+    assert env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") == 'value: "off"'
+
+
+# ADR-0975, THE GUARD: lifecycle `ServerTls::from_lookup` reads
+# `LISTEN_TLS_CLIENT_AUTH` unconditionally. Absent it refuses to boot
+# (`ClientAuthMissing`), and any value but "off" beside a cleartext listener
+# refuses too (`ClientAuthWithoutTls`). So with TLS off EVERY user value,
+# including none, renders the constant "off".
+CLEARTEXT_CLIENT_AUTH_SHAPES = (
+    ("off", 'tls: {enabled: false, clientAuth: "off"}\n'),
+    ("required", 'tls: {enabled: false, clientAuth: "required"}\n'),
+    ("optional", 'tls: {enabled: false, clientAuth: "optional"}\n'),
+    ("bogus", 'tls: {enabled: false, clientAuth: "bogus"}\n'),
+    ("wrong-case", 'tls: {enabled: false, clientAuth: "Required"}\n'),
+    ("unquoted-off", "tls: {enabled: false, clientAuth: off}\n"),
+    ("number", "tls: {enabled: false, clientAuth: 3}\n"),
+    ("list", "tls: {enabled: false, clientAuth: [required]}\n"),
+    ("null", "tls: {enabled: false, clientAuth: null}\n"),
+    ("required-no-ca", 'tls: {enabled: false, clientAuth: "required", clientCaSecret: ""}\n'),
+)
+
+
+def test_with_tls_off_every_client_auth_value_renders_the_constant_off(tmp_path):
+    """MUTATION: moving the env var back under `{{- if .Values.tls.enabled }}`
+    turns every row red, and so does rendering the user's value on the cleartext
+    side."""
+    failures = []
+    for label, body in CLEARTEXT_CLIENT_AUTH_SHAPES:
+        overlay = values_file(tmp_path / f"{label}.yaml", body)
+        result = render(CHART, "--values", str(overlay))
+        if result.returncode != 0:
+            failures.append(f"{label}: refused: {result.stderr.strip()[:200]}")
+            continue
+        if env_value(result.stdout, "LISTEN_TLS_CLIENT_AUTH") != 'value: "off"':
+            failures.append(f"{label}: did not render the constant off")
+        if "- name: LISTEN_TLS_CLIENT_CA_FILE" in result.stdout:
+            failures.append(f"{label}: rendered a client CA beside a cleartext listener")
+    assert failures == [], "\n".join(failures)
+
+
+def test_with_tls_off_the_schema_still_requires_the_client_auth_key():
+    """The key stays in `tls.required`, so deleting it is a schema refusal even
+    with TLS off. That is the one shape the constant cannot cover."""
+    result = bare("--set", "tls.enabled=false", "--set", "iamDb.tls.enabled=false",
+                  "--set", "nats.tls.enabled=false")
+    assert result.returncode != 0
+    assert SCHEMA_WRAPPER in result.stderr and "clientAuth" in result.stderr, result.stderr
 
 
 def test_iam_db_switch_false_renders_its_variable_as_zero():
@@ -835,18 +891,6 @@ def test_client_auth_off_is_refused_by_name(tmp_path):
         assert SCHEMA_WRAPPER not in result.stderr, result.stderr
 
 
-def test_client_auth_off_with_tls_off_still_renders(tmp_path):
-    """ADR-0974: `off` beside a cleartext listener renders, with no
-    `LISTEN_TLS_CLIENT_AUTH` env. MUTATION: moving the off arm outside the
-    `tls.enabled` gate turns this red."""
-    overlay = values_file(tmp_path / "off-cleartext.yaml", 'tls: {enabled: false, clientAuth: "off"}\n')
-    result = render(CHART, "--values", str(overlay))
-    assert result.returncode == 0, result.stderr
-    assert env_value(result.stdout, "LISTEN_TLS_ENABLED") == 'value: "0"'
-    assert "- name: LISTEN_TLS_CLIENT_AUTH" not in result.stdout
-    assert "- name: LISTEN_TLS_CLIENT_CA_FILE" not in result.stdout
-
-
 def test_client_auth_off_is_refused_by_name_over_bare_switches():
     """The same refusal with no `chart/ci/values.yaml` behind it, over the
     switches alone: what an adopter who writes `off` gets."""
@@ -886,26 +930,6 @@ def test_optional_and_required_render_with_tls_and_a_ca_secret(tmp_path):
         assert "path: ca.crt" in result.stdout
 
 
-def test_a_verifying_mode_with_tls_off_renders_without_the_variable(tmp_path):
-    """ADR-0974 REPLACES the cleartext refusal: `optional` and `required` beside
-    `tls.enabled: false` render, with no `LISTEN_TLS_CLIENT_AUTH`."""
-    for mode in ("optional", "required"):
-        overlay = values_file(
-            tmp_path / f"{mode}-cleartext.yaml",
-            {
-                "tls": {
-                    "enabled": False,
-                    "clientAuth": mode,
-                    "clientCaSecret": "iam-client-ca",
-                    "clientCaSecretKey": "ca.crt",
-                }
-            },
-        )
-        result = render(CHART, "--values", str(overlay))
-        assert result.returncode == 0, f"clientAuth: {mode} with tls off must render: {result.stderr}"
-        assert "- name: LISTEN_TLS_CLIENT_AUTH" not in result.stdout
-
-
 def test_a_verifying_mode_without_a_ca_secret_is_refused_by_name(tmp_path):
     """An absent and an empty `clientCaSecret` are the same deployment. Rendered
     BARE: `chart/ci/values.yaml` names a CA, and would fill in an absent one."""
@@ -937,9 +961,21 @@ def test_client_ca_secret_renders_its_env_mount_and_item_only_when_named(tmp_pat
     assert "secretName: iam-client-ca" in result.stdout
 
 
+def test_client_ca_secret_empty_string_renders_nothing(tmp_path):
+    """`""` is falsy, so the CA env, mount and volume all stay absent, never a
+    `secretName: ""` (TLS off, so no CA check applies, ADR-0975)."""
+    overlay = values_file(
+        tmp_path / "ca-empty.yaml", 'tls: {enabled: false, clientAuth: "required", clientCaSecret: ""}\n'
+    )
+    result = render(CHART, "--values", str(overlay))
+    assert result.returncode == 0, result.stderr
+    for absent in ("- name: LISTEN_TLS_CLIENT_CA_FILE", "secretName: \"\""):
+        assert absent not in result.stdout
+
+
 def test_client_ca_secret_with_tls_off_renders_no_ca(tmp_path):
     """The CA env, mount and volume stay nested under `tls.enabled`: a
-    cleartext listener reads no CA, so none is mounted (ADR-0974)."""
+    cleartext listener reads no CA, so none is mounted (ADR-0975)."""
     overlay = values_file(
         tmp_path / "ca-cleartext.yaml",
         'tls: {enabled: false, clientAuth: "required", clientCaSecret: iam-client-ca, '

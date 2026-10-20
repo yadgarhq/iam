@@ -187,11 +187,13 @@ refuses the same shape), and a verifying mode with no `tls.clientCaSecret`
 render). Absent and `""` are the same deployment for the Secret.
 */}}
 {{/*
-ADR-0974: WITH `tls.enabled` FALSE THIS CHART DOES NOT VALIDATE OR RENDER
-`tls.clientAuth` AT ALL. A cleartext listener carries no client certificate, so
-the binary sees no name and refuses every RPC (ADR-0972): validating the mode
-there protects nothing, and the D80 all-off render needs it to render. Every
-check below therefore sits inside `tls.enabled`.
+ADR-0975: WITH `tls.enabled` FALSE THIS CHART DOES NOT VALIDATE
+`tls.clientAuth`, and `templates/deployment.yaml` renders the CONSTANT "off"
+for it. A cleartext listener carries no client certificate, so the binary sees
+no name and refuses every RPC (ADR-0972); the binary also refuses any other
+value beside a cleartext listener, and refuses it absent, hence the constant.
+The D80 all-off render needs this to render. Every check below therefore sits
+inside `tls.enabled`.
 */}}
 {{- if .Values.tls.enabled }}
 {{- if not (and (kindIs "map" .Values.tls) (hasKey .Values.tls "clientAuth") (kindIs "string" .Values.tls.clientAuth)) }}
@@ -204,10 +206,10 @@ check below therefore sits inside `tls.enabled`.
 {{- fail (printf "iam: tls.clientAuth is %q, which is not off, optional or required." .Values.tls.clientAuth) }}
 {{- end }}
 {{/*
-K1 (ADR-0972, ADR-0974): `"off"` IS REFUSED (TLS IS ON HERE). iam gates every verb on the
+K1 (ADR-0972, ADR-0975): `"off"` IS REFUSED (TLS IS ON HERE). iam gates every verb on the
 caller's certificate name, and `"off"` verifies no caller, so no name reaches
 the gate and every RPC is refused at runtime. The refusal moves that outage to
-the render. With `tls.enabled` false none of this runs (ADR-0974, see above).
+the render. With `tls.enabled` false none of this runs (ADR-0975, see above).
 */}}
 {{- if eq .Values.tls.clientAuth "off" }}
 {{- fail (join "" (list

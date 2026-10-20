@@ -78,13 +78,15 @@ tls:
   # extending ADR-0845; B-U5). A quoted string: `"off"`, `"optional"` or
   # `"required"` (YAML reads a bare off as false, which is refused by name). It
   # renders `LISTEN_TLS_CLIENT_AUTH` whether `enabled` is true or false, because
-  # the binary refuses to boot without it either way. `"off"` is REFUSED at
-  # render (K1, ADR-0972): it verifies no caller, and iam admits a caller by the
-  # name in its client certificate. `"optional"` verifies a certificate a
-  # caller presents and serves one that presents none — a staging step, not a
-  # control; `"required"`
-  # refuses every caller without a certificate the authority below signed.
-  # `optional` and `required` need `enabled: true`.
+  # the binary refuses to boot without it either way. With `enabled: true`,
+  # `"off"` is REFUSED at render (K1, ADR-0972): it verifies no caller, and iam
+  # admits a caller by the name in its client certificate. With `enabled: false`
+  # the chart IGNORES this value, does not validate it, and renders the constant
+  # `"off"` (ADR-0975): the cleartext listener boots, sees no client certificate
+  # name, and refuses every RPC. `"optional"` verifies a certificate a caller
+  # presents and serves one that presents none — a staging step, not a control;
+  # `"required"` refuses every caller without a certificate the authority below
+  # signed. `optional` and `required` need `enabled: true`.
   #
   # `clientCaSecret` / `clientCaSecretKey` — the Secret, and the key inside
   # it, holding the authority callers' certificates are verified against.
