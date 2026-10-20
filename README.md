@@ -89,8 +89,9 @@ Two residuals are accepted rather than hidden, and both are in the contract:
 
 - A retry mints a **fresh** credential, because a token shown once and kept as a
   hash cannot be replayed. Every attempt but the last leaves an orphan.
-  `ListCredentials` exists to find those and is **not implemented yet** — until
-  it is, an orphan is reachable only in the store.
+  `ListCredentials` finds those: it relays to `iam-db`, omits revoked rows and
+  returns expired ones. No gateway route reaches it yet, so an orphan is
+  reachable only through a direct `iam` call until that route ships.
 - A **replayed `IssueEnrolment` key mints a second, live enrolment.** `iam-db`'s
   `iam_enrolment` table carries no idempotency column, and `CreateEnrolment`
   discards the key it is handed rather than comparing against it — so a retry,
