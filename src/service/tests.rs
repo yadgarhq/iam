@@ -620,7 +620,7 @@ async fn an_unknown_username_still_costs_a_full_argon2_verification() {
 
     let before = argon2_verifications();
     let err = iam
-        .login_as(Some(GATEWAY_CALLER), login("nobody", "hunter2"))
+        .login_as(Some(GATEWAY_CALLER), login("nobody", &fixture_password()))
         .await
         .expect_err("an unknown username must not authenticate");
     let spent = argon2_verifications() - before;
@@ -644,6 +644,7 @@ async fn a_failed_login_issues_no_credential() {
     // the dummy verification SUCCEEDS — which is what makes the bypass reachable
     // here at all. Any other password fails against the dummy on its own and the
     // assertion below would hold with `stored.is_some()` already deleted.
+    let wrong = fixture_password();
     for (name, fake, password) in [
         ("unknown username", FakeDb::default(), "x"),
         (
@@ -652,7 +653,7 @@ async fn a_failed_login_issues_no_credential() {
                 password: known_user("correct horse"),
                 ..Default::default()
             },
-            "wrong horse",
+            &wrong,
         ),
     ] {
         let (iam, recorded, _inv) = iam_with(fake).await;
@@ -681,7 +682,7 @@ async fn wrong_password_and_unknown_username_are_byte_identical() {
     // message of its own, e.g. "no such user".
     let (iam, _r, _i) = iam_with(FakeDb::default()).await;
     let unknown = iam
-        .login_as(Some(GATEWAY_CALLER), login("nobody", "hunter2"))
+        .login_as(Some(GATEWAY_CALLER), login("nobody", &fixture_password()))
         .await
         .unwrap_err();
 
@@ -691,7 +692,7 @@ async fn wrong_password_and_unknown_username_are_byte_identical() {
     })
     .await;
     let wrong = iam
-        .login_as(Some(GATEWAY_CALLER), login("max", "wrong horse"))
+        .login_as(Some(GATEWAY_CALLER), login("max", &fixture_password()))
         .await
         .unwrap_err();
 
@@ -709,14 +710,15 @@ async fn the_token_returned_is_the_one_that_was_stored() {
     // MUTATION THIS CATCHES: minting twice — hashing one token and returning
     // another. Every credential issued would then be unresolvable, and no test
     // that only checks "a token came back" can tell.
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with(FakeDb {
-        password: known_user("correct horse"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
 
     let out = iam
-        .login_as(Some(GATEWAY_CALLER), login("max", "correct horse"))
+        .login_as(Some(GATEWAY_CALLER), login("max", &password))
         .await
         .expect("a correct password logs in")
         .into_inner();
@@ -776,33 +778,31 @@ async fn every_login_path_takes_at_least_the_floor() {
     // handler, the real Argon2 work, the real round trips to the twin.
     const FLOOR: Duration = Duration::from_millis(400);
 
+    let correct = fixture_password();
+    let wrong = fixture_password();
+    let unknown = fixture_password();
     for (name, fake, username, password) in [
         // The divergence itself: real Argon2 work, at a cost that answers in
         // microseconds.
         (
             "a cheap stored hash",
             FakeDb {
-                password: cheap_user("correct horse"),
+                password: cheap_user(&correct),
                 ..Default::default()
             },
             "max",
-            "wrong horse",
+            &wrong,
         ),
         // The dummy, at this build's cost.
-        (
-            "an unknown username",
-            FakeDb::default(),
-            "nobody",
-            "hunter2",
-        ),
+        ("an unknown username", FakeDb::default(), "nobody", &unknown),
         (
             "a default-cost stored hash",
             FakeDb {
-                password: known_user("correct horse"),
+                password: known_user(&correct),
                 ..Default::default()
             },
             "max",
-            "wrong horse",
+            &wrong,
         ),
         // THE SUCCESS PATH IS FLOORED TOO. Not because a successful login is
         // ambiguous — it answers with a token, which is as distinguishable as a
@@ -812,11 +812,11 @@ async fn every_login_path_takes_at_least_the_floor() {
         (
             "a successful login",
             FakeDb {
-                password: known_user("correct horse"),
+                password: known_user(&correct),
                 ..Default::default()
             },
             "max",
-            "correct horse",
+            &correct,
         ),
     ] {
         let (iam, _rec, _inv) = iam_with_floor(fake, FLOOR).await;
@@ -1021,9 +1021,10 @@ async fn a_login_slower_than_the_floor_answers_normally_and_warns() {
     // involved: the gap is the oracle.
     const FLOOR: Duration = Duration::from_millis(1);
 
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with_floor(
         FakeDb {
-            password: known_user("correct horse"),
+            password: known_user(&password),
             ..Default::default()
         },
         FLOOR,
@@ -1031,7 +1032,7 @@ async fn a_login_slower_than_the_floor_answers_normally_and_warns() {
     .await;
 
     let out = iam
-        .login_as(Some(GATEWAY_CALLER), login("max", "correct horse"))
+        .login_as(Some(GATEWAY_CALLER), login("max", &password))
         .await
         .expect("EXCEEDING THE FLOOR IS NOT AN ERROR — a slow verification is still a correct one")
         .into_inner();
@@ -1096,7 +1097,7 @@ async fn a_login_inside_the_floor_warns_about_nothing() {
     .await;
 
     let _ = iam
-        .login_as(Some(GATEWAY_CALLER), login("max", "wrong horse"))
+        .login_as(Some(GATEWAY_CALLER), login("max", &fixture_password()))
         .await;
 
     assert_eq!(
@@ -2127,17 +2128,21 @@ async fn an_unknown_enrolment_secret_costs_the_same_argon2_work_as_a_valid_one()
     //
     // Both paths are driven on ONE thread, which the counter's thread-local
     // storage requires — see the note on NOMINAL_FLOOR.
+    let password = fixture_password();
     let (iam, _rec, _inv) = iam_with(FakeDb {
         redeem: redeemed("ada"),
-        password: known_user("chosen one"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
 
     let before = argon2_verifications();
-    iam.redeem_enrolment_as(Some(GATEWAY_CALLER), redeem("s3cret", "chosen one", "k1"))
-        .await
-        .expect("a valid secret redeems");
+    iam.redeem_enrolment_as(
+        Some(GATEWAY_CALLER),
+        redeem(&fixture_secret(), &password, "k1"),
+    )
+    .await
+    .expect("a valid secret redeems");
     let valid = argon2_verifications() - before;
 
     let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
@@ -2146,7 +2151,7 @@ async fn an_unknown_enrolment_secret_costs_the_same_argon2_work_as_a_valid_one()
     let err = iam
         .redeem_enrolment_as(
             Some(GATEWAY_CALLER),
-            redeem("not a secret", "chosen one", "k2"),
+            redeem(&fixture_secret(), &password, "k2"),
         )
         .await
         .expect_err("an unknown secret must not redeem");
@@ -2188,7 +2193,10 @@ async fn unknown_spent_and_expired_are_one_refusal() {
         .await;
 
         let err = iam
-            .redeem_enrolment_as(Some(GATEWAY_CALLER), redeem("s3cret", "chosen one", "k1"))
+            .redeem_enrolment_as(
+                Some(GATEWAY_CALLER),
+                redeem(&fixture_secret(), &fixture_password(), "k1"),
+            )
             .await
             .expect_err("none of the three redeems");
 
@@ -2261,7 +2269,10 @@ async fn a_redeemed_key_and_an_unredeemed_one_refuse_identically() {
     })
     .await;
     let redeemed_key = iam
-        .redeem_enrolment_as(Some(GATEWAY_CALLER), redeem(garbage, "chosen one", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(garbage, &fixture_password(), "k1"),
+        )
         .await
         .expect_err("a key already spent on another secret does not redeem");
 
@@ -2271,7 +2282,10 @@ async fn a_redeemed_key_and_an_unredeemed_one_refuse_identically() {
     })
     .await;
     let unredeemed_key = iam
-        .redeem_enrolment_as(Some(GATEWAY_CALLER), redeem(garbage, "chosen one", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(garbage, &fixture_password(), "k1"),
+        )
         .await
         .expect_err("an unknown secret does not redeem either");
 
@@ -2417,7 +2431,7 @@ async fn a_key_replayed_with_a_different_password_is_refused() {
     let err = iam
         .redeem_enrolment_as(
             Some(GATEWAY_CALLER),
-            redeem("s3cret", "a second password", "k1"),
+            redeem(&fixture_secret(), &fixture_password(), "k1"),
         )
         .await
         .expect_err("a key reused with a different password is refused");
@@ -2443,9 +2457,10 @@ async fn a_redemption_returns_the_username_and_the_credential_the_store_holds() 
     // MUTATION THIS CATCHES: returning `user_id` in its place, or leaving it
     // empty. Both look like a successful redemption and leave the person unable
     // to log in afterwards.
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with(FakeDb {
         redeem: redeemed("Ada Lovelace"),
-        password: known_user("chosen one"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
@@ -2453,7 +2468,7 @@ async fn a_redemption_returns_the_username_and_the_credential_the_store_holds() 
     let out = iam
         .redeem_enrolment_as(
             Some(GATEWAY_CALLER),
-            redeem("s3cret", "chosen one", "attempt-1"),
+            redeem(&fixture_secret(), &password, "attempt-1"),
         )
         .await
         .expect("a valid secret redeems")
@@ -2561,6 +2576,7 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
     // second thing to tune.
     const FLOOR: Duration = Duration::from_secs(10);
 
+    let password = fixture_password();
     for (name, fake) in [
         ("an unknown secret", FakeDb::default()),
         (
@@ -2590,7 +2606,7 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
             "a successful redemption",
             FakeDb {
                 redeem: redeemed("ada"),
-                password: known_user("chosen one"),
+                password: known_user(&password),
                 ..Default::default()
             },
         ),
@@ -2599,7 +2615,10 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
 
         let t0 = tokio::time::Instant::now();
         let _ = iam
-            .redeem_enrolment_as(Some(GATEWAY_CALLER), redeem("s3cret", "chosen one", "k1"))
+            .redeem_enrolment_as(
+                Some(GATEWAY_CALLER),
+                redeem(&fixture_secret(), &password, "k1"),
+            )
             .await;
         let held = t0.elapsed();
 
@@ -2657,10 +2676,11 @@ async fn a_redemption_slower_than_the_floor_answers_normally_and_warns() {
     // the oracle.
     const FLOOR: Duration = Duration::from_millis(1);
 
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with_redeem_floor(
         FakeDb {
             redeem: redeemed("ada"),
-            password: known_user("chosen one"),
+            password: known_user(&password),
             ..Default::default()
         },
         FLOOR,
@@ -2668,7 +2688,10 @@ async fn a_redemption_slower_than_the_floor_answers_normally_and_warns() {
     .await;
 
     let out = iam
-        .redeem_enrolment_as(Some(GATEWAY_CALLER), redeem("s3cret", "chosen one", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &password, "k1"),
+        )
         .await
         .expect("EXCEEDING THE FLOOR IS NOT AN ERROR — a slow redemption is still a correct one")
         .into_inner();
@@ -4191,14 +4214,18 @@ fn the_outcome_of_a_name_refusal_is_one_the_shared_mapping_produces() {
 /// everything, so an EMPTY vector is the only thing that says the refusal landed
 /// before the secret was spent rather than after.
 async fn redeem_with_key(key: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let password = fixture_password();
     let (iam, rec, _inv) = iam_with(FakeDb {
         redeem: redeemed("ada"),
-        password: known_user("chosen one"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
     let answered = iam
-        .redeem_enrolment_as(Some(GATEWAY_CALLER), redeem("s3cret", "chosen one", key))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &password, key),
+        )
         .await
         .map(|_| ());
     (answered, rec)
