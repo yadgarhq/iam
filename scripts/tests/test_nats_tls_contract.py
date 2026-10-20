@@ -36,7 +36,15 @@ NOT_BOOL = "iam: nats.tls.enabled must be set to true or false; it renders NATS_
 # (ADR-0854, B-U5), so only `nats.tls` is under test. Stated here rather than
 # read from `chart/ci/values.yaml`, because that file states `nats.tls.enabled`
 # too and the ABSENT case must not see it.
-SWITCHES = {"tls": {"enabled": True, "clientAuth": "off"}, "iamDb": {"tls": {"enabled": True}}}
+SWITCHES = {
+    "tls": {
+        "enabled": True,
+        "clientAuth": "required",
+        "clientCaSecret": "iam-tls",
+        "clientCaSecretKey": "ca.crt",
+    },
+    "iamDb": {"tls": {"enabled": True}},
+}
 
 
 def overlay(tmp_path: Path, nats_tls=..., **nats) -> Path:
