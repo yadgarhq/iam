@@ -567,6 +567,7 @@ async fn every_non_ok_status_is_not_passed_and_the_permanent_ones_are_named() {
         tonic::Code::Unimplemented,
         tonic::Code::FailedPrecondition,
         tonic::Code::InvalidArgument,
+        tonic::Code::PermissionDenied,
     ] {
         let asked = never_passes_and_never_exits(Script {
             get: vec![Answer::Failed(code)],
@@ -582,6 +583,66 @@ async fn every_non_ok_status_is_not_passed_and_the_permanent_ones_are_named() {
             "{code:?} cannot be mended by a retry, so an operator must be told"
         );
     }
+}
+
+/// **`PERMISSION_DENIED` IS IAM-DB'S CALLER GATE, NOT AN OUTAGE (ADR-0972).**
+/// iam-db admits only `iam-caller`; a pod presenting any other leaf is refused
+/// on every verb, and no retry mends a misissued certificate. Left in the
+/// catch-all it read "the twin did not answer" at WARN, sending an operator
+/// after a network fault that does not exist.
+///
+/// THE ASSERTIONS THAT REDDEN: deleting the arm (`is_permanent()` false, and
+/// the reason names no gate); a reason that drops the admitted name.
+#[test]
+fn permission_denied_is_a_permanent_unverified_that_names_the_caller_gate() {
+    let unverified = Unverified::of_status(tonic::Code::PermissionDenied);
+    assert!(
+        unverified.is_permanent(),
+        "a misissued leaf is mended by a reissue, never by a retry"
+    );
+    assert!(
+        unverified.reason.contains("caller gate"),
+        "the reason names the cause: {:?}",
+        unverified.reason
+    );
+    assert!(
+        unverified.reason.contains("iam-caller"),
+        "the reason names the one caller iam-db admits: {:?}",
+        unverified.reason
+    );
+}
+
+/// **A GATE REFUSAL ON THE READ STAYS `NotYet`, NEVER `Refused`, AND REACHES
+/// AN OPERATOR AT ERROR.** The key identity is UNVERIFIED, not MISMATCHED, so
+/// iam must not stop on it: it stays Ready and keeps asking, and the ERROR
+/// line names the cause.
+///
+/// THE ASSERTIONS THAT REDDEN: mapping the code to `Step::Refused` ends the
+/// serve (the helper's timeout); a transient classification logs at WARN
+/// (`line.error`); recording on it writes a marker (`set.is_empty()`).
+#[tokio::test]
+async fn a_key_identity_read_refused_by_the_gate_stays_not_yet_and_never_refused() {
+    crate::service::tests::warnings_from_here();
+    let asked = never_passes_and_never_exits(Script {
+        get: vec![Answer::Failed(tonic::Code::PermissionDenied)],
+        ..Default::default()
+    })
+    .await;
+    assert!(asked.get.len() > 1, "a gate refusal is retried, not passed");
+    assert!(
+        asked.set.is_empty(),
+        "a refused read is not an absent marker; nothing may be recorded on it"
+    );
+
+    let lines = told_about(Unverified::of_status(tonic::Code::PermissionDenied).reason);
+    assert!(
+        !lines.is_empty(),
+        "an operator is told about a gate refusal"
+    );
+    assert!(
+        lines.iter().all(|line| line.error),
+        "a gate refusal no retry mends is an ERROR: {lines:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
