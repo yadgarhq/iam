@@ -28,6 +28,7 @@ use super::*;
 // The bounds and the checks that apply them moved out of `service.rs` and in
 // beside the RPC each belongs to; `use super::*` reaches the module root alone,
 // so the few this file names are imported by name.
+use super::caller::GATEWAY_CALLER;
 use super::credential::MAX_EXPIRES_IN_SECONDS;
 use crate::crypto::argon2_verifications;
 use crate::invalidate::subject;
@@ -37,6 +38,13 @@ use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbSer
 /// Everything the fake twin was asked to do.
 #[derive(Default)]
 struct Recorded {
+    /// **EVERY ARM, COUNTED, AND THE CALLER GATE'S WITNESS (ADR-0972).** The
+    /// vectors below record only the arms a test reads, so "the store was never
+    /// asked" could not be said of the twin as a whole. Each `IamDbService` arm
+    /// of [`FakeDb`] bumps this first — before any scripted refusal — so a gate
+    /// test asserts ZERO here, and a refusal placed after an upstream hop
+    /// cannot pass it.
+    calls: usize,
     /// The `x-yadgar-request-id` each `ResolveCredential` arrived with, read
     /// EXACTLY as `iam-db`'s `request_id_of` reads it: through `to_str()`, which
     /// refuses any non-ASCII byte. A value that does not survive that read is
@@ -131,12 +139,20 @@ struct FakeDb {
     recorded: Arc<Mutex<Recorded>>,
 }
 
+impl FakeDb {
+    /// Count one arm reached. See [`Recorded::calls`].
+    fn asked(&self) {
+        self.recorded.lock().expect("recorded").calls += 1;
+    }
+}
+
 #[tonic::async_trait]
 impl IamDbService for FakeDb {
     async fn resolve_credential(
         &self,
         req: Request<db::ResolveCredentialRequest>,
     ) -> Result<Response<db::ResolveCredentialResponse>, Status> {
+        self.asked();
         let header = req
             .metadata()
             .get("x-yadgar-request-id")
@@ -178,6 +194,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::GetPasswordHashRequest>,
     ) -> Result<Response<db::GetPasswordHashResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -194,6 +211,7 @@ impl IamDbService for FakeDb {
         &self,
         _req: Request<db::SetPasswordRequest>,
     ) -> Result<Response<db::SetPasswordResponse>, Status> {
+        self.asked();
         Ok(Response::new(db::SetPasswordResponse {}))
     }
 
@@ -201,6 +219,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::CreateEnrolmentRequest>,
     ) -> Result<Response<db::CreateEnrolmentResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -215,6 +234,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RedeemEnrolmentRequest>,
     ) -> Result<Response<db::RedeemEnrolmentResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -235,6 +255,7 @@ impl IamDbService for FakeDb {
         &self,
         _req: Request<db::ListCredentialsRequest>,
     ) -> Result<Response<db::ListCredentialsResponse>, Status> {
+        self.asked();
         Ok(Response::new(db::ListCredentialsResponse::default()))
     }
 
@@ -242,6 +263,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::SetUserAdminRequest>,
     ) -> Result<Response<db::SetUserAdminResponse>, Status> {
+        self.asked();
         // RECORDED BEFORE THE REFUSAL, so a test can tell "the store refused"
         // from "the store was never asked" — the two produce the same `Err` at
         // the caller and only this log tells them apart.
@@ -260,6 +282,7 @@ impl IamDbService for FakeDb {
         &self,
         _req: Request<db::SetRateLimitOverrideRequest>,
     ) -> Result<Response<db::SetRateLimitOverrideResponse>, Status> {
+        self.asked();
         Ok(Response::new(db::SetRateLimitOverrideResponse {}))
     }
 
@@ -267,6 +290,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::SetInheritedSettingRequest>,
     ) -> Result<Response<db::SetInheritedSettingResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -281,6 +305,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::CreateCredentialRequest>,
     ) -> Result<Response<db::CreateCredentialResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -295,6 +320,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RevokeCredentialRequest>,
     ) -> Result<Response<db::RevokeCredentialResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -309,6 +335,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RevokeAllCredentialsRequest>,
     ) -> Result<Response<db::RevokeAllCredentialsResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -326,6 +353,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::CreateUserRequest>,
     ) -> Result<Response<db::CreateUserResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -341,6 +369,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::AddTeamMemberRequest>,
     ) -> Result<Response<db::AddTeamMemberResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -353,6 +382,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RemoveTeamMemberRequest>,
     ) -> Result<Response<db::RemoveTeamMemberResponse>, Status> {
+        self.asked();
         self.recorded
             .lock()
             .expect("recorded")
@@ -372,6 +402,7 @@ impl IamDbService for FakeDb {
         &self,
         _req: Request<db::GetKeyIdentityRequest>,
     ) -> Result<Response<db::GetKeyIdentityResponse>, Status> {
+        self.asked();
         unimplemented!("no IamService handler asks the twin about the key identity")
     }
 
@@ -379,6 +410,7 @@ impl IamDbService for FakeDb {
         &self,
         _req: Request<db::SetKeyIdentityRequest>,
     ) -> Result<Response<db::SetKeyIdentityResponse>, Status> {
+        self.asked();
         unimplemented!("no IamService handler asks the twin about the key identity")
     }
 }
@@ -498,15 +530,19 @@ async fn iam_with_floors(
     floors: ResponseFloors,
     enrolment: Option<EnrolmentConfig>,
 ) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    iam_with_keys(fake, crate::crypto::tests::keys(), floors, enrolment).await
+}
+
+/// [`iam_with_floors`], holding `keys` rather than the shared fixture.
+async fn iam_with_keys(
+    fake: FakeDb,
+    keys: Keys,
+    floors: ResponseFloors,
+    enrolment: Option<EnrolmentConfig>,
+) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
     let (channel, recorded) = twin(fake).await;
     let invalidator = Invalidator::connect(None, None, None).await;
-    let iam = Iam::new(
-        crate::crypto::tests::keys(),
-        channel,
-        invalidator.clone(),
-        floors,
-        enrolment,
-    );
+    let iam = Iam::new(keys, channel, invalidator.clone(), floors, enrolment);
     // LAST, and both halves of that matter. It installs the WARN tap, so no login
     // any test performs can precede the global subscriber; and it drains this
     // thread's list, so setup noise — `Invalidator::connect(None)` warns that it
@@ -588,7 +624,7 @@ async fn an_unknown_username_still_costs_a_full_argon2_verification() {
 
     let before = argon2_verifications();
     let err = iam
-        .login(login("nobody", "hunter2"))
+        .login_as(Some(GATEWAY_CALLER), login("nobody", &fixture_password()))
         .await
         .expect_err("an unknown username must not authenticate");
     let spent = argon2_verifications() - before;
@@ -607,24 +643,33 @@ async fn a_failed_login_issues_no_credential() {
     // `login` proceeds, and `CreateCredential` is called with user_id "" — a
     // working bearer token for nobody. That is a successful login, so no
     // assertion on the error can catch it; only the absence of the write can.
-    // "x" for the unknown-username case DELIBERATELY. The test fixture's dummy
-    // hash is the hash of "x", so this is the one submitted password for which
-    // the dummy verification SUCCEEDS — which is what makes the bypass reachable
-    // here at all. Any other password fails against the dummy on its own and the
-    // assertion below would hold with `stored.is_some()` already deleted.
+    // THE DUMMY'S OWN PLAINTEXT for the unknown-username case, DELIBERATELY.
+    // Each `Iam` here holds keys whose dummy hash is minted from `dummy`, so it
+    // is the one submitted password for which the dummy verification SUCCEEDS —
+    // which is what makes the bypass reachable here at all. Any other password
+    // fails against the dummy on its own and the assertion below would hold with
+    // `stored.is_some()` already deleted. A run-time fixture, not the shared
+    // fixture's literal, so no hard-coded credential reaches `login`.
+    let dummy = fixture_password();
+    let wrong = fixture_password();
     for (name, fake, password) in [
-        ("unknown username", FakeDb::default(), "x"),
+        ("unknown username", FakeDb::default(), &dummy),
         (
             "wrong password",
             FakeDb {
                 password: known_user("correct horse"),
                 ..Default::default()
             },
-            "wrong horse",
+            &wrong,
         ),
     ] {
-        let (iam, recorded, _inv) = iam_with(fake).await;
-        iam.login(login("max", password))
+        let floors = ResponseFloors {
+            login: NOMINAL_FLOOR,
+            redeem: NOMINAL_FLOOR,
+        };
+        let keys = crate::crypto::tests::keys_with_dummy(&dummy);
+        let (iam, recorded, _inv) = iam_with_keys(fake, keys, floors, enrolment_config()).await;
+        iam.login_as(Some(GATEWAY_CALLER), login("max", password))
             .await
             .expect_err("a failed login must not succeed");
 
@@ -648,14 +693,20 @@ async fn wrong_password_and_unknown_username_are_byte_identical() {
     // MUTATION THIS CATCHES: replacing either `refused()` call site with a
     // message of its own, e.g. "no such user".
     let (iam, _r, _i) = iam_with(FakeDb::default()).await;
-    let unknown = iam.login(login("nobody", "hunter2")).await.unwrap_err();
+    let unknown = iam
+        .login_as(Some(GATEWAY_CALLER), login("nobody", &fixture_password()))
+        .await
+        .unwrap_err();
 
     let (iam, _r, _i) = iam_with(FakeDb {
         password: known_user("correct horse"),
         ..Default::default()
     })
     .await;
-    let wrong = iam.login(login("max", "wrong horse")).await.unwrap_err();
+    let wrong = iam
+        .login_as(Some(GATEWAY_CALLER), login("max", &fixture_password()))
+        .await
+        .unwrap_err();
 
     assert_eq!(unknown.code(), wrong.code());
     assert_eq!(unknown.message(), wrong.message());
@@ -671,14 +722,15 @@ async fn the_token_returned_is_the_one_that_was_stored() {
     // MUTATION THIS CATCHES: minting twice — hashing one token and returning
     // another. Every credential issued would then be unresolvable, and no test
     // that only checks "a token came back" can tell.
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with(FakeDb {
-        password: known_user("correct horse"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
 
     let out = iam
-        .login(login("max", "correct horse"))
+        .login_as(Some(GATEWAY_CALLER), login("max", &password))
         .await
         .expect("a correct password logs in")
         .into_inner();
@@ -738,33 +790,31 @@ async fn every_login_path_takes_at_least_the_floor() {
     // handler, the real Argon2 work, the real round trips to the twin.
     const FLOOR: Duration = Duration::from_millis(400);
 
+    let correct = fixture_password();
+    let wrong = fixture_password();
+    let unknown = fixture_password();
     for (name, fake, username, password) in [
         // The divergence itself: real Argon2 work, at a cost that answers in
         // microseconds.
         (
             "a cheap stored hash",
             FakeDb {
-                password: cheap_user("correct horse"),
+                password: cheap_user(&correct),
                 ..Default::default()
             },
             "max",
-            "wrong horse",
+            &wrong,
         ),
         // The dummy, at this build's cost.
-        (
-            "an unknown username",
-            FakeDb::default(),
-            "nobody",
-            "hunter2",
-        ),
+        ("an unknown username", FakeDb::default(), "nobody", &unknown),
         (
             "a default-cost stored hash",
             FakeDb {
-                password: known_user("correct horse"),
+                password: known_user(&correct),
                 ..Default::default()
             },
             "max",
-            "wrong horse",
+            &wrong,
         ),
         // THE SUCCESS PATH IS FLOORED TOO. Not because a successful login is
         // ambiguous — it answers with a token, which is as distinguishable as a
@@ -774,17 +824,19 @@ async fn every_login_path_takes_at_least_the_floor() {
         (
             "a successful login",
             FakeDb {
-                password: known_user("correct horse"),
+                password: known_user(&correct),
                 ..Default::default()
             },
             "max",
-            "correct horse",
+            &correct,
         ),
     ] {
         let (iam, _rec, _inv) = iam_with_floor(fake, FLOOR).await;
 
         let started = Instant::now();
-        let _ = iam.login(login(username, password)).await;
+        let _ = iam
+            .login_as(Some(GATEWAY_CALLER), login(username, password))
+            .await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -981,9 +1033,10 @@ async fn a_login_slower_than_the_floor_answers_normally_and_warns() {
     // involved: the gap is the oracle.
     const FLOOR: Duration = Duration::from_millis(1);
 
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with_floor(
         FakeDb {
-            password: known_user("correct horse"),
+            password: known_user(&password),
             ..Default::default()
         },
         FLOOR,
@@ -991,7 +1044,7 @@ async fn a_login_slower_than_the_floor_answers_normally_and_warns() {
     .await;
 
     let out = iam
-        .login(login("max", "correct horse"))
+        .login_as(Some(GATEWAY_CALLER), login("max", &password))
         .await
         .expect("EXCEEDING THE FLOOR IS NOT AN ERROR — a slow verification is still a correct one")
         .into_inner();
@@ -1055,7 +1108,9 @@ async fn a_login_inside_the_floor_warns_about_nothing() {
     )
     .await;
 
-    let _ = iam.login(login("max", "wrong horse")).await;
+    let _ = iam
+        .login_as(Some(GATEWAY_CALLER), login("max", &fixture_password()))
+        .await;
 
     assert_eq!(
         floor_warnings(),
@@ -1079,11 +1134,14 @@ async fn adding_a_team_member_publishes_the_invalidation() {
     // trying to reach.
     let (iam, _rec, invalidator) = iam_with(FakeDb::default()).await;
 
-    iam.add_team_member(Request::new(AddTeamMemberRequest {
-        team_id: "yadgar:team:t1".into(),
-        user_id: "yadgar:user:1".into(),
-        ..Default::default()
-    }))
+    iam.add_team_member_as(
+        Some(GATEWAY_CALLER),
+        Request::new(AddTeamMemberRequest {
+            team_id: "yadgar:team:t1".into(),
+            user_id: "yadgar:user:1".into(),
+            ..Default::default()
+        }),
+    )
     .await
     .expect("add");
 
@@ -1097,11 +1155,14 @@ async fn adding_a_team_member_publishes_the_invalidation() {
 async fn removing_a_team_member_publishes_the_invalidation() {
     let (iam, _rec, invalidator) = iam_with(FakeDb::default()).await;
 
-    iam.remove_team_member(Request::new(RemoveTeamMemberRequest {
-        team_id: "yadgar:team:t1".into(),
-        user_id: "yadgar:user:1".into(),
-        ..Default::default()
-    }))
+    iam.remove_team_member_as(
+        Some(GATEWAY_CALLER),
+        Request::new(RemoveTeamMemberRequest {
+            team_id: "yadgar:team:t1".into(),
+            user_id: "yadgar:user:1".into(),
+            ..Default::default()
+        }),
+    )
     .await
     .expect("remove");
 
@@ -1115,10 +1176,13 @@ async fn removing_a_team_member_publishes_the_invalidation() {
 async fn revoking_a_credential_publishes_the_invalidation() {
     let (iam, _rec, invalidator) = iam_with(FakeDb::default()).await;
 
-    iam.revoke_credential(Request::new(RevokeCredentialRequest {
-        credential_id: "yadgar:credential:fake".into(),
-        ..Default::default()
-    }))
+    iam.revoke_credential_as(
+        Some(GATEWAY_CALLER),
+        Request::new(RevokeCredentialRequest {
+            credential_id: "yadgar:credential:fake".into(),
+            ..Default::default()
+        }),
+    )
     .await
     .expect("revoke");
 
@@ -1173,9 +1237,12 @@ async fn revoking_all_credentials_relays_the_key_the_user_and_the_actor() {
     ] {
         let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
-        iam.revoke_all_credentials(revoke_all(REVOKE_ALL_USER, actor.clone()))
-            .await
-            .expect("revoke all");
+        iam.revoke_all_credentials_as(
+            Some(GATEWAY_CALLER),
+            revoke_all(REVOKE_ALL_USER, actor.clone()),
+        )
+        .await
+        .expect("revoke all");
 
         assert_eq!(
             rec.lock().expect("recorded").revoke_all_credentials,
@@ -1201,7 +1268,7 @@ async fn revoking_all_credentials_publishes_the_eviction_for_the_user() {
     })
     .await;
 
-    iam.revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+    iam.revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
         .await
         .expect("revoke all");
 
@@ -1228,7 +1295,7 @@ async fn revoking_all_credentials_publishes_even_when_nothing_was_revoked() {
     .await;
 
     let answered = iam
-        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
         .await
         .expect("revoke all")
         .into_inner();
@@ -1252,7 +1319,7 @@ async fn revoking_all_credentials_publishes_nothing_when_the_store_fails() {
     .await;
 
     let refused = iam
-        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
         .await
         .expect_err("the store failed");
 
@@ -1284,7 +1351,7 @@ async fn revoking_all_credentials_for_an_unknown_user_stays_not_found() {
     .await;
 
     let refused = iam
-        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
         .await
         .expect_err("no such user");
 
@@ -1314,7 +1381,7 @@ async fn revoking_all_credentials_returns_the_stores_count() {
     .await;
 
     let answered = iam
-        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
         .await
         .expect("revoke all")
         .into_inner();
@@ -1332,7 +1399,7 @@ async fn revoking_all_credentials_refuses_a_malformed_user_id_without_asking_the
         let (iam, rec, invalidator) = iam_with(FakeDb::default()).await;
 
         let refused = iam
-            .revoke_all_credentials(revoke_all(&user_id, None))
+            .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(&user_id, None))
             .await
             .expect_err("a malformed user_id is refused");
 
@@ -1356,7 +1423,7 @@ async fn revoking_all_credentials_refuses_a_malformed_user_id_without_asking_the
 
     // THE OTHER SIDE OF THE BOUND: exactly 96 characters is accepted.
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
-    iam.revoke_all_credentials(revoke_all(&"u".repeat(96), None))
+    iam.revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(&"u".repeat(96), None))
         .await
         .expect("a 96-character user_id is accepted");
     assert_eq!(
@@ -1400,7 +1467,7 @@ async fn revoking_all_credentials_answers_ok_when_the_broker_is_unreachable() {
         "the broker is unreachable, so the publish fails"
     );
     let answered = iam
-        .revoke_all_credentials(revoke_all(REVOKE_ALL_USER, None))
+        .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
         .await
         .expect("a failed publish does not fail the call")
         .into_inner();
@@ -1449,7 +1516,7 @@ async fn setting_the_admin_flag_publishes_the_invalidation_in_both_directions() 
     for is_admin in [true, false] {
         let (iam, _rec, invalidator) = iam_with(FakeDb::default()).await;
 
-        iam.set_user_admin(promote(is_admin, None))
+        iam.set_user_admin_as(Some(GATEWAY_CALLER), promote(is_admin, None))
             .await
             .expect("set the flag");
 
@@ -1478,18 +1545,24 @@ async fn a_promotion_is_visible_to_the_next_resolve_and_the_cache_is_told() {
     .await;
 
     let before = iam
-        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .resolve_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(ResolveCredentialRequest::default()),
+        )
         .await
         .expect("resolve")
         .into_inner();
     assert!(!before.is_admin, "nobody is an admin before the promotion");
 
-    iam.set_user_admin(promote(true, None))
+    iam.set_user_admin_as(Some(GATEWAY_CALLER), promote(true, None))
         .await
         .expect("promote");
 
     let after = iam
-        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .resolve_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(ResolveCredentialRequest::default()),
+        )
         .await
         .expect("resolve")
         .into_inner();
@@ -1526,7 +1599,7 @@ async fn a_promotion_the_store_refuses_invalidates_nothing() {
     .await;
 
     let err = iam
-        .set_user_admin(promote(true, None))
+        .set_user_admin_as(Some(GATEWAY_CALLER), promote(true, None))
         .await
         .expect_err("the store refused the write");
 
@@ -1570,7 +1643,7 @@ async fn the_promote_verb_relays_the_actor_the_caller_asserted() {
     ] {
         let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
-        iam.set_user_admin(promote(true, actor.clone()))
+        iam.set_user_admin_as(Some(GATEWAY_CALLER), promote(true, actor.clone()))
             .await
             .expect("promote");
 
@@ -1607,7 +1680,10 @@ async fn an_upstream_message_does_not_reach_the_caller() {
     .await;
 
     let err = iam
-        .create_user(Request::new(CreateUserRequest::default()))
+        .create_user_as(
+            Some(GATEWAY_CALLER),
+            Request::new(CreateUserRequest::default()),
+        )
         .await
         .expect_err("the upstream failure propagates");
 
@@ -1630,7 +1706,10 @@ async fn a_negative_resolve_is_not_cacheable() {
     // consumer that caches on it has not been written.
     let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
     let empty = iam
-        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .resolve_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(ResolveCredentialRequest::default()),
+        )
         .await
         .expect("an unknown token is not an error")
         .into_inner();
@@ -1647,7 +1726,10 @@ async fn a_negative_resolve_is_not_cacheable() {
     })
     .await;
     let found = iam
-        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .resolve_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(ResolveCredentialRequest::default()),
+        )
         .await
         .expect("resolve")
         .into_inner();
@@ -1750,7 +1832,7 @@ async fn an_enrolment_token_carries_the_secret_whose_hash_was_stored() {
     let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
 
     let out = iam
-        .issue_enrolment(issue("attempt-1"))
+        .issue_enrolment_as(Some(GATEWAY_CALLER), issue("attempt-1"))
         .await
         .expect("issue")
         .into_inner();
@@ -1819,7 +1901,7 @@ async fn an_enrolment_expires_in_twenty_four_hours() {
     let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
 
     let out = iam
-        .issue_enrolment(issue("attempt-1"))
+        .issue_enrolment_as(Some(GATEWAY_CALLER), issue("attempt-1"))
         .await
         .expect("issue")
         .into_inner();
@@ -1873,10 +1955,10 @@ async fn the_bootstrap_demand_is_relayed_verbatim_to_the_store() {
     // constant.
     let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
 
-    iam.issue_enrolment(issue_demanding("attempt-1"))
+    iam.issue_enrolment_as(Some(GATEWAY_CALLER), issue_demanding("attempt-1"))
         .await
         .expect("issue");
-    iam.issue_enrolment(issue("attempt-2"))
+    iam.issue_enrolment_as(Some(GATEWAY_CALLER), issue("attempt-2"))
         .await
         .expect("issue");
 
@@ -1904,10 +1986,10 @@ async fn the_revoke_instruction_is_relayed_verbatim_to_the_store() {
     // cannot tell a relay from a constant.
     let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
 
-    iam.issue_enrolment(issue_revoking("attempt-1"))
+    iam.issue_enrolment_as(Some(GATEWAY_CALLER), issue_revoking("attempt-1"))
         .await
         .expect("issue");
-    iam.issue_enrolment(issue("attempt-2"))
+    iam.issue_enrolment_as(Some(GATEWAY_CALLER), issue("attempt-2"))
         .await
         .expect("issue");
 
@@ -1943,9 +2025,12 @@ async fn a_revoking_redemption_publishes_the_credential_eviction() {
     })
     .await;
 
-    iam.redeem_enrolment(redeem(&fixture_secret(), &password, "k1"))
-        .await
-        .expect("a valid secret redeems");
+    iam.redeem_enrolment_as(
+        Some(GATEWAY_CALLER),
+        redeem(&fixture_secret(), &password, "k1"),
+    )
+    .await
+    .expect("a valid secret redeems");
 
     assert_eq!(
         invalidator.published(),
@@ -1965,9 +2050,12 @@ async fn an_ordinary_redemption_publishes_no_eviction() {
     })
     .await;
 
-    iam.redeem_enrolment(redeem(&fixture_secret(), &password, "k1"))
-        .await
-        .expect("a valid secret redeems");
+    iam.redeem_enrolment_as(
+        Some(GATEWAY_CALLER),
+        redeem(&fixture_secret(), &password, "k1"),
+    )
+    .await
+    .expect("a valid secret redeems");
 
     assert!(invalidator.published().is_empty());
 }
@@ -2003,10 +2091,10 @@ async fn issuing_an_enrolment_relays_the_actor_the_caller_asserted() {
 
     let (iam, recorded, _inv) = iam_with(FakeDb::default()).await;
 
-    iam.issue_enrolment(issue_by("attempt-1", actor.clone()))
+    iam.issue_enrolment_as(Some(GATEWAY_CALLER), issue_by("attempt-1", actor.clone()))
         .await
         .expect("issue");
-    iam.issue_enrolment(issue_by("attempt-2", None))
+    iam.issue_enrolment_as(Some(GATEWAY_CALLER), issue_by("attempt-2", None))
         .await
         .expect("issue");
 
@@ -2052,24 +2140,31 @@ async fn an_unknown_enrolment_secret_costs_the_same_argon2_work_as_a_valid_one()
     //
     // Both paths are driven on ONE thread, which the counter's thread-local
     // storage requires — see the note on NOMINAL_FLOOR.
+    let password = fixture_password();
     let (iam, _rec, _inv) = iam_with(FakeDb {
         redeem: redeemed("ada"),
-        password: known_user("chosen one"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
 
     let before = argon2_verifications();
-    iam.redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
-        .await
-        .expect("a valid secret redeems");
+    iam.redeem_enrolment_as(
+        Some(GATEWAY_CALLER),
+        redeem(&fixture_secret(), &password, "k1"),
+    )
+    .await
+    .expect("a valid secret redeems");
     let valid = argon2_verifications() - before;
 
     let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
 
     let before = argon2_verifications();
     let err = iam
-        .redeem_enrolment(redeem("not a secret", "chosen one", "k2"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &password, "k2"),
+        )
         .await
         .expect_err("an unknown secret must not redeem");
     let unknown = argon2_verifications() - before;
@@ -2110,7 +2205,10 @@ async fn unknown_spent_and_expired_are_one_refusal() {
         .await;
 
         let err = iam
-            .redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+            .redeem_enrolment_as(
+                Some(GATEWAY_CALLER),
+                redeem(&fixture_secret(), &fixture_password(), "k1"),
+            )
             .await
             .expect_err("none of the three redeems");
 
@@ -2183,7 +2281,10 @@ async fn a_redeemed_key_and_an_unredeemed_one_refuse_identically() {
     })
     .await;
     let redeemed_key = iam
-        .redeem_enrolment(redeem(garbage, "chosen one", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(garbage, &fixture_password(), "k1"),
+        )
         .await
         .expect_err("a key already spent on another secret does not redeem");
 
@@ -2193,7 +2294,10 @@ async fn a_redeemed_key_and_an_unredeemed_one_refuse_identically() {
     })
     .await;
     let unredeemed_key = iam
-        .redeem_enrolment(redeem(garbage, "chosen one", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(garbage, &fixture_password(), "k1"),
+        )
         .await
         .expect_err("an unknown secret does not redeem either");
 
@@ -2272,7 +2376,10 @@ async fn validation_runs_before_the_secret_is_looked_up() {
         // passed rather than interpolated. Written the wrong way it emits the
         // braces literally, and the panic message on a regression names nothing
         // — in the one test whose whole job is proving an ordering.
-        let err = iam.redeem_enrolment(req).await.expect_err(name);
+        let err = iam
+            .redeem_enrolment_as(Some(GATEWAY_CALLER), req)
+            .await
+            .expect_err(name);
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{name}");
         assert!(
@@ -2306,7 +2413,7 @@ async fn validation_runs_before_the_secret_is_looked_up() {
 
     let mut at_the_bound = redeem("s3cret", "chosen one", "k1");
     at_the_bound.get_mut().label = "l".repeat(255);
-    iam.redeem_enrolment(at_the_bound)
+    iam.redeem_enrolment_as(Some(GATEWAY_CALLER), at_the_bound)
         .await
         .expect("a label at the bound is accepted, not refused");
 }
@@ -2334,7 +2441,10 @@ async fn a_key_replayed_with_a_different_password_is_refused() {
     .await;
 
     let err = iam
-        .redeem_enrolment(redeem("s3cret", "a second password", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &fixture_password(), "k1"),
+        )
         .await
         .expect_err("a key reused with a different password is refused");
 
@@ -2359,15 +2469,19 @@ async fn a_redemption_returns_the_username_and_the_credential_the_store_holds() 
     // MUTATION THIS CATCHES: returning `user_id` in its place, or leaving it
     // empty. Both look like a successful redemption and leave the person unable
     // to log in afterwards.
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with(FakeDb {
         redeem: redeemed("Ada Lovelace"),
-        password: known_user("chosen one"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
 
     let out = iam
-        .redeem_enrolment(redeem("s3cret", "chosen one", "attempt-1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &password, "attempt-1"),
+        )
         .await
         .expect("a valid secret redeems")
         .into_inner();
@@ -2474,6 +2588,7 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
     // second thing to tune.
     const FLOOR: Duration = Duration::from_secs(10);
 
+    let password = fixture_password();
     for (name, fake) in [
         ("an unknown secret", FakeDb::default()),
         (
@@ -2503,7 +2618,7 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
             "a successful redemption",
             FakeDb {
                 redeem: redeemed("ada"),
-                password: known_user("chosen one"),
+                password: known_user(&password),
                 ..Default::default()
             },
         ),
@@ -2512,7 +2627,10 @@ async fn the_redeem_floor_is_anchored_to_the_start_on_every_path() {
 
         let t0 = tokio::time::Instant::now();
         let _ = iam
-            .redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+            .redeem_enrolment_as(
+                Some(GATEWAY_CALLER),
+                redeem(&fixture_secret(), &password, "k1"),
+            )
             .await;
         let held = t0.elapsed();
 
@@ -2570,10 +2688,11 @@ async fn a_redemption_slower_than_the_floor_answers_normally_and_warns() {
     // the oracle.
     const FLOOR: Duration = Duration::from_millis(1);
 
+    let password = fixture_password();
     let (iam, recorded, _inv) = iam_with_redeem_floor(
         FakeDb {
             redeem: redeemed("ada"),
-            password: known_user("chosen one"),
+            password: known_user(&password),
             ..Default::default()
         },
         FLOOR,
@@ -2581,7 +2700,10 @@ async fn a_redemption_slower_than_the_floor_answers_normally_and_warns() {
     .await;
 
     let out = iam
-        .redeem_enrolment(redeem("s3cret", "chosen one", "k1"))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &password, "k1"),
+        )
         .await
         .expect("EXCEEDING THE FLOOR IS NOT AN ERROR — a slow redemption is still a correct one")
         .into_inner();
@@ -2658,7 +2780,7 @@ async fn an_unconfigured_deployment_refuses_to_mint_and_serves_everything_else()
     .await;
 
     let err = iam
-        .issue_enrolment(issue("attempt-1"))
+        .issue_enrolment_as(Some(GATEWAY_CALLER), issue("attempt-1"))
         .await
         .expect_err("an unconfigured deployment cannot mint an enrolment");
 
@@ -2687,7 +2809,10 @@ async fn an_unconfigured_deployment_refuses_to_mint_and_serves_everything_else()
     // not failing boot: `iam` is the authentication plane, and one unset
     // administrative value must not stop credential resolution for the estate.
     let resolved = iam
-        .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+        .resolve_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(ResolveCredentialRequest::default()),
+        )
         .await
         .expect("ResolveCredential is unaffected by enrolment configuration")
         .into_inner();
@@ -2768,13 +2893,19 @@ async fn the_unbuilt_rpcs_refuse_rather_than_answering() {
     let (iam, _rec, _inv) = iam_with(FakeDb::default()).await;
 
     let listed = iam
-        .list_credentials(Request::new(ListCredentialsRequest::default()))
+        .list_credentials_as(
+            Some(GATEWAY_CALLER),
+            Request::new(ListCredentialsRequest::default()),
+        )
         .await
         .expect_err("ListCredentials is not built");
     assert_eq!(listed.code(), tonic::Code::Unimplemented);
 
     let limit = iam
-        .set_rate_limit_override(Request::new(SetRateLimitOverrideRequest::default()))
+        .set_rate_limit_override_as(
+            Some(GATEWAY_CALLER),
+            Request::new(SetRateLimitOverrideRequest::default()),
+        )
         .await
         .expect_err("SetRateLimitOverride is not built");
     assert_eq!(limit.code(), tonic::Code::Unimplemented);
@@ -2798,7 +2929,10 @@ async fn the_admin_flag_travels_from_the_store_rather_than_being_decided_here() 
         .await;
 
         let got = iam
-            .resolve_credential(Request::new(ResolveCredentialRequest::default()))
+            .resolve_credential_as(
+                Some(GATEWAY_CALLER),
+                Request::new(ResolveCredentialRequest::default()),
+            )
             .await
             .expect("resolve")
             .into_inner();
@@ -2834,11 +2968,14 @@ fn stated(value: SettingValue, locked: bool) -> Option<InheritedSetting> {
 
 async fn resolved_setting(fake: FakeDb) -> Option<InheritedSetting> {
     let (iam, _rec, _inv) = iam_with(fake).await;
-    iam.resolve_credential(Request::new(ResolveCredentialRequest::default()))
-        .await
-        .expect("resolve")
-        .into_inner()
-        .owner_reads_own_record
+    iam.resolve_credential_as(
+        Some(GATEWAY_CALLER),
+        Request::new(ResolveCredentialRequest::default()),
+    )
+    .await
+    .expect("resolve")
+    .into_inner()
+    .owner_reads_own_record
 }
 
 #[tokio::test]
@@ -2980,7 +3117,7 @@ async fn a_write_reaches_the_store_with_its_presence_intact() {
 
     let sent = org_write();
     let got = iam
-        .set_inherited_setting(Request::new(sent.clone()))
+        .set_inherited_setting_as(Some(GATEWAY_CALLER), Request::new(sent.clone()))
         .await
         .expect("a well-formed organisation write")
         .into_inner();
@@ -3023,7 +3160,7 @@ async fn a_withdrawal_is_forwarded_as_a_withdrawal() {
         clear: true,
         ..team_write()
     };
-    iam.set_inherited_setting(Request::new(sent))
+    iam.set_inherited_setting_as(Some(GATEWAY_CALLER), Request::new(sent))
         .await
         .expect("clearing an override is well formed");
 
@@ -3173,7 +3310,7 @@ async fn every_refusal_lands_before_the_store_is_asked() {
         .await;
 
         let err = iam
-            .set_inherited_setting(Request::new(request))
+            .set_inherited_setting_as(Some(GATEWAY_CALLER), Request::new(request))
             .await
             .expect_err(why);
         assert_eq!(err.code(), tonic::Code::InvalidArgument, "{why}");
@@ -3202,7 +3339,7 @@ async fn a_setting_write_publishes_no_invalidation() {
     })
     .await;
 
-    iam.set_inherited_setting(Request::new(org_write()))
+    iam.set_inherited_setting_as(Some(GATEWAY_CALLER), Request::new(org_write()))
         .await
         .expect("a well-formed organisation write");
 
@@ -3254,39 +3391,51 @@ async fn d9s_key_travels_on_every_administrative_write() {
 
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
-    iam.revoke_credential(Request::new(RevokeCredentialRequest {
-        idempotency: key(),
-        credential_id: "yadgar:credential:1".into(),
-        ..Default::default()
-    }))
+    iam.revoke_credential_as(
+        Some(GATEWAY_CALLER),
+        Request::new(RevokeCredentialRequest {
+            idempotency: key(),
+            credential_id: "yadgar:credential:1".into(),
+            ..Default::default()
+        }),
+    )
     .await
     .expect("a revocation");
 
-    iam.create_user(Request::new(CreateUserRequest {
-        idempotency: key(),
-        external_id: "someone".into(),
-        display_name: "Some One".into(),
-        is_admin: false,
-        ..Default::default()
-    }))
+    iam.create_user_as(
+        Some(GATEWAY_CALLER),
+        Request::new(CreateUserRequest {
+            idempotency: key(),
+            external_id: "someone".into(),
+            display_name: "Some One".into(),
+            is_admin: false,
+            ..Default::default()
+        }),
+    )
     .await
     .expect("a user");
 
-    iam.add_team_member(Request::new(AddTeamMemberRequest {
-        idempotency: key(),
-        team_id: "yadgar:team:a".into(),
-        user_id: "yadgar:user:1".into(),
-        ..Default::default()
-    }))
+    iam.add_team_member_as(
+        Some(GATEWAY_CALLER),
+        Request::new(AddTeamMemberRequest {
+            idempotency: key(),
+            team_id: "yadgar:team:a".into(),
+            user_id: "yadgar:user:1".into(),
+            ..Default::default()
+        }),
+    )
     .await
     .expect("a grant");
 
-    iam.remove_team_member(Request::new(RemoveTeamMemberRequest {
-        idempotency: key(),
-        team_id: "yadgar:team:a".into(),
-        user_id: "yadgar:user:1".into(),
-        ..Default::default()
-    }))
+    iam.remove_team_member_as(
+        Some(GATEWAY_CALLER),
+        Request::new(RemoveTeamMemberRequest {
+            idempotency: key(),
+            team_id: "yadgar:team:a".into(),
+            user_id: "yadgar:user:1".into(),
+            ..Default::default()
+        }),
+    )
     .await
     .expect("a removal");
 
@@ -3319,13 +3468,16 @@ async fn d9s_key_travels_on_every_administrative_write() {
 async fn create_user_carries_d73s_admin_flag() {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
-    iam.create_user(Request::new(CreateUserRequest {
-        idempotency: None,
-        external_id: "the-first-admin".into(),
-        display_name: "The First Admin".into(),
-        is_admin: true,
-        ..Default::default()
-    }))
+    iam.create_user_as(
+        Some(GATEWAY_CALLER),
+        Request::new(CreateUserRequest {
+            idempotency: None,
+            external_id: "the-first-admin".into(),
+            display_name: "The First Admin".into(),
+            is_admin: true,
+            ..Default::default()
+        }),
+    )
     .await
     .expect("an administrator");
 
@@ -3367,12 +3519,15 @@ async fn creating_a_user_relays_the_actor_the_caller_asserted() {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
     for asserted in [actor.clone(), None] {
-        iam.create_user(Request::new(CreateUserRequest {
-            external_id: "someone".into(),
-            display_name: "Some One".into(),
-            unverified_actor: asserted,
-            ..Default::default()
-        }))
+        iam.create_user_as(
+            Some(GATEWAY_CALLER),
+            Request::new(CreateUserRequest {
+                external_id: "someone".into(),
+                display_name: "Some One".into(),
+                unverified_actor: asserted,
+                ..Default::default()
+            }),
+        )
         .await
         .expect("a user");
     }
@@ -3402,13 +3557,16 @@ async fn issue_credential_carries_the_expiry_the_caller_asked_for() {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
     let before = SystemTime::now();
-    iam.issue_credential(Request::new(IssueCredentialRequest {
-        idempotency: None,
-        user_id: "yadgar:user:1".into(),
-        label: "a laptop".into(),
-        expires_in_seconds: 3600,
-        ..Default::default()
-    }))
+    iam.issue_credential_as(
+        Some(GATEWAY_CALLER),
+        Request::new(IssueCredentialRequest {
+            idempotency: None,
+            user_id: "yadgar:user:1".into(),
+            label: "a laptop".into(),
+            expires_in_seconds: 3600,
+            ..Default::default()
+        }),
+    )
     .await
     .expect("a credential");
 
@@ -3446,13 +3604,16 @@ async fn issue_credential_carries_the_expiry_the_caller_asked_for() {
 async fn issue_credential_with_zero_seconds_carries_no_expiry() {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
-    iam.issue_credential(Request::new(IssueCredentialRequest {
-        idempotency: None,
-        user_id: "yadgar:user:1".into(),
-        label: "a laptop".into(),
-        expires_in_seconds: 0,
-        ..Default::default()
-    }))
+    iam.issue_credential_as(
+        Some(GATEWAY_CALLER),
+        Request::new(IssueCredentialRequest {
+            idempotency: None,
+            user_id: "yadgar:user:1".into(),
+            label: "a laptop".into(),
+            expires_in_seconds: 0,
+            ..Default::default()
+        }),
+    )
     .await
     .expect("a credential");
 
@@ -3490,11 +3651,14 @@ async fn issue_credential_refuses_an_expiry_the_contract_gives_no_meaning_to() {
 
     for asked in [-1, i64::MIN, MAX_EXPIRES_IN_SECONDS + 1, i64::MAX] {
         let err = iam
-            .issue_credential(Request::new(IssueCredentialRequest {
-                user_id: "yadgar:user:1".into(),
-                expires_in_seconds: asked,
-                ..Default::default()
-            }))
+            .issue_credential_as(
+                Some(GATEWAY_CALLER),
+                Request::new(IssueCredentialRequest {
+                    user_id: "yadgar:user:1".into(),
+                    expires_in_seconds: asked,
+                    ..Default::default()
+                }),
+            )
             .await
             .expect_err("an expiry the contract gives no meaning to is refused");
 
@@ -3536,11 +3700,14 @@ async fn issue_credential_grants_the_longest_life_the_bound_allows() {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
 
     let before = SystemTime::now();
-    iam.issue_credential(Request::new(IssueCredentialRequest {
-        user_id: "yadgar:user:1".into(),
-        expires_in_seconds: MAX_EXPIRES_IN_SECONDS,
-        ..Default::default()
-    }))
+    iam.issue_credential_as(
+        Some(GATEWAY_CALLER),
+        Request::new(IssueCredentialRequest {
+            user_id: "yadgar:user:1".into(),
+            expires_in_seconds: MAX_EXPIRES_IN_SECONDS,
+            ..Default::default()
+        }),
+    )
     .await
     .expect("the longest life this service grants is a life it grants");
 
@@ -3583,7 +3750,7 @@ async fn login_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Recorde
     .await;
     let mut req = login("ada", "pw");
     req.get_mut().label = label.into();
-    let answered = iam.login(req).await.map(|_| ());
+    let answered = iam.login_as(Some(GATEWAY_CALLER), req).await.map(|_| ());
     (answered, rec)
 }
 
@@ -3597,7 +3764,10 @@ async fn redeem_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Record
     .await;
     let mut req = redeem("s3cret", "chosen one", "k1");
     req.get_mut().label = label.into();
-    let answered = iam.redeem_enrolment(req).await.map(|_| ());
+    let answered = iam
+        .redeem_enrolment_as(Some(GATEWAY_CALLER), req)
+        .await
+        .map(|_| ());
     (answered, rec)
 }
 
@@ -3605,11 +3775,14 @@ async fn redeem_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Record
 async fn issue_credential_with_label(label: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
     let answered = iam
-        .issue_credential(Request::new(IssueCredentialRequest {
-            user_id: "yadgar:user:1".into(),
-            label: label.into(),
-            ..Default::default()
-        }))
+        .issue_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(IssueCredentialRequest {
+                user_id: "yadgar:user:1".into(),
+                label: label.into(),
+                ..Default::default()
+            }),
+        )
         .await
         .map(|_| ());
     (answered, rec)
@@ -3877,11 +4050,14 @@ async fn create_user_named(
 ) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
     let answered = iam
-        .create_user(Request::new(CreateUserRequest {
-            external_id: external_id.into(),
-            display_name: display_name.into(),
-            ..Default::default()
-        }))
+        .create_user_as(
+            Some(GATEWAY_CALLER),
+            Request::new(CreateUserRequest {
+                external_id: external_id.into(),
+                display_name: display_name.into(),
+                ..Default::default()
+            }),
+        )
         .await
         .map(|_| ());
     (answered, rec)
@@ -4050,14 +4226,18 @@ fn the_outcome_of_a_name_refusal_is_one_the_shared_mapping_produces() {
 /// everything, so an EMPTY vector is the only thing that says the refusal landed
 /// before the secret was spent rather than after.
 async fn redeem_with_key(key: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
+    let password = fixture_password();
     let (iam, rec, _inv) = iam_with(FakeDb {
         redeem: redeemed("ada"),
-        password: known_user("chosen one"),
+        password: known_user(&password),
         ..Default::default()
     })
     .await;
     let answered = iam
-        .redeem_enrolment(redeem("s3cret", "chosen one", key))
+        .redeem_enrolment_as(
+            Some(GATEWAY_CALLER),
+            redeem(&fixture_secret(), &password, key),
+        )
         .await
         .map(|_| ());
     (answered, rec)
@@ -4071,10 +4251,13 @@ async fn setting_write_with_key(key: &str) -> (Result<(), Status>, Arc<Mutex<Rec
     })
     .await;
     let answered = iam
-        .set_inherited_setting(Request::new(SetInheritedSettingRequest {
-            idempotency: Some(Idempotency { key: key.into() }),
-            ..org_write()
-        }))
+        .set_inherited_setting_as(
+            Some(GATEWAY_CALLER),
+            Request::new(SetInheritedSettingRequest {
+                idempotency: Some(Idempotency { key: key.into() }),
+                ..org_write()
+            }),
+        )
         .await
         .map(|_| ());
     (answered, rec)
@@ -4094,12 +4277,15 @@ async fn setting_write_for_team(team_id: &str) -> (Result<(), Status>, Arc<Mutex
     })
     .await;
     let answered = iam
-        .set_inherited_setting(Request::new(SetInheritedSettingRequest {
-            team_id: Some(team_id.into()),
-            value: None,
-            clear: true,
-            ..team_write()
-        }))
+        .set_inherited_setting_as(
+            Some(GATEWAY_CALLER),
+            Request::new(SetInheritedSettingRequest {
+                team_id: Some(team_id.into()),
+                value: None,
+                clear: true,
+                ..team_write()
+            }),
+        )
         .await
         .map(|_| ());
     (answered, rec)
@@ -4109,11 +4295,14 @@ async fn setting_write_for_team(team_id: &str) -> (Result<(), Status>, Arc<Mutex
 async fn issue_credential_for_user(user_id: &str) -> (Result<(), Status>, Arc<Mutex<Recorded>>) {
     let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
     let answered = iam
-        .issue_credential(Request::new(IssueCredentialRequest {
-            user_id: user_id.into(),
-            label: "laptop".into(),
-            ..Default::default()
-        }))
+        .issue_credential_as(
+            Some(GATEWAY_CALLER),
+            Request::new(IssueCredentialRequest {
+                user_id: user_id.into(),
+                label: "laptop".into(),
+                ..Default::default()
+            }),
+        )
         .await
         .map(|_| ());
     (answered, rec)
@@ -4371,9 +4560,10 @@ async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
     let long = "z".repeat(1000);
     let cut = format!("{}...", "z".repeat(256));
 
-    let record = the_call_record(
-        iam.resolve_credential(with_request_id(ResolveCredentialRequest::default(), &long)),
-    )
+    let record = the_call_record(iam.resolve_credential_as(
+        Some(GATEWAY_CALLER),
+        with_request_id(ResolveCredentialRequest::default(), &long),
+    ))
     .await;
 
     assert!(
@@ -4408,9 +4598,10 @@ async fn a_gateway_request_id_reaches_the_record_and_the_twin_unchanged() {
     .await;
     let id = "01a0fdd8-2b87-704e-b0b6-c3b9adada833";
 
-    let record = the_call_record(
-        iam.resolve_credential(with_request_id(ResolveCredentialRequest::default(), id)),
-    )
+    let record = the_call_record(iam.resolve_credential_as(
+        Some(GATEWAY_CALLER),
+        with_request_id(ResolveCredentialRequest::default(), id),
+    ))
     .await;
 
     assert!(carries(&record, id), "{record}");
@@ -4419,3 +4610,8 @@ async fn a_gateway_request_id_reaches_the_record_and_the_twin_unchanged() {
         vec![Some(id.to_string())]
     );
 }
+
+// The caller gate (ADR-0972, ledger 1629): every RPC through the `_as` seam
+// and the trait methods, and the same gate through a real TLS listener.
+mod gate;
+mod gate_transport;

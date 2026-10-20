@@ -279,8 +279,9 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration
             derivation_version = DERIVATION_VERSION,
             "the key identity is UNVERIFIED and no retry will mend it. This pod is Ready and \
              serving and has NOT proved it holds the key set its rows were encrypted under. \
-             Deploy an iam-db carrying the key-identity arm, or resolve the marker this store \
-             holds (ADR-0764, ADR-0765)"
+             Act on the reason: deploy an iam-db carrying the key-identity arm, resolve the \
+             marker this store holds (ADR-0764, ADR-0765), or reissue this pod's client \
+             certificate as `iam-caller` (ADR-0972)"
         ),
         false => tracing::warn!(
             reason = unverified.reason,
@@ -329,6 +330,9 @@ impl Unverified {
     /// and the only refusal about the stored marker on that arm.
     /// `INVALID_ARGUMENT` is a request this build should never have sent, which
     /// includes D9's refusal of a key replayed under a different payload.
+    /// `PERMISSION_DENIED` is iam-db's caller gate (ADR-0972): this pod's client
+    /// leaf does not name `iam-caller`. A reissued certificate mends it; a retry
+    /// does not. Still `NotYet` and never `Refused`: unverified, not mismatched.
     pub fn of_status(code: tonic::Code) -> Self {
         match code {
             tonic::Code::Unimplemented => Self {
@@ -341,6 +345,13 @@ impl Unverified {
             },
             tonic::Code::InvalidArgument => Self {
                 reason: "INVALID_ARGUMENT: iam-db refused the request this build sent",
+                permanent: true,
+            },
+            // Before this arm the catch-all below read it as "the twin did not
+            // answer", transient, at WARN — an outage that does not exist.
+            tonic::Code::PermissionDenied => Self {
+                reason: "PERMISSION_DENIED: iam-db's caller gate refused this pod's client \
+                         certificate (it admits only `iam-caller`)",
                 permanent: true,
             },
             _ => Self {
