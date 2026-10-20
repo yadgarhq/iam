@@ -48,8 +48,12 @@ tonic-prost = "0.14"
 # leaf is kept beside `iam-db`'s rather than replacing it, so each exports its
 # own expiry series (see `rotate::watch_set`).
 #
+# v0.2.24 (ledger 1629, ADR-0972) for `serve_tls::caller_common_name`, first
+# shipped in v0.2.23: every `IamService` verb reads the verified client leaf's
+# common name and admits only the gateway's (`service::caller`).
+#
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.21", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.24", features = [
   "serve-tls",
 ] }
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a
@@ -137,7 +141,28 @@ hmac = "0.13"
 sha2 = "0.11"
 zeroize = { version = "1.9", features = ["derive"] }
 base64 = "0.23"
-async-nats = "0.50"
+# EVERY DEFAULT FEATURE BUT `websockets`, and that one omission is the point.
+# `websockets` pulls `tokio-websockets` 0.10, which pins `webpki-roots` 0.26.11 —
+# a compatibility shim RUSTSEC-2026-0381 (bundled roots trusting distrusted
+# emSign intermediates) covers, with no patched 0.26.x to update to. This crate
+# dials the broker over `nats://` with TLS and never over `ws://` or `wss://`,
+# so the feature carried the advisory and nothing this crate calls. The list
+# below is the 0.50.0 default set, copied rather than trimmed, so no other
+# behaviour moves with the advisory fix.
+async-nats = { version = "0.50", default-features = false, features = [
+  "server_2_10",
+  "server_2_11",
+  "server_2_12",
+  "server_2_14",
+  "service",
+  "ring",
+  "jetstream",
+  "nkeys",
+  "crypto",
+  "object-store",
+  "kv",
+  "nuid",
+] }
 uuid = { version = "1", features = ["v7"] }
 
 [build-dependencies]
