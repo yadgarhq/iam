@@ -223,6 +223,7 @@ impl Iam {
             user_id: r.user_id.clone(),
             page_size: r.page_size,
             page_token: r.page_token.clone(),
+            unverified_actor: None,
         });
         forward_request_id(&req, &mut upstream);
 
@@ -343,6 +344,7 @@ impl Iam {
             // same additive change is still needed on `iam-db` for
             // `CreateCredential`, `AddTeamMember` and `RemoveTeamMember`.
             unverified_actor: None,
+            expected_credential_epoch: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -380,6 +382,7 @@ impl Iam {
             // authorises on it. An empty actor is never fabricated to fill the
             // field.
             unverified_actor: req.get_ref().unverified_actor.clone(),
+            user_id: String::new(),
         });
         forward_request_id(&req, &mut upstream);
 
@@ -461,6 +464,7 @@ impl Iam {
         });
         Ok(Response::new(RevokeAllCredentialsResponse {
             revoked: done.revoked,
+            voided_enrolments: 0,
         }))
     }
 }

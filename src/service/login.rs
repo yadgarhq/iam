@@ -125,6 +125,7 @@ impl Iam {
             // `LoginRequest` carries no actor and ADR-0534's field is for
             // administrative requests.
             unverified_actor: None,
+            expected_credential_epoch: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -143,6 +144,7 @@ impl Iam {
             // The only time this value is ever returned. The store holds a hash.
             token: token.to_string(),
             credential_id: created.credential_id,
+            expires_at: None,
         }))
     }
 

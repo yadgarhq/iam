@@ -71,6 +71,7 @@ async fn listing_relays_the_request_and_projects_each_row() {
             user_id: LISTED_USER.into(),
             page_size: 2,
             page_token: "yadgar:credential:0".into(),
+            unverified_actor: None,
         }],
         "the store must be asked what the caller asked for"
     );

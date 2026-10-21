@@ -215,6 +215,7 @@ impl IamDbService for FakeDb {
         Ok(Response::new(db::GetPasswordHashResponse {
             user_id,
             argon2id_hash,
+            credential_epoch: 0,
         }))
     }
 
@@ -369,6 +370,7 @@ impl IamDbService for FakeDb {
         }
         Ok(Response::new(db::RevokeAllCredentialsResponse {
             revoked: self.revoke_all_answer,
+            voided_enrolments: 0,
         }))
     }
 
@@ -1782,6 +1784,8 @@ fn redeemed(username: &str) -> Option<db::RedeemEnrolmentResponse> {
             .encrypt(username)
             .expect("encrypt the fixture username"),
         revoked_existing_credentials: false,
+        credential_epoch: 0,
+        voided_enrolments: 0,
     })
 }
 

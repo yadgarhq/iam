@@ -209,6 +209,7 @@ impl Iam {
             // field exists on the boundary from v1.10.0 and is left absent
             // rather than filled with a value nothing supplied.
             unverified_actor: None,
+            expected_credential_epoch: None,
         });
         forward_request_id(&req, &mut create);
 
@@ -227,6 +228,7 @@ impl Iam {
             token: token.to_string(),
             credential_id: created.credential_id,
             username,
+            expires_at: None,
         }))
     }
 
