@@ -114,3 +114,12 @@ def test_a_lifetime_above_ten_years_is_refused_naming_the_key(tmp_path):
 def test_helm_lint_strict_passes_at_the_defaults():
     done = helm("lint", "--strict", str(CHART), "-f", str(CI_VALUES))
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_huge_lifetime_names_the_value_it_was_given(tmp_path):
+    # The range is checked BEFORE the int64 conversion, so a float beyond int64
+    # is reported as written, not as an overflowed number.
+    done = render_with(tmp_path, {"lifetimeSeconds": 1e20})
+    assert done.returncode != 0
+    assert "ten years" in done.stderr, done.stderr
+    assert "1e+20" in done.stderr, done.stderr

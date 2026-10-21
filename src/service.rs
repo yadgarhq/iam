@@ -57,7 +57,7 @@ mod validate;
 /// every call metric, rather than on a second spelling of the same name.
 pub const SERVICE: &str = "iam";
 
-pub use lifetime::CredentialLifetime;
+pub use lifetime::{CredentialLifetime, LIFETIME_CHART_KEY, LIFETIME_ENV};
 
 /// The measured response-time floor for [`IamService::login`].
 ///

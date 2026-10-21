@@ -12,6 +12,11 @@ const LIVE_CACHE_SECONDS: i64 = 300;
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
+/// The variable the lifetime is read from, and the chart key that renders it.
+/// Every refusal names both, as `upstream::REQUEST_TIMEOUT_CHART_KEY` does.
+pub const LIFETIME_ENV: &str = "CREDENTIAL_LIFETIME_SECONDS";
+pub const LIFETIME_CHART_KEY: &str = "credential.lifetimeSeconds";
+
 /// `CREDENTIAL_LIFETIME_SECONDS`, parsed and bounded. Construct it only through
 /// [`Self::parse`], so an `Iam` cannot hold a lifetime nobody checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

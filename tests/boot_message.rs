@@ -246,8 +246,19 @@ fn credential_lifetime_refusal(value: Option<&str>) -> String {
 fn an_absent_credential_lifetime_refuses_to_boot() {
     let line = credential_lifetime_refusal(None);
     assert!(
-        line.contains("CREDENTIAL_LIFETIME_SECONDS is NOT SET"),
-        "the refusal must name the variable: {line}"
+        line.contains("CREDENTIAL_LIFETIME_SECONDS is NOT SET")
+            && line.contains("credential.lifetimeSeconds"),
+        "the refusal must name the variable and the chart key: {line}"
+    );
+}
+
+#[test]
+fn an_empty_credential_lifetime_refuses_to_boot() {
+    let line = credential_lifetime_refusal(Some(""));
+    assert!(
+        line.contains("CREDENTIAL_LIFETIME_SECONDS is set but EMPTY")
+            && line.contains("credential.lifetimeSeconds"),
+        "the refusal must name the variable and the chart key: {line}"
     );
 }
 

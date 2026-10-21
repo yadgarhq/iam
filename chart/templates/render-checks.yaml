@@ -252,15 +252,19 @@ ten years (`MAX_EXPIRES_IN_SECONDS` in src/service/credential.rs).
       "unquoted integer, for example 7776000 for 90 days (ADR-0972)."))
       $lifetime (kindOf $lifetime)) }}
 {{- end }}
-{{- if le (int64 $lifetime) 0 }}
+{{/*
+COMPARED AS float64 AND PRINTED AS GIVEN: `int64` on a float beyond its range wraps, so a
+range check after the conversion would report 1e20 as a negative number.
+*/}}
+{{- if le (float64 $lifetime) 0.0 }}
 {{- fail (printf (join "" (list
-      "iam: credential.lifetimeSeconds is %d, and a credential lifetime must be positive: there is "
+      "iam: credential.lifetimeSeconds is %v, and a credential lifetime must be positive: there is "
       "no \"never expires\" value (ADR-0972)."))
-      (int64 $lifetime)) }}
+      $lifetime) }}
 {{- end }}
-{{- if gt (int64 $lifetime) 315360000 }}
+{{- if gt (float64 $lifetime) 315360000.0 }}
 {{- fail (printf (join "" (list
-      "iam: credential.lifetimeSeconds is %d, longer than the ten years (315360000) iam grants any "
+      "iam: credential.lifetimeSeconds is %v, longer than the ten years (315360000) iam grants any "
       "credential (ADR-0972)."))
-      (int64 $lifetime)) }}
+      $lifetime) }}
 {{- end }}
