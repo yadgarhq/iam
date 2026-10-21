@@ -207,6 +207,7 @@ impl Iam {
         // a credential the earlier attempt's owner never holds — the orphan the
         // contract accepts, findable through ListCredentials.
         let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
+        let expires_at = super::lifetime::deadline(self.credential_lifetime);
         let mut create = Request::new(db::CreateCredentialRequest {
             idempotency: Some(Idempotency {
                 key: uuid::Uuid::now_v7().to_string(),
@@ -214,8 +215,8 @@ impl Iam {
             user_id: spent.user_id.clone(),
             token_hash: Keys::token_hash(&token),
             label: req.get_ref().label.clone(),
-            // NO EXPIRY, because this request has no field to ask for one.
-            expires_at: None,
+            // ADR-0972 (3): now + CREDENTIAL_LIFETIME_SECONDS, also returned.
+            expires_at: Some(expires_at),
             // NOT STAMPED. This credential is minted by RedeemEnrolment, whose
             // request carries no actor to record — the holder of the enrolment
             // secret is the subject, not an administrator acting on one. The
@@ -245,7 +246,7 @@ impl Iam {
             token: token.to_string(),
             credential_id: created.credential_id,
             username,
-            expires_at: None,
+            expires_at: Some(expires_at),
         }))
     }
 

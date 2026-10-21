@@ -414,6 +414,14 @@ spec:
             # configured by accident.
             - name: REDEEM_RESPONSE_FLOOR_MS
               value: {{ required "redeemEnrolment.responseFloorMs is the RedeemEnrolment response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.redeemEnrolment.responseFloorMs | quote }}
+            # ADR-0972 (3): how long every Login and RedeemEnrolment credential
+            # lives. iam refuses to boot without it. `int64` because a values
+            # file delivers a float64, which `quote` alone renders as
+            # `7.776e+06`. The shape and range refusals are in
+            # `templates/render-checks.yaml`; this line only reads the value,
+            # guarded so a non-map `credential` cannot panic the render first.
+            - name: CREDENTIAL_LIFETIME_SECONDS
+              value: {{ required "iam: credential.lifetimeSeconds must be set: it renders CREDENTIAL_LIFETIME_SECONDS, which iam requires to boot (ADR-0972)" (dig "lifetimeSeconds" "" (ternary .Values.credential dict (kindIs "map" .Values.credential))) | int64 | quote }}
             # The gateway address every enrolment token carries (D73).
             #
             # NOT `required`, and NOT a boot failure either. No default can know

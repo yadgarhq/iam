@@ -46,6 +46,7 @@ mod admin;
 pub mod caller;
 mod credential;
 mod enrolment;
+mod lifetime;
 mod login;
 mod rpc;
 mod settings;
@@ -55,6 +56,8 @@ mod validate;
 /// that [`crate::rotate`]'s expiry gauge lands on the same bounded label as
 /// every call metric, rather than on a second spelling of the same name.
 pub const SERVICE: &str = "iam";
+
+pub use lifetime::{CredentialLifetime, LIFETIME_CHART_KEY, LIFETIME_ENV};
 
 /// The measured response-time floor for [`IamService::login`].
 ///
@@ -286,6 +289,8 @@ pub struct Iam {
     /// THEN UNAVAILABLE AND THE REST OF THE SERVICE IS NOT — see
     /// [`EnrolmentConfig::from_env`] for why that is not a boot failure.
     enrolment: Option<EnrolmentConfig>,
+    /// ADR-0972 (3): what every `Login` and redemption credential lives for.
+    credential_lifetime: CredentialLifetime,
 }
 
 impl Iam {
@@ -306,6 +311,7 @@ impl Iam {
         invalidator: Invalidator,
         floors: ResponseFloors,
         enrolment: Option<EnrolmentConfig>,
+        credential_lifetime: CredentialLifetime,
     ) -> Self {
         Self {
             keys,
@@ -322,6 +328,7 @@ impl Iam {
                 value: floors.redeem,
             },
             enrolment,
+            credential_lifetime,
         }
     }
 

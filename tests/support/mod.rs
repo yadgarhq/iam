@@ -141,6 +141,8 @@ pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
         ("YADGAR_KEYS_DIR", keys_dir.display().to_string()),
         ("LOGIN_RESPONSE_FLOOR_MS", "0".to_string()),
         ("REDEEM_RESPONSE_FLOOR_MS", "0".to_string()),
+        // ADR-0972 (3): required, no default. The chart's 90 days.
+        ("CREDENTIAL_LIFETIME_SECONDS", "7776000".to_string()),
     ]
 }
 

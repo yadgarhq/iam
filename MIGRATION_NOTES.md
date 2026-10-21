@@ -3,6 +3,32 @@
 Commands for a human to run, and orderings a human must decide. Nothing here is
 applied automatically.
 
+## Credential lifetime: `CREDENTIAL_LIFETIME_SECONDS` is required (ADR-0972 (3); I1d)
+
+**Breaking: iam refuses to boot without `CREDENTIAL_LIFETIME_SECONDS`.** The
+chart renders it from `credential.lifetimeSeconds`, default `7776000` (90
+days). A missing, non-integer, zero, negative or over-ten-years value is
+refused at render, naming the key. The binary refuses the same values at boot.
+
+- `Login` and `RedeemEnrolment` mint with `expires_at = now + lifetime` and
+  return it on `LoginResponse.expires_at` / `RedeemEnrolmentResponse.expires_at`.
+- `ResolveCredential` sets `valid_for_seconds = min(300, expires_at − now)`,
+  floor 1, when iam-db returns `expires_at` (iam-db ≥ D1b). With no expiry it
+  stays 300.
+- Existing credentials keep their NULL expiry. Nothing is backfilled.
+- The ADR-0881 boot audit for the A1 pin must show `CREDENTIAL_LIFETIME_SECONDS`
+  in the rendered Deployment:
+
+```bash
+helm template iam chart -f chart/ci/values.yaml | grep -A1 CREDENTIAL_LIFETIME_SECONDS
+```
+
+A parent values file that sets `iam.credential: null` or
+`iam.credential.lifetimeSeconds: null` is refused at render.
+
+Rollback: revert this image. Credentials minted with an expiry keep it; that
+is the safe direction.
+
 ## Revoke ownership, the credential epoch and the void count (ADR-0972 (2), (4), (5); I1c)
 
 Proto v1.21.0. Ships with iam-db ≥ the D1b release (iam-db#98) in the A1 pin.
