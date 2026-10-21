@@ -147,6 +147,21 @@ struct FakeDb {
     list_answer: db::ListCredentialsResponse,
     /// A `(code, message)` to fail `ListCredentials` with.
     list_fails: Option<(tonic::Code, &'static str)>,
+    /// What `GetPasswordHash` answers as `credential_epoch` (ADR-0972 (4)).
+    /// NONZERO in the tests that pin the carry, because `0` is prost's default
+    /// and a handler that sent a constant would still match it.
+    epoch: u64,
+    /// A `(code, message)` to fail `CreateCredential` with. The request is
+    /// recorded FIRST, so a test can tell "the mint was refused" from "the mint
+    /// was never asked". `FAILED_PRECONDITION` is the store's answer for a mint
+    /// whose `expected_credential_epoch` has moved.
+    create_credential_fails: Option<(tonic::Code, &'static str)>,
+    /// A `(code, message)` to fail `RevokeCredential` with: `NOT_FOUND` is the
+    /// store's answer for a `(credential_id, user_id)` pair no row carries.
+    revoke_fails: Option<(tonic::Code, &'static str)>,
+    /// What `RevokeAllCredentials` answers as `voided_enrolments`. NONZERO in the
+    /// test that pins the relay, for `revoke_all_answer`'s reason.
+    revoke_all_voided: u32,
     recorded: Arc<Mutex<Recorded>>,
 }
 
@@ -215,7 +230,7 @@ impl IamDbService for FakeDb {
         Ok(Response::new(db::GetPasswordHashResponse {
             user_id,
             argon2id_hash,
-            credential_epoch: 0,
+            credential_epoch: self.epoch,
         }))
     }
 
@@ -335,6 +350,9 @@ impl IamDbService for FakeDb {
             .expect("recorded")
             .create_credential
             .push(req.into_inner());
+        if let Some((code, message)) = self.create_credential_fails {
+            return Err(Status::new(code, message));
+        }
         Ok(Response::new(db::CreateCredentialResponse {
             credential_id: "yadgar:credential:fake".into(),
         }))
@@ -350,6 +368,9 @@ impl IamDbService for FakeDb {
             .expect("recorded")
             .revoke_credential
             .push(req.into_inner());
+        if let Some((code, message)) = self.revoke_fails {
+            return Err(Status::new(code, message));
+        }
         Ok(Response::new(db::RevokeCredentialResponse {
             user_id: "yadgar:user:1".into(),
         }))
@@ -370,7 +391,7 @@ impl IamDbService for FakeDb {
         }
         Ok(Response::new(db::RevokeAllCredentialsResponse {
             revoked: self.revoke_all_answer,
-            voided_enrolments: 0,
+            voided_enrolments: self.revoke_all_voided,
         }))
     }
 
@@ -1205,6 +1226,7 @@ async fn revoking_a_credential_publishes_the_invalidation() {
         Some(GATEWAY_CALLER),
         Request::new(RevokeCredentialRequest {
             credential_id: "yadgar:credential:fake".into(),
+            user_id: "yadgar:user:1".into(),
             ..Default::default()
         }),
     )
@@ -3409,6 +3431,7 @@ async fn d9s_key_travels_on_every_administrative_write() {
         Request::new(RevokeCredentialRequest {
             idempotency: key(),
             credential_id: "yadgar:credential:1".into(),
+            user_id: "yadgar:user:1".into(),
             ..Default::default()
         }),
     )
@@ -4627,5 +4650,6 @@ async fn a_gateway_request_id_reaches_the_record_and_the_twin_unchanged() {
 // The caller gate (ADR-0972, ledger 1629): every RPC through the `_as` seam
 // and the trait methods, and the same gate through a real TLS listener.
 mod credentials;
+mod epoch;
 mod gate;
 mod gate_transport;
