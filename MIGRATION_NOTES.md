@@ -3,6 +3,31 @@
 Commands for a human to run, and orderings a human must decide. Nothing here is
 applied automatically.
 
+## Revoke ownership, the credential epoch and the void count (ADR-0972 (2), (4), (5); I1c)
+
+Proto v1.21.0. Ships with iam-db ≥ the D1b release (iam-db#98) in the A1 pin.
+
+- **`RevokeCredential` requires `user_id`.** Empty or over-long is
+  `INVALID_ARGUMENT` before any iam-db call. iam relays it, and iam-db refuses
+  a `(credential_id, user_id)` pair no row carries with `NOT_FOUND`
+  ("no such record", the same as an unknown id). `CREDENTIAL_REVOKED` is
+  published for the validated `user_id`. No caller sends this verb before
+  gateway G1a.
+- **Login and RedeemEnrolment mint under the credential epoch.** Login sends
+  the epoch `GetPasswordHash` read; a moved epoch answers exactly as a wrong
+  password. Redeem sends the epoch the redemption returned; a moved epoch
+  answers `FAILED_PRECONDITION` "your password is set, but the account changed
+  before a credential could be issued; run `yaadgaar login`".
+  `IssueCredential` sends no epoch.
+- **`RevokeAllCredentials` relays `voided_enrolments`.** A voided enrolment
+  gets the single redemption refusal.
+- `ListCredentials` relays `unverified_actor` to iam-db.
+
+Mixed versions: against an iam-db older than D1b, the epoch and `user_id` are
+ignored, so the mint is unchecked and revoke matches the id alone (today's
+behaviour). Rollback: revert this image only. Keep iam-db at ≥ D1b (A1 is
+one-way, plan §5).
+
 ## iam admits only `gateway-caller` on every verb (ADR-0972, ledger 1629)
 
 **Breaking: a caller whose verified client certificate does not name

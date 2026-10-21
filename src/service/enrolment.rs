@@ -27,6 +27,10 @@ const ENROLMENT_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 /// policy, and this file is not it.
 const MAX_PASSWORD_BYTES: usize = 1024;
 
+/// What a redemption answers when its mint lost the epoch race (`iam.proto`).
+const PASSWORD_SET_RUN_LOGIN: &str = "your password is set, but the account changed before a \
+     credential could be issued; run `yaadgaar login`";
+
 /// Everything that can be refused WITHOUT looking the secret up.
 ///
 /// **THIS IS THE LIST, AND ITS SHORTNESS IS THE POINT.** Any check added here
@@ -85,7 +89,7 @@ impl Iam {
     /// function there is one place the elapsed time is read and one place it is
     /// paid, and no `return` in this body can skip either.
     ///
-    /// **THE ORDER OF THE FOUR STEPS IS THE WHOLE SECURITY PROPERTY**, and each
+    /// **THE ORDER OF THE STEPS IS THE WHOLE SECURITY PROPERTY**, and each
     /// is placed against a named leak:
     ///
     /// 1. **VALIDATE FIRST.** Every check that does not need the secret runs
@@ -97,7 +101,8 @@ impl Iam {
     ///    because it is paid before anything is known about the secret. An
     ///    implementation that hashed only after a hit would answer an unknown
     ///    secret in microseconds and a valid one in tens of milliseconds.
-    /// 3. **ONE REFUSAL FOR THREE OUTCOMES.** Unknown, spent and expired are all
+    /// 3. **ONE REFUSAL FOR THREE OUTCOMES.** Unknown, spent and expired (and
+    ///    voided, ADR-0972 (5)) are all
     ///    `UNAUTHENTICATED` with one message. The store tells them apart and
     ///    records which; the caller cannot. The refusal path ALSO pays the
     ///    verification the success path is about to pay, so the two cost the
@@ -116,6 +121,14 @@ impl Iam {
     ///    rather than answered with the first attempt's outcome — which would
     ///    leave the FIRST password live while the person believed the second had
     ///    taken effect.
+    /// 5. **THE MINT CARRIES THE EPOCH** (ADR-0972 (4)) the redemption returned:
+    ///    after its own bump, or on a replay the epoch the first delivery
+    ///    recorded (iam-db#98), so a replay after any bump mints nothing — and
+    ///    only after step 4 re-checked the password, which `iam-db` cannot do,
+    ///    being handed a fresh salted hash each time. A moved epoch is answered
+    ///    `FAILED_PRECONDITION` with [`PASSWORD_SET_RUN_LOGIN`]: the redemption
+    ///    committed, so it is not the single refusal and never says spent or
+    ///    expired. Inside the floor, and no oracle.
     pub(super) async fn redeem_inner(
         &self,
         req: Request<RedeemEnrolmentRequest>,
@@ -209,15 +222,20 @@ impl Iam {
             // field exists on the boundary from v1.10.0 and is left absent
             // rather than filled with a value nothing supplied.
             unverified_actor: None,
+            // Step 5 above, through [`Self::mint_under_epoch`].
+            expected_credential_epoch: Some(spent.credential_epoch),
         });
         forward_request_id(&req, &mut create);
 
-        let created = self
-            .client()
-            .create_credential(create)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let created = match self.mint_under_epoch(create).await {
+            Ok(created) => created,
+            // COMMITTED: not the single refusal, never "spent"/"expired".
+            Err(super::login::MintRefused::EpochMoved) => {
+                call.fail("FAILED_PRECONDITION");
+                return Err(Status::failed_precondition(PASSWORD_SET_RUN_LOGIN));
+            }
+            Err(super::login::MintRefused::Failed(failed)) => return Err(failed),
+        };
 
         call.finish(Outcome {
             status: "OK",
@@ -227,6 +245,7 @@ impl Iam {
             token: token.to_string(),
             credential_id: created.credential_id,
             username,
+            expires_at: None,
         }))
     }
 

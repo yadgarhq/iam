@@ -71,6 +71,11 @@ async fn listing_relays_the_request_and_projects_each_row() {
             user_id: LISTED_USER.into(),
             page_size: 2,
             page_token: "yadgar:credential:0".into(),
+            // RELAYED (proto v1.21.0 added the field on the iam-db side):
+            // exactly as received, never fabricated.
+            unverified_actor: Some(UnverifiedActor {
+                user_id: "yadgar:user:admin".into(),
+            }),
         }],
         "the store must be asked what the caller asked for"
     );
@@ -269,6 +274,7 @@ async fn revoking_one_credential_relays_the_actor_and_an_absent_one_stays_absent
             Some(GATEWAY_CALLER),
             Request::new(RevokeCredentialRequest {
                 credential_id: "yadgar:credential:fake".into(),
+                user_id: "yadgar:user:1".into(),
                 unverified_actor: actor.clone(),
                 ..Default::default()
             }),
@@ -284,4 +290,148 @@ async fn revoking_one_credential_relays_the_actor_and_an_absent_one_stays_absent
             "yadgar:credential:fake"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ownership on RevokeCredential (ADR-0972 (2), train step I1c).
+// ---------------------------------------------------------------------------
+
+/// The owner every ownership test names. NOT the fake's `RevokeCredential` echo
+/// `"yadgar:user:1"`, so a handler that published the store's id instead of the
+/// one it validated cannot pass by coincidence.
+const OWNER: &str = "yadgar:user:owner";
+
+fn revoking(user_id: &str) -> Request<RevokeCredentialRequest> {
+    Request::new(RevokeCredentialRequest {
+        credential_id: "yadgar:credential:fake".into(),
+        user_id: user_id.into(),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn revoke_credential_refuses_an_empty_user_id_before_any_upstream_call() {
+    // MUTATION THIS CATCHES: relaying the request without checking `user_id`.
+    // A store that implements the pair check refuses it too, but an `iam-db`
+    // too old to read the field would revoke by id alone — the refusal has to
+    // be here. Over-long is refused for `check_entity_id`'s column reason.
+    let long = "x".repeat(97);
+    for (name, user_id) in [("empty", ""), ("over-long", long.as_str())] {
+        let (iam, rec, inv) = iam_with(FakeDb::default()).await;
+
+        let refused = iam
+            .revoke_credential_as(Some(GATEWAY_CALLER), revoking(user_id))
+            .await
+            .expect_err(name);
+
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{name}");
+        assert_eq!(
+            rec.lock().expect("recorded").calls,
+            0,
+            "{name}: the store must never be asked"
+        );
+        assert!(inv.published().is_empty(), "{name}: nothing to evict");
+    }
+}
+
+#[tokio::test]
+async fn revoke_credential_relays_the_owner_and_publishes_for_it() {
+    let (iam, rec, inv) = iam_with(FakeDb::default()).await;
+
+    iam.revoke_credential_as(Some(GATEWAY_CALLER), revoking(OWNER))
+        .await
+        .expect("a revocation");
+
+    let seen = rec.lock().expect("recorded");
+    assert_eq!(seen.revoke_credential.len(), 1);
+    assert_eq!(
+        seen.revoke_credential[0].user_id, OWNER,
+        "the owner travels"
+    );
+    // ONE eviction: the store checked the pair, so its echo is the owner.
+    assert_eq!(
+        inv.published(),
+        vec![(subject::CREDENTIAL_REVOKED, OWNER.to_string())]
+    );
+}
+
+#[tokio::test]
+async fn a_credential_of_another_user_is_not_found_and_nothing_is_published() {
+    // The store's NOT_FOUND passes through as NOT_FOUND, with this service's
+    // fixed sentence and none of the store's words: the answer for "not yours"
+    // and "no such id" is one answer, so the call cannot learn whose a
+    // credential is.
+    let (iam, rec, inv) = iam_with(FakeDb {
+        revoke_fails: Some((
+            tonic::Code::NotFound,
+            "credential yadgar:credential:fake belongs to yadgar:user:other",
+        )),
+        ..Default::default()
+    })
+    .await;
+
+    let refused = iam
+        .revoke_credential_as(Some(GATEWAY_CALLER), revoking(OWNER))
+        .await
+        .expect_err("not the owner's");
+
+    assert_eq!(refused.code(), tonic::Code::NotFound);
+    assert_eq!(refused.message(), "no such record");
+    assert_eq!(rec.lock().expect("recorded").revoke_credential.len(), 1);
+    assert!(
+        inv.published().is_empty(),
+        "a refused revoke evicts nothing"
+    );
+}
+
+#[tokio::test]
+async fn revoke_all_relays_the_void_count() {
+    // ADR-0972 (5). NONZERO, because 0 is prost's default and a handler that
+    // dropped the store's number would still answer it.
+    let (iam, _rec, _inv) = iam_with(FakeDb {
+        revoke_all_answer: 2,
+        revoke_all_voided: 3,
+        ..Default::default()
+    })
+    .await;
+
+    let got = iam
+        .revoke_all_credentials_as(Some(GATEWAY_CALLER), revoke_all(REVOKE_ALL_USER, None))
+        .await
+        .expect("a revoke-all")
+        .into_inner();
+
+    assert_eq!(got.revoked, 2);
+    assert_eq!(got.voided_enrolments, 3, "the store's void count travels");
+}
+
+#[tokio::test]
+async fn a_store_that_revoked_by_id_alone_still_evicts_the_real_owner() {
+    // MIXED VERSIONS (security review of I1c): an `iam-db` older than ADR-0972
+    // (2) ignores `user_id`, revokes by id alone and answers with the REAL
+    // owner. Publishing only for the named user would leave the real owner's
+    // revoked token served from the gateway cache for the whole TTL. The
+    // store's answer says whose credential died, so it is evicted too.
+    let (iam, _rec, inv) = iam_with(FakeDb {
+        revoke_echo: Some("yadgar:user:real-owner".into()),
+        ..Default::default()
+    })
+    .await;
+
+    iam.revoke_credential_as(Some(GATEWAY_CALLER), revoking(OWNER))
+        .await
+        .expect("an old store revokes by id");
+
+    let published = inv.published();
+    assert!(
+        published.contains(&(
+            subject::CREDENTIAL_REVOKED,
+            "yadgar:user:real-owner".to_string()
+        )),
+        "the user whose credential the store revoked must be evicted: {published:?}"
+    );
+    assert!(
+        published.contains(&(subject::CREDENTIAL_REVOKED, OWNER.to_string())),
+        "the named user is evicted too: {published:?}"
+    );
 }

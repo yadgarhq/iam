@@ -209,6 +209,7 @@ async fn credential_rpcs(iam: &Iam, rec: &Arc<Mutex<Recorded>>, via: Via<'_>) ->
             revoke_credential_as,
             Request::new(RevokeCredentialRequest {
                 credential_id: "yadgar:credential:fake".into(),
+                user_id: "yadgar:user:1".into(),
                 ..Default::default()
             })
         ),

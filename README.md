@@ -85,6 +85,14 @@ legitimately costs more — two Argon2id operations and a further round trip —
 `Login`'s floor would be exceeded by every successful redemption, turning the
 warning that says "raise this" into one that fires on every call.
 
+**Both mints carry the credential epoch (ADR-0972 (4)).** `Login` sends the
+epoch `GetPasswordHash` read with the hash. A redemption sends the epoch its own
+bump produced. A reset, revoke-all or `SetPassword` that commits in between
+moves the epoch, and `iam-db` refuses the mint. `Login` then answers exactly as
+a wrong password, inside its floor. A redemption has already set the password,
+so it answers `FAILED_PRECONDITION` and tells the person to run
+`yaadgaar login`.
+
 Two residuals are accepted rather than hidden, and both are in the contract:
 
 - A retry mints a **fresh** credential, because a token shown once and kept as a
