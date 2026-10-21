@@ -184,11 +184,8 @@ impl Iam {
     /// restricting the verb to an attested administrator is the gateway route's
     /// job.
     ///
-    /// **THE ACTOR IS NOT RELAYED, BECAUSE THE FIELD DOES NOT EXIST ON THE HOP.**
-    /// `iamdb.v1.ListCredentialsRequest` (proto v1.19.0) has no
-    /// `unverified_actor`, unlike `iam.v1.ListCredentialsRequest`. Nothing is
-    /// fabricated to fill the gap, and this is not one of the `None` sites in
-    /// `issue_credential`'s comment: those send a field that exists.
+    /// **THE ACTOR IS RELAYED** (proto v1.21.0 added it to the `iam-db` hop):
+    /// exactly as received, audit-only, and absent stays absent.
     ///
     /// **A REVOKED ROW IS DROPPED HERE TOO.** The contract omits it and `iam-db`
     /// does too. An entry leaving the list is how a caller sees a revocation
@@ -223,7 +220,7 @@ impl Iam {
             user_id: r.user_id.clone(),
             page_size: r.page_size,
             page_token: r.page_token.clone(),
-            unverified_actor: None,
+            unverified_actor: r.unverified_actor.clone(),
         });
         forward_request_id(&req, &mut upstream);
 
@@ -325,18 +322,18 @@ impl Iam {
             // arrive on. Relaying `r.unverified_actor` today would move `None`
             // and READ AS A RELAY THAT WORKS.
             //
-            // **THE RELAY HAS NINE SITES AND FOUR OF THEM STILL SEND `None`**:
+            // **THE RELAY HAS TEN SITES AND FOUR OF THEM STILL SEND `None`**:
             // here, `add_team_member`, `remove_team_member` and
             // `set_inherited_setting`. The sites were invisible until this file
             // stopped using a rest pattern, so whoever wires the path by grepping
             // for the field would have found only some of them.
             //
-            // **FIVE RELAY FOR REAL — `set_user_admin`, `create_user`,
-            // `issue_enrolment`, `revoke_all_credentials` and
-            // `revoke_credential`** — so "nothing populates the field" is not
+            // **SIX RELAY FOR REAL — `set_user_admin`, `create_user`,
+            // `issue_enrolment`, `revoke_all_credentials`, `revoke_credential`
+            // and `list_credentials`** — so "nothing populates the field" is not
             // true of this service as a whole. It stays true here: the first
             // three are exactly the RPCs the gateway's administrative route
-            // reaches, and the last two relay because their contracts require it
+            // reaches, and the last three relay because their contracts require it
             // (ADR-0945, ledger 1627), ahead of the gateway routes that will call
             // them. This is not one of them. The four that send `None` wait on a
             // caller each, not on a sink. `iam-db` already reads the field on
@@ -370,6 +367,14 @@ impl Iam {
         req: Request<RevokeCredentialRequest>,
         call: Call,
     ) -> Result<Response<RevokeCredentialResponse>, Status> {
+        // OWNERSHIP (ADR-0972 (2)): REQUIRED, and refused BEFORE the upstream
+        // call. An `iam-db` too old to read the field would revoke by id alone,
+        // so the refusal cannot be left to the store.
+        let user_id = req.get_ref().user_id.clone();
+        if let Err(refusal) = required_entity_id(&user_id) {
+            call.fail("INVALID_ARGUMENT");
+            return Err(refusal);
+        }
         let mut upstream = Request::new(db::RevokeCredentialRequest {
             // D9's key travels. A revocation is a mutating RPC a retrying load
             // balancer will deliver twice, and the key is what makes the second
@@ -382,21 +387,22 @@ impl Iam {
             // authorises on it. An empty actor is never fabricated to fill the
             // field.
             unverified_actor: req.get_ref().unverified_actor.clone(),
-            user_id: String::new(),
+            // The store matches the PAIR and answers NOT_FOUND when no row
+            // carries it. `upstream_failed` keeps that code and replaces the
+            // words, so "not yours" and "no such id" read the same.
+            user_id: user_id.clone(),
         });
         forward_request_id(&req, &mut upstream);
 
-        let done = self
-            .client()
+        self.client()
             .revoke_credential(upstream)
             .await
-            .map_err(upstream_failed)?
-            .into_inner();
+            .map_err(upstream_failed)?;
 
         // The USER, not the credential — the gateway's cache is keyed on a token
         // hash this service never sees, so the person is the addressable unit.
-        // This is why RevokeCredential returns user_id at all.
-        self.invalidator.credential_revoked(&done.user_id).await;
+        // The id VALIDATED above: the store checked the pair against it.
+        self.invalidator.credential_revoked(&user_id).await;
 
         call.finish(Outcome {
             status: "OK",
@@ -416,12 +422,7 @@ impl Iam {
         // BEFORE THE UPSTREAM CALL, so a refused request reaches no store. An
         // empty id names nobody; `check_entity_id` bounds only the length, and it
         // is not widened here because `issue_credential` shares it.
-        let checked = if r.user_id.is_empty() {
-            Err(Status::invalid_argument("`user_id` is required"))
-        } else {
-            check_entity_id("user_id", &r.user_id)
-        };
-        if let Err(refusal) = checked {
+        if let Err(refusal) = required_entity_id(&r.user_id) {
             call.fail("INVALID_ARGUMENT");
             return Err(refusal);
         }
@@ -464,7 +465,8 @@ impl Iam {
         });
         Ok(Response::new(RevokeAllCredentialsResponse {
             revoked: done.revoked,
-            voided_enrolments: 0,
+            // ADR-0972 (5): what THIS delivery voided, relayed unchanged.
+            voided_enrolments: done.voided_enrolments,
         }))
     }
 }

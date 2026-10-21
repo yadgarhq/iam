@@ -76,12 +76,12 @@ struct Recorded {
     create_user: Vec<db::CreateUserRequest>,
     add_team_member: Vec<db::AddTeamMemberRequest>,
     remove_team_member: Vec<db::RemoveTeamMemberRequest>,
-    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and now one of five:
+    /// **THE FIRST RELAY SITE WITH SOMETHING TO RELAY**, and now one of six:
     /// `create_user` and `create_enrolment` above carry ADR-0534's actor too since
-    /// ledger 612, and `revoke_all_credentials` since ADR-0945 and
-    /// `revoke_credential` since ledger 1627. The four administrative writes
+    /// ledger 612, `revoke_all_credentials` since ADR-0945, `revoke_credential`
+    /// since ledger 1627 and `list_credentials` since proto v1.21.0. The four administrative writes
     /// that still forward `unverified_actor: None` buy nothing from a recorded
-    /// request but the field list. On these five a
+    /// request but the field list. On these six a
     /// hard-coded `None` answers `Ok` exactly like a working relay — so the
     /// forwarded request is the only oracle.
     set_user_admin: Vec<db::SetUserAdminRequest>,

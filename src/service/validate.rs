@@ -240,3 +240,14 @@ pub(super) fn check_entity_id(field: &str, id: &str) -> Result<(), Status> {
     }
     Ok(())
 }
+
+/// A `user_id` that must name somebody: non-empty, then [`check_entity_id`].
+///
+/// The admin verbs that act on one user's credentials (revoke-all, revoke one)
+/// share it, so the two cannot disagree about what an absent owner is.
+pub(super) fn required_entity_id(user_id: &str) -> Result<(), Status> {
+    if user_id.is_empty() {
+        return Err(Status::invalid_argument("`user_id` is required"));
+    }
+    check_entity_id("user_id", user_id)
+}

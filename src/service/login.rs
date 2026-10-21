@@ -7,6 +7,14 @@
 use super::validate::*;
 use super::*;
 
+/// Why [`Iam::mint_under_epoch`] minted nothing.
+pub(super) enum MintRefused {
+    /// The user's credential epoch moved since it was read.
+    EpochMoved,
+    /// Any other store failure, already redacted by `upstream_failed`.
+    Failed(Status),
+}
+
 impl Iam {
     /// Everything `Login` actually does. Wrapped by the trait method, which is
     /// what holds it to the response-time floor.
@@ -125,16 +133,19 @@ impl Iam {
             // `LoginRequest` carries no actor and ADR-0534's field is for
             // administrative requests.
             unverified_actor: None,
-            expected_credential_epoch: None,
+            // ALWAYS SENT; 0 IS A REAL EPOCH. See [`Self::mint_under_epoch`].
+            expected_credential_epoch: Some(found.credential_epoch),
         });
         forward_request_id(&req, &mut create);
 
-        let created = self
-            .client()
-            .create_credential(create)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let created = match self.mint_under_epoch(create).await {
+            Ok(created) => created,
+            Err(MintRefused::EpochMoved) => {
+                call.fail("UNAUTHENTICATED");
+                return Err(refused());
+            }
+            Err(MintRefused::Failed(failed)) => return Err(failed),
+        };
 
         call.finish(Outcome {
             status: "OK",
@@ -146,6 +157,32 @@ impl Iam {
             credential_id: created.credential_id,
             expires_at: None,
         }))
+    }
+
+    /// Mint a `Login` or redemption credential under the epoch the caller read,
+    /// telling a moved epoch apart from every other store failure.
+    ///
+    /// THE EPOCH (ADR-0972 (4)) is the value read in the same statement as the
+    /// hash (`Login`) or produced by the redemption's own bump. A reset,
+    /// revoke-all or `SetPassword` that committed since moves it, and `iam-db`
+    /// refuses the mint with `FAILED_PRECONDITION` rather than letting a
+    /// credential outlive that commit. Zero is a real epoch, so the caller
+    /// always sends `Some`. The store's words go to the log; each caller picks
+    /// its own answer, because only a redemption has already set a password.
+    /// `Login` answers EXACTLY as a wrong password, inside its floor, so the
+    /// race opens no oracle.
+    pub(super) async fn mint_under_epoch(
+        &self,
+        create: Request<db::CreateCredentialRequest>,
+    ) -> Result<db::CreateCredentialResponse, MintRefused> {
+        match self.client().create_credential(create).await {
+            Ok(created) => Ok(created.into_inner()),
+            Err(moved) if moved.code() == tonic::Code::FailedPrecondition => {
+                tracing::info!(upstream = %moved.message(), "a mint lost the credential epoch race");
+                Err(MintRefused::EpochMoved)
+            }
+            Err(other) => Err(MintRefused::Failed(upstream_failed(other))),
+        }
     }
 
     /// Wait out whatever is left of the floor, or say that there was nothing left.
