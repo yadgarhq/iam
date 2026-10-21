@@ -154,6 +154,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         broker_and_watch(listen_tls.as_ref(), db_tls.as_ref(), &config).await?;
 
     let floors = boot::response_floors()?;
+    let lifetime = boot::credential_lifetime()?;
 
     let addr: SocketAddr = boot::env_required("LISTEN")?
         .parse()
@@ -173,7 +174,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     serve_and_drain(
         server,
         addr,
-        Iam::new(keys, db, invalidator, floors, enrolment),
+        Iam::new(keys, db, invalidator, floors, enrolment, lifetime),
         listen_tls.as_ref(),
         watch_inputs,
         schedule,

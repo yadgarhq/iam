@@ -504,6 +504,20 @@ redeemEnrolment:
   # slowest legitimate redemption on THIS cluster approaches it.
   responseFloorMs: 750
 
+credential:
+  # How long every Login and RedeemEnrolment credential lives, in seconds
+  # (ADR-0972 (3)). Rendered as CREDENTIAL_LIFETIME_SECONDS; iam refuses to
+  # boot without it. 7776000 is 90 days, the ruled default.
+  #
+  # A WHOLE NUMBER, 1 TO 315360000 (ten years, the bound IssueCredential uses).
+  # There is no "never expires" value: 0, a negative and a non-integer are
+  # refused at render by templates/render-checks.yaml, naming this key.
+  #
+  # Credentials minted before this release keep their NULL expiry and are not
+  # backfilled. The gateway never caches a resolution past a credential's
+  # expiry. People re-run `yaadgaar login` when theirs expires.
+  lifetimeSeconds: 7776000
+
 # What iam puts into every enrolment token it mints (D73). An admin assembles
 # neither value and so cannot get either wrong — which puts the whole burden of
 # holding correct ones here.

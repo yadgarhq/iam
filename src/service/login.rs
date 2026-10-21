@@ -117,6 +117,7 @@ impl Iam {
         }
 
         let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
+        let expires_at = super::lifetime::deadline(self.credential_lifetime);
         let mut create = Request::new(db::CreateCredentialRequest {
             // NOTHING TO SUPPLY: `LoginRequest` carries no idempotency key. D9's
             // key covers mutating RPCs a caller can retry, and a sign-in is not
@@ -125,9 +126,8 @@ impl Iam {
             user_id: found.user_id.clone(),
             token_hash: Keys::token_hash(&token),
             label: req.get_ref().label.clone(),
-            // NOTHING TO SUPPLY: `LoginRequest` has no field to ask for an
-            // expiry, so there is no deadline to carry.
-            expires_at: None,
+            // ADR-0972 (3): now + CREDENTIAL_LIFETIME_SECONDS, also returned.
+            expires_at: Some(expires_at),
             // NOTHING TO SUPPLY, AND NOT MERELY UNWIRED. `Login` is the person
             // themselves signing in, not an administrator acting on someone —
             // `LoginRequest` carries no actor and ADR-0534's field is for
@@ -155,7 +155,7 @@ impl Iam {
             // The only time this value is ever returned. The store holds a hash.
             token: token.to_string(),
             credential_id: created.credential_id,
-            expires_at: None,
+            expires_at: Some(expires_at),
         }))
     }
 

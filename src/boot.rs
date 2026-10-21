@@ -15,7 +15,7 @@ use tonic::transport::{Channel, Server};
 use crate::invalidate::Credentials;
 use crate::rotate::{self, Configuration, Schedule};
 use crate::serve::{self, ServerTls};
-use crate::service::{EnrolmentConfig, ResponseFloors};
+use crate::service::{CredentialLifetime, EnrolmentConfig, ResponseFloors};
 use crate::upstream::{self, UpstreamTls};
 
 /// The file holding the broker password. A PATH, never the value (D80).
@@ -454,6 +454,19 @@ pub fn response_floors() -> Result<ResponseFloors, Box<dyn std::error::Error>> {
         login: login_response_floor,
         redeem: redeem_response_floor,
     })
+}
+
+/// ADR-0972 (3): how long every `Login` and redemption credential lives.
+///
+/// REQUIRED, like the floors: no compiled-in default (ADR-0569), and no "never"
+/// value. The chart renders it from `credential.lifetimeSeconds`.
+pub fn credential_lifetime() -> Result<CredentialLifetime, Box<dyn std::error::Error>> {
+    let lifetime = CredentialLifetime::parse(&env_required("CREDENTIAL_LIFETIME_SECONDS")?)?;
+    tracing::info!(
+        lifetime_seconds = lifetime.seconds(),
+        "Login and RedeemEnrolment credentials expire after CREDENTIAL_LIFETIME_SECONDS"
+    );
+    Ok(lifetime)
 }
 
 #[cfg(test)]

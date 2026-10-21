@@ -226,3 +226,41 @@ the render. With `tls.enabled` false none of this runs (ADR-0975, see above).
       .Values.tls.clientAuth) }}
 {{- end }}
 {{- end }}
+{{/*
+`credential.lifetimeSeconds` (ADR-0972 (3), ledger 1628): REFUSED HERE, BY NAME, EVERY
+VALUE THE BINARY REFUSES AT BOOT. It renders CREDENTIAL_LIFETIME_SECONDS, which iam reads
+with no default and no "never" value, so a value that rendered and then CrashLooped iam
+would stop the authentication plane. The schema leaf is untyped `{}` (ADR-0847) so these
+sentences, not helm's, reach the adopter.
+
+WHOLE NUMBER, AND THE KIND MATTERS: a values file delivers 7776000 as float64 and `--set`
+as int64, so both kinds are accepted when integral. A string (`--set-string`, a quoted
+value) and a bool are refused rather than coerced. The upper bound is IssueCredential's
+ten years (`MAX_EXPIRES_IN_SECONDS` in src/service/credential.rs).
+*/}}
+{{- $credential := .Values.credential }}
+{{- if not (and (kindIs "map" $credential) (hasKey $credential "lifetimeSeconds") (not (kindIs "invalid" $credential.lifetimeSeconds))) }}
+{{- fail (join "" (list
+      "iam: credential.lifetimeSeconds must be set: it renders CREDENTIAL_LIFETIME_SECONDS, which iam "
+      "requires to boot, and every Login and RedeemEnrolment credential expires after it (ADR-0972). "
+      "The chart default is 7776000 (90 days).")) }}
+{{- end }}
+{{- $lifetime := $credential.lifetimeSeconds }}
+{{- if not (or (kindIs "int" $lifetime) (kindIs "int64" $lifetime) (and (kindIs "float64" $lifetime) (eq $lifetime (floor $lifetime)))) }}
+{{- fail (printf (join "" (list
+      "iam: credential.lifetimeSeconds is %v (%s), which is not a whole number of seconds. Write an "
+      "unquoted integer, for example 7776000 for 90 days (ADR-0972)."))
+      $lifetime (kindOf $lifetime)) }}
+{{- end }}
+{{- if le (int64 $lifetime) 0 }}
+{{- fail (printf (join "" (list
+      "iam: credential.lifetimeSeconds is %d, and a credential lifetime must be positive: there is "
+      "no \"never expires\" value (ADR-0972)."))
+      (int64 $lifetime)) }}
+{{- end }}
+{{- if gt (int64 $lifetime) 315360000 }}
+{{- fail (printf (join "" (list
+      "iam: credential.lifetimeSeconds is %d, longer than the ten years (315360000) iam grants any "
+      "credential (ADR-0972)."))
+      (int64 $lifetime)) }}
+{{- end }}

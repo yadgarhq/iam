@@ -27,6 +27,12 @@ use super::*;
 /// caller meets here is this service's own and never the store's.
 pub(super) const MAX_EXPIRES_IN_SECONDS: i64 = 315_360_000;
 
+/// THE ONE UPPER BOUND on a credential life, shared by `IssueCredential` and
+/// `CREDENTIAL_LIFETIME_SECONDS` (ADR-0972 (3)) so the two cannot disagree.
+pub(super) fn exceeds_max_lifetime(seconds: i64) -> bool {
+    seconds > MAX_EXPIRES_IN_SECONDS
+}
+
 /// The two `expires_in_seconds` values `IssueCredential` refuses, and why the
 /// refusal belongs on this boundary rather than at the store.
 ///
@@ -75,7 +81,7 @@ fn check_issue_credential(r: &IssueCredentialRequest) -> Result<(), Status> {
              that 0 asks for",
         ));
     }
-    if r.expires_in_seconds > MAX_EXPIRES_IN_SECONDS {
+    if exceeds_max_lifetime(r.expires_in_seconds) {
         return Err(Status::invalid_argument(
             "expires_in_seconds is longer than this service will grant a \
              credential; send 0 to ask for no expiry at all",
@@ -117,6 +123,7 @@ impl Iam {
         // negative answer is the one thing that must never be served from a
         // cache.
         let resolved = !got.user_id.is_empty();
+        let live_for = super::lifetime::valid_for_seconds(got.expires_at.as_ref());
         let resp = ResolveCredentialResponse {
             user_id: got.user_id,
             team_ids: got.team_ids,
@@ -124,7 +131,8 @@ impl Iam {
             // mechanism — revocation and team changes arrive as broker events
             // (D72). Five minutes bounds how long a missed event can leave a
             // revoked credential working.
-            valid_for_seconds: if resolved { 300 } else { 0 },
+            // ADR-0972 (3): never longer than the credential has left.
+            valid_for_seconds: if resolved { live_for } else { 0 },
             // D73's flag, read in the same transaction as the credential and
             // passed straight through. FALSE IS THE SAFE DEFAULT — an `iam` that
             // did not set it denies administration rather than granting it —

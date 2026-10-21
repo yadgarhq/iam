@@ -226,3 +226,45 @@ fn a_missing_or_out_of_range_request_timeout_names_the_variable_and_the_chart_ke
         );
     }
 }
+
+/// ADR-0972 (3): `CREDENTIAL_LIFETIME_SECONDS` has no compiled-in default and
+/// no "never" value. Read after the response floors, so the document is
+/// mounted. Absent, zero and above `IssueCredential`'s ten-year bound each
+/// refuse the boot, naming the variable.
+fn credential_lifetime_refusal(value: Option<&str>) -> String {
+    let keys_dir = fresh_keys_dir();
+    let mut vars = cleartext_env(&keys_dir);
+    vars.retain(|(k, _)| *k != "CREDENTIAL_LIFETIME_SECONDS");
+    if let Some(value) = value {
+        vars.push(("CREDENTIAL_LIFETIME_SECONDS", value.to_string()));
+    }
+    let (status, stderr) = run_to_exit(&vars);
+    refusal_line(status, &stderr)
+}
+
+#[test]
+fn an_absent_credential_lifetime_refuses_to_boot() {
+    let line = credential_lifetime_refusal(None);
+    assert!(
+        line.contains("CREDENTIAL_LIFETIME_SECONDS is NOT SET"),
+        "the refusal must name the variable: {line}"
+    );
+}
+
+#[test]
+fn a_zero_credential_lifetime_refuses_to_boot() {
+    let line = credential_lifetime_refusal(Some("0"));
+    assert!(
+        line.contains("CREDENTIAL_LIFETIME_SECONDS") && line.contains("credential.lifetimeSeconds"),
+        "the refusal must name the variable and the chart key: {line}"
+    );
+}
+
+#[test]
+fn a_lifetime_above_ten_years_refuses_to_boot() {
+    let line = credential_lifetime_refusal(Some("315360001"));
+    assert!(
+        line.contains("CREDENTIAL_LIFETIME_SECONDS") && line.contains("credential.lifetimeSeconds"),
+        "the refusal must name the variable and the chart key: {line}"
+    );
+}

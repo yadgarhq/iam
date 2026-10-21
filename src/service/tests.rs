@@ -164,6 +164,9 @@ struct FakeDb {
     /// an `iam-db` older than ADR-0972 (2): it revokes by id alone and answers
     /// with the REAL owner, who may not be the user the caller named.
     revoke_echo: Option<String>,
+    /// What `ResolveCredential` answers as `expires_at` (ADR-0972 (3)). `None`
+    /// is a legacy row with no expiry.
+    resolves_expires_at: Option<prost_types::Timestamp>,
     /// What `RevokeAllCredentials` answers as `voided_enrolments`. NONZERO in the
     /// test that pins the relay, for `revoke_all_answer`'s reason.
     revoke_all_voided: u32,
@@ -217,6 +220,7 @@ impl IamDbService for FakeDb {
             user_id: self.resolves_to.clone().unwrap_or_default(),
             is_admin: promoted.unwrap_or(self.resolves_admin),
             owner_reads_own_record: self.resolves_setting.clone(),
+            expires_at: self.resolves_expires_at,
             ..Default::default()
         }))
     }
@@ -590,6 +594,31 @@ async fn iam_with_floors(
     iam_with_keys(fake, crate::crypto::tests::keys(), floors, enrolment).await
 }
 
+/// The lifetime every test that is NOT about the lifetime runs with: the
+/// chart's 90-day default.
+const TEST_LIFETIME_SECONDS: i64 = 7_776_000;
+
+fn test_lifetime() -> CredentialLifetime {
+    CredentialLifetime::parse(&TEST_LIFETIME_SECONDS.to_string()).expect("a valid lifetime")
+}
+
+/// An `Iam` minting credentials that live `seconds`.
+async fn iam_with_lifetime(fake: FakeDb, seconds: i64) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    let lifetime = CredentialLifetime::parse(&seconds.to_string()).expect("a valid lifetime");
+    let floors = ResponseFloors {
+        login: NOMINAL_FLOOR,
+        redeem: NOMINAL_FLOOR,
+    };
+    iam_assembled(
+        fake,
+        crate::crypto::tests::keys(),
+        floors,
+        enrolment_config(),
+        lifetime,
+    )
+    .await
+}
+
 /// [`iam_with_floors`], holding `keys` rather than the shared fixture.
 async fn iam_with_keys(
     fake: FakeDb,
@@ -597,9 +626,27 @@ async fn iam_with_keys(
     floors: ResponseFloors,
     enrolment: Option<EnrolmentConfig>,
 ) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
+    iam_assembled(fake, keys, floors, enrolment, test_lifetime()).await
+}
+
+/// Every harness above, assembled in one place.
+async fn iam_assembled(
+    fake: FakeDb,
+    keys: Keys,
+    floors: ResponseFloors,
+    enrolment: Option<EnrolmentConfig>,
+    lifetime: CredentialLifetime,
+) -> (Iam, Arc<Mutex<Recorded>>, Invalidator) {
     let (channel, recorded) = twin(fake).await;
     let invalidator = Invalidator::connect(None, None, None).await;
-    let iam = Iam::new(keys, channel, invalidator.clone(), floors, enrolment);
+    let iam = Iam::new(
+        keys,
+        channel,
+        invalidator.clone(),
+        floors,
+        enrolment,
+        lifetime,
+    );
     // LAST, and both halves of that matter. It installs the WARN tap, so no login
     // any test performs can precede the global subscriber; and it drains this
     // thread's list, so setup noise — `Invalidator::connect(None)` warns that it
@@ -1517,6 +1564,7 @@ async fn revoking_all_credentials_answers_ok_when_the_broker_is_unreachable() {
             redeem: NOMINAL_FLOOR,
         },
         enrolment_config(),
+        test_lifetime(),
     );
     warnings_from_here();
 
@@ -4664,3 +4712,4 @@ mod credentials;
 mod epoch;
 mod gate;
 mod gate_transport;
+mod lifetime;
