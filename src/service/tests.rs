@@ -159,6 +159,11 @@ struct FakeDb {
     /// A `(code, message)` to fail `RevokeCredential` with: `NOT_FOUND` is the
     /// store's answer for a `(credential_id, user_id)` pair no row carries.
     revoke_fails: Option<(tonic::Code, &'static str)>,
+    /// Whose credential `RevokeCredential` reports it revoked. `None` echoes the
+    /// request's `user_id`, as an `iam-db` that checks the pair does. `Some` is
+    /// an `iam-db` older than ADR-0972 (2): it revokes by id alone and answers
+    /// with the REAL owner, who may not be the user the caller named.
+    revoke_echo: Option<String>,
     /// What `RevokeAllCredentials` answers as `voided_enrolments`. NONZERO in the
     /// test that pins the relay, for `revoke_all_answer`'s reason.
     revoke_all_voided: u32,
@@ -371,9 +376,15 @@ impl IamDbService for FakeDb {
         if let Some((code, message)) = self.revoke_fails {
             return Err(Status::new(code, message));
         }
-        Ok(Response::new(db::RevokeCredentialResponse {
-            user_id: "yadgar:user:1".into(),
-        }))
+        let user_id = self.revoke_echo.clone().unwrap_or_else(|| {
+            let seen = self.recorded.lock().expect("recorded");
+            seen.revoke_credential
+                .last()
+                .expect("recorded")
+                .user_id
+                .clone()
+        });
+        Ok(Response::new(db::RevokeCredentialResponse { user_id }))
     }
 
     async fn revoke_all_credentials(

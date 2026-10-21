@@ -268,3 +268,34 @@ async fn issue_credential_sends_no_expected_epoch() {
 
     assert_eq!(minted(&rec)[0].expected_credential_epoch, None);
 }
+
+#[tokio::test]
+async fn a_revoking_redemption_whose_mint_lost_the_race_still_evicts() {
+    // GUARD (security review of I1c): the store revoked the old credentials in
+    // the redemption's transaction, which committed before the mint was
+    // refused. The eviction must not depend on the mint landing.
+    let password = fixture_password();
+    let mut spent = redeemed_at(6);
+    if let Some(r) = spent.as_mut() {
+        r.revoked_existing_credentials = true;
+    }
+    let (iam, _rec, inv) = iam_with(FakeDb {
+        redeem: spent,
+        password: known_user(&password),
+        create_credential_fails: Some((tonic::Code::FailedPrecondition, EPOCH_MOVED)),
+        ..Default::default()
+    })
+    .await;
+
+    iam.redeem_enrolment_as(
+        Some(GATEWAY_CALLER),
+        redeem(&fixture_secret(), &password, "k1"),
+    )
+    .await
+    .expect_err("the epoch moved");
+
+    assert_eq!(
+        inv.published(),
+        vec![(subject::CREDENTIAL_REVOKED, "yadgar:user:1".to_string())]
+    );
+}

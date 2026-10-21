@@ -348,8 +348,7 @@ async fn revoke_credential_relays_the_owner_and_publishes_for_it() {
         seen.revoke_credential[0].user_id, OWNER,
         "the owner travels"
     );
-    // The id VALIDATED here, not the store's echo: the store checked the pair
-    // against exactly this value.
+    // ONE eviction: the store checked the pair, so its echo is the owner.
     assert_eq!(
         inv.published(),
         vec![(subject::CREDENTIAL_REVOKED, OWNER.to_string())]
@@ -404,4 +403,35 @@ async fn revoke_all_relays_the_void_count() {
 
     assert_eq!(got.revoked, 2);
     assert_eq!(got.voided_enrolments, 3, "the store's void count travels");
+}
+
+#[tokio::test]
+async fn a_store_that_revoked_by_id_alone_still_evicts_the_real_owner() {
+    // MIXED VERSIONS (security review of I1c): an `iam-db` older than ADR-0972
+    // (2) ignores `user_id`, revokes by id alone and answers with the REAL
+    // owner. Publishing only for the named user would leave the real owner's
+    // revoked token served from the gateway cache for the whole TTL. The
+    // store's answer says whose credential died, so it is evicted too.
+    let (iam, _rec, inv) = iam_with(FakeDb {
+        revoke_echo: Some("yadgar:user:real-owner".into()),
+        ..Default::default()
+    })
+    .await;
+
+    iam.revoke_credential_as(Some(GATEWAY_CALLER), revoking(OWNER))
+        .await
+        .expect("an old store revokes by id");
+
+    let published = inv.published();
+    assert!(
+        published.contains(&(
+            subject::CREDENTIAL_REVOKED,
+            "yadgar:user:real-owner".to_string()
+        )),
+        "the user whose credential the store revoked must be evicted: {published:?}"
+    );
+    assert!(
+        published.contains(&(subject::CREDENTIAL_REVOKED, OWNER.to_string())),
+        "the named user is evicted too: {published:?}"
+    );
 }

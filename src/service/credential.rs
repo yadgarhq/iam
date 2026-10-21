@@ -394,15 +394,23 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        self.client()
+        let done = self
+            .client()
             .revoke_credential(upstream)
             .await
-            .map_err(upstream_failed)?;
+            .map_err(upstream_failed)?
+            .into_inner();
 
         // The USER, not the credential — the gateway's cache is keyed on a token
         // hash this service never sees, so the person is the addressable unit.
-        // The id VALIDATED above: the store checked the pair against it.
+        // AFTER THE COMMIT, for the validated user AND for whoever the store
+        // says owned the credential. A D1b store checked the pair, so the two
+        // are one user. An older store revoked by id alone, and its answer is
+        // the real owner, whose revoked token must not stay cached.
         self.invalidator.credential_revoked(&user_id).await;
+        if !done.user_id.is_empty() && done.user_id != user_id {
+            self.invalidator.credential_revoked(&done.user_id).await;
+        }
 
         call.finish(Outcome {
             status: "OK",
