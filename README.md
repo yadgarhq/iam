@@ -29,7 +29,7 @@ Everything a credential store has no business doing itself (D72):
 - **A credential is an opaque bearer token**, random and hashed at rest.
   `ResolveCredential` is the one RPC on the request path — the gateway calls it
   on a cache miss, never per request, because `recall` is the latency-critical
-  path (D25) and every call crosses this boundary.
+  path (D67, after D25) and every call crosses this boundary.
 - **Minting is administrative, not an agent operation.** `IssueCredential`,
   `CreateUser` and the team-membership RPCs are GitOps or CLI surface; an agent
   presents a credential, it never issues one.

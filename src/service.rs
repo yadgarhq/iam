@@ -377,7 +377,7 @@ fn forward_request_id<T, U>(from: &Request<T>, to: &mut Request<U>) {
         return;
     }
     // Always parses: `to_str()` admitted the inbound value and the marker is
-    // ASCII. Dropped rather than unwrapped if it ever did not (D25).
+    // ASCII. Dropped rather than unwrapped if it ever did not (D67).
     if let Ok(v) = id.parse() {
         to.metadata_mut().insert("x-yadgar-request-id", v);
     }
@@ -414,7 +414,7 @@ fn capped(s: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// A header is bounded only by the transport, and this one `String` reaches the
 /// `CallRecord` through `tel`'s `Scope`. Capped rather than refused, because a
-/// correlation id is transport-level context and must never fail a call (D25).
+/// correlation id is transport-level context and must never fail a call (D67).
 /// The gateway mints every legitimate id as a 36-character UUIDv7, so a value
 /// long enough to be cut did not come from it.
 fn request_id_of<T>(req: &Request<T>) -> String {
