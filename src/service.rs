@@ -20,6 +20,7 @@
 //! | [`validate`] | the bounds on fields that appear in more than one request |
 //! | [`rpc`] | the `IamService` impl: contract docs, and the caller handed on |
 //! | [`caller`] | the caller gate (ADR-0972): the `_as` seam, telemetry scope, floors |
+//! | [`teams`] | `SyncTeams`, its seeder gate, and `IAM_ADMIN_FROM_TEAM` (team access) |
 //!
 //! A BOUND STAYS WITH THE REQUEST IT WAS ARGUED FOR, which is ADR-0565's rule
 //! about re-arguing a bound per field, applied to where the bound lives. Only
@@ -50,6 +51,7 @@ mod lifetime;
 mod login;
 mod rpc;
 mod settings;
+mod teams;
 mod validate;
 
 /// The `service` label every metric this binary emits carries (D67). Public so
@@ -58,6 +60,10 @@ mod validate;
 pub const SERVICE: &str = "iam";
 
 pub use lifetime::{CredentialLifetime, LIFETIME_CHART_KEY, LIFETIME_ENV};
+pub use teams::{
+    parse_admin_from_team, ADMIN_FROM_TEAM_CHART_KEY, ADMIN_FROM_TEAM_ENV, SEEDER_CALLER,
+    SEEDER_PRINCIPAL,
+};
 
 /// The measured response-time floor for [`IamService::login`].
 ///
@@ -291,6 +297,9 @@ pub struct Iam {
     enrolment: Option<EnrolmentConfig>,
     /// ADR-0972 (3): what every `Login` and redemption credential lives for.
     credential_lifetime: CredentialLifetime,
+    /// `IAM_ADMIN_FROM_TEAM` (ADR-0962, ADR-0963; plans/team-access.md §6).
+    /// See [`teams`] for what it changes.
+    admin_from_team: bool,
 }
 
 impl Iam {
@@ -312,6 +321,7 @@ impl Iam {
         floors: ResponseFloors,
         enrolment: Option<EnrolmentConfig>,
         credential_lifetime: CredentialLifetime,
+        admin_from_team: bool,
     ) -> Self {
         Self {
             keys,
@@ -329,6 +339,7 @@ impl Iam {
             },
             enrolment,
             credential_lifetime,
+            admin_from_team,
         }
     }
 

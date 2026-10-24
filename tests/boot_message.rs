@@ -323,3 +323,25 @@ fn a_lifetime_above_ten_years_refuses_to_boot() {
         "the refusal must name the variable and the chart key: {line}"
     );
 }
+
+/// Team access stage 3: `IAM_ADMIN_FROM_TEAM` has no compiled-in default
+/// (ADR-0569) and is exactly `true` or `false`. Read after the credential
+/// lifetime, so the document is mounted. Absent, empty and any other spelling
+/// each refuse the boot, naming the variable and the chart key.
+#[test]
+fn an_absent_or_misspelt_admin_from_team_refuses_to_boot() {
+    for bad in [None, Some(""), Some("yes"), Some("True")] {
+        let keys_dir = fresh_keys_dir();
+        let mut vars = cleartext_env(&keys_dir);
+        vars.retain(|(k, _)| *k != "IAM_ADMIN_FROM_TEAM");
+        if let Some(value) = bad {
+            vars.push(("IAM_ADMIN_FROM_TEAM", value.to_string()));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains("IAM_ADMIN_FROM_TEAM") && line.contains("adminFromTeam"),
+            "{bad:?}: the refusal must name the variable and the chart key: {line}"
+        );
+    }
+}

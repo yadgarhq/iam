@@ -149,6 +149,7 @@ pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
         ("REDEEM_RESPONSE_FLOOR_MS", "0".to_string()),
         // ADR-0972 (3): required, no default. The chart's 90 days.
         ("CREDENTIAL_LIFETIME_SECONDS", "7776000".to_string()),
+        ("IAM_ADMIN_FROM_TEAM", "false".to_string()),
     ]
 }
 

@@ -205,6 +205,13 @@ impl IamDbService for FakeTwin {
     ) -> Result<Response<db::SetInheritedSettingResponse>, Status> {
         unimplemented!("the key-identity check never calls this arm")
     }
+
+    async fn sync_teams(
+        &self,
+        _r: Request<db::SyncTeamsRequest>,
+    ) -> Result<Response<db::SyncTeamsResponse>, Status> {
+        unimplemented!("the key-identity check never calls this arm")
+    }
 }
 
 /// A port nothing is listening on, learned rather than guessed.
