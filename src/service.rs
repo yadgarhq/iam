@@ -21,6 +21,7 @@
 //! | [`rpc`] | the `IamService` impl: contract docs, and the caller handed on |
 //! | [`caller`] | the caller gate (ADR-0972): the `_as` seam, telemetry scope, floors |
 //! | [`teams`] | `SyncTeams`, its seeder gate, and `IAM_ADMIN_FROM_TEAM` (team access) |
+//! | [`store`] | the `iam-db` hop under the caller's deadline (ADR-1019) |
 //!
 //! A BOUND STAYS WITH THE REQUEST IT WAS ARGUED FOR, which is ADR-0565's rule
 //! about re-arguing a bound per field, applied to where the bound lives. Only
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use tonic::{Request, Response, Status};
+use yadgar_dial::Deadline;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
@@ -51,6 +53,7 @@ mod lifetime;
 mod login;
 mod rpc;
 mod settings;
+mod store;
 mod teams;
 mod validate;
 
@@ -60,6 +63,8 @@ mod validate;
 pub const SERVICE: &str = "iam";
 
 pub use lifetime::{CredentialLifetime, LIFETIME_CHART_KEY, LIFETIME_ENV};
+pub use store::IamDb;
+use store::{cut_off, recorded, store_failed};
 pub use teams::{
     parse_admin_from_team, ADMIN_FROM_TEAM_CHART_KEY, ADMIN_FROM_TEAM_ENV, SEEDER_CALLER,
     SEEDER_PRINCIPAL,
@@ -286,6 +291,8 @@ impl EnrolmentConfig {
 pub struct Iam {
     keys: Keys,
     channel: tonic::transport::Channel,
+    /// The ceiling on every `iam-db` call (ADR-1019). See [`IamDb`].
+    ceiling: Duration,
     invalidator: Invalidator,
     /// See [`MEASURED_LOGIN_RESPONSE_FLOOR`] and `Iam::hold_until_floor`.
     login_floor: Floor,
@@ -316,7 +323,7 @@ impl Iam {
     /// default, which for a security control is the change nobody sees.
     pub fn new(
         keys: Keys,
-        channel: tonic::transport::Channel,
+        db: IamDb,
         invalidator: Invalidator,
         floors: ResponseFloors,
         enrolment: Option<EnrolmentConfig>,
@@ -325,7 +332,8 @@ impl Iam {
     ) -> Self {
         Self {
             keys,
-            channel,
+            channel: db.channel,
+            ceiling: db.ceiling,
             invalidator,
             login_floor: Floor {
                 rpc: "Login",
@@ -473,6 +481,7 @@ fn refusal_for(code: tonic::Code) -> &'static str {
         tonic::Code::NotFound => "no such record",
         tonic::Code::InvalidArgument => "the store refused the request",
         tonic::Code::Unavailable => "storage unavailable",
+        tonic::Code::DeadlineExceeded => "iam-db did not answer before the caller's deadline",
         _ => "the iam-db call failed",
     }
 }

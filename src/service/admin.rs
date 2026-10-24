@@ -108,6 +108,7 @@ impl Iam {
         req: Request<SetUserAdminRequest>,
         call: Call,
     ) -> Result<Response<SetUserAdminResponse>, Status> {
+        let deadline = Deadline::of(&req);
         // RETIRED WHILE IAM_ADMIN_FROM_TEAM IS TRUE (ADR-0962), before the store
         // is asked and before any invalidation: see `teams.rs`.
         if let Some(refusal) = self.set_user_admin_retired() {
@@ -140,10 +141,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        self.client()
-            .set_user_admin(upstream)
-            .await
-            .map_err(upstream_failed)?;
+        let (_, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.set_user_admin(r).await
+            })
+            .await?;
 
         // **THE SUBJECT NAMES SOMETHING THAT DID NOT HAPPEN, AND THAT COST IS
         // PAID DELIBERATELY.** No credential was revoked here: a person's
@@ -189,6 +191,7 @@ impl Iam {
         req: Request<CreateUserRequest>,
         call: Call,
     ) -> Result<Response<CreateUserResponse>, Status> {
+        let deadline = Deadline::of(&req);
         let r = req.get_ref();
 
         // TEAM ACCESS FIRST (`teams.rs`): the `user_id` format, the setting it
@@ -261,12 +264,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        let created = self
-            .client()
-            .create_user(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (created, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.create_user(r).await
+            })
+            .await?;
 
         // AFTER AN F2 CREATE COMMITTED: the store moved the pending
         // administrator into `iam_team_member`, so that user's team set

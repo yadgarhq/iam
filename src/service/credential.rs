@@ -96,6 +96,7 @@ impl Iam {
         req: Request<ResolveCredentialRequest>,
         call: Call,
     ) -> Result<Response<ResolveCredentialResponse>, Status> {
+        let deadline = Deadline::of(&req);
         let mut upstream = Request::new(db::ResolveCredentialRequest {
             token_hash: Keys::token_hash(&req.get_ref().token),
             // IAM_ADMIN_FROM_TEAM, relayed on every call (team access, `teams.rs`).
@@ -103,12 +104,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        let got = self
-            .client()
-            .resolve_credential(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (got, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.resolve_credential(r).await
+            })
+            .await?;
 
         // AN EMPTY user_id IS A NEGATIVE ANSWER, and it must not be cacheable.
         //
@@ -209,6 +209,7 @@ impl Iam {
         req: Request<ListCredentialsRequest>,
         call: Call,
     ) -> Result<Response<ListCredentialsResponse>, Status> {
+        let deadline = Deadline::of(&req);
         let r = req.get_ref();
         // BEFORE THE UPSTREAM CALL, so a refused request reaches no store. An
         // empty id names nobody. A negative page size is refused rather than
@@ -234,12 +235,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        let got = self
-            .client()
-            .list_credentials(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (got, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.list_credentials(r).await
+            })
+            .await?;
 
         let credentials: Vec<Credential> = got
             .credentials
@@ -269,6 +269,7 @@ impl Iam {
         req: Request<IssueCredentialRequest>,
         call: Call,
     ) -> Result<Response<IssueCredentialResponse>, Status> {
+        let deadline = Deadline::of(&req);
         let r = req.get_ref();
         // BEFORE THE MINT, so a refused request leaves no token in existence.
         if let Err(refusal) = check_issue_credential(r) {
@@ -355,12 +356,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut create);
 
-        let created = self
-            .client()
-            .create_credential(create)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (created, call) = self
+            .ask_recorded(deadline, call, create, |mut c, r| async move {
+                c.create_credential(r).await
+            })
+            .await?;
 
         call.finish(Outcome {
             status: "OK",
@@ -377,6 +377,7 @@ impl Iam {
         req: Request<RevokeCredentialRequest>,
         call: Call,
     ) -> Result<Response<RevokeCredentialResponse>, Status> {
+        let deadline = Deadline::of(&req);
         // OWNERSHIP (ADR-0972 (2)): REQUIRED, and refused BEFORE the upstream
         // call. An `iam-db` too old to read the field would revoke by id alone,
         // so the refusal cannot be left to the store.
@@ -404,12 +405,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        let done = self
-            .client()
-            .revoke_credential(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (done, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.revoke_credential(r).await
+            })
+            .await?;
 
         // The USER, not the credential — the gateway's cache is keyed on a token
         // hash this service never sees, so the person is the addressable unit.
@@ -436,6 +436,7 @@ impl Iam {
         req: Request<RevokeAllCredentialsRequest>,
         call: Call,
     ) -> Result<Response<RevokeAllCredentialsResponse>, Status> {
+        let deadline = Deadline::of(&req);
         let r = req.get_ref();
         // BEFORE THE UPSTREAM CALL, so a refused request reaches no store. An
         // empty id names nobody; `check_entity_id` bounds only the length, and it
@@ -461,12 +462,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        let done = self
-            .client()
-            .revoke_all_credentials(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (done, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.revoke_all_credentials(r).await
+            })
+            .await?;
 
         // AFTER THE COMMIT AND WHATEVER `revoked` IS (ADR-0945). The count is
         // what THIS delivery changed, so a retry after a lost response answers 0

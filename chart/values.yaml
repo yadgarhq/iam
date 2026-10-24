@@ -199,6 +199,10 @@ iamDb:
   # cross-chart check is ledger 1524, not this chart. The caller's bound is not
   # known here either: the parent chart (`yadgarhq/yadgar`) is where "strictly
   # below the caller" can be checked.
+  #
+  # A CEILING, NOT THE BOUND (ADR-1019). Each iam-db call is told, and cut off
+  # at, min(this, the caller's remaining time - 50 ms). Only a call whose caller
+  # sent no deadline gets this value whole.
   requestTimeoutSeconds: 14
 
   # HOW THIS SERVICE VERIFIES THE CERTIFICATE iam-db PRESENTS — the opposite

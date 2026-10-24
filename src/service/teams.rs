@@ -139,7 +139,9 @@ impl Iam {
         req: Request<SyncTeamsRequest>,
         call: Call,
     ) -> Result<Response<SyncTeamsResponse>, Status> {
-        // The header first: `into_inner` drops the metadata it is read from.
+        // The header and the deadline first: `into_inner` drops the metadata
+        // both are read from (ADR-1019).
+        let deadline = Deadline::of(&req);
         let mut upstream = Request::new(db::SyncTeamsRequest::default());
         forward_request_id(&req, &mut upstream);
         // EXHAUSTIVE, so a field added to the contract fails to compile here
@@ -166,17 +168,25 @@ impl Iam {
         // line is the operator's only view of WHY a sync was refused (the
         // lockout guard names `administrators`), and a fixed sentence would
         // hide it. `project` relays `SyncProjects` refusals the same way.
-        let answer = match self.client().sync_teams(upstream).await {
-            Ok(answer) => answer.into_inner(),
+        let answer = match self
+            .ask(deadline, upstream, |mut c, r| async move {
+                c.sync_teams(r).await
+            })
+            .await
+        {
+            Ok(answer) => answer,
             Err(status) => {
                 tracing::warn!(
                     code = ?status.code(),
                     db_message = status.message(),
                     "iam-db refused the team sync"
                 );
-                // The `Call` drops here, as every other upstream refusal's does.
-                drop(call);
-                return Err(Status::new(status.code(), status.message().to_owned()));
+                // RECORDED WITH ITS CODE, as every other upstream refusal now
+                // is (ADR-1019): a dropped `Call` records `UNRECORDED`.
+                return Err(recorded(
+                    call,
+                    Status::new(status.code(), status.message().to_owned()),
+                ));
             }
         };
 

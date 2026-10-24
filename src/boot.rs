@@ -8,6 +8,7 @@
 //! `iam-db` grew a `boot` module for the same reason and this is its twin.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tonic::transport::{Channel, Server};
 
@@ -288,12 +289,16 @@ pub fn listener() -> Result<(Option<ServerTls>, Server), Box<dyn std::error::Err
     Ok((listen_tls, server))
 }
 
-/// The channel to `iam-db`, and the TLS configuration it was dialled under.
+/// The channel to `iam-db`, the request timeout it was dialled with, and the
+/// TLS configuration it was dialled under.
 ///
 /// The configuration comes back with the channel because [`crate::rotate`]
 /// watches the files it names; a dial that dropped it would leave a rotated CA
-/// bundle unnoticed.
-pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::error::Error>> {
+/// bundle unnoticed. The timeout comes back because it is also the CEILING
+/// every `iam-db` call is stamped with (ADR-1019): the caller's remaining time
+/// bounds a call below it, never above it.
+pub async fn iam_db() -> Result<(Channel, Duration, Option<UpstreamTls>), Box<dyn std::error::Error>>
+{
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
     let db_host = env_required("IAM_DB_HOST")?;
@@ -337,7 +342,7 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
         request_timeout_secs = request_timeout.as_secs(),
         "connected to iam-db"
     );
-    Ok((db, db_tls))
+    Ok((db, request_timeout, db_tls))
 }
 
 /// The mounted configuration document, and the rotation schedule it states.

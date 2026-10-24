@@ -32,17 +32,17 @@ use crate::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 
 /// The name the serving leaf is issued for. The client dials an IP and
 /// verifies this name, so nothing depends on how `localhost` resolves.
-const SERVED_NAME: &str = "localhost";
+pub(super) const SERVED_NAME: &str = "localhost";
 
 /// One authority, the serving leaf it issued, and the means to issue more.
-struct Pki {
+pub(super) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,
-    ca_pem: String,
+    pub(super) ca_pem: String,
     cert_pem: String,
     key_pem: String,
 }
 
-fn pki() -> Pki {
+pub(super) fn pki() -> Pki {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -67,7 +67,7 @@ fn pki() -> Pki {
 }
 
 /// A client leaf the authority issued, with common name `name`.
-fn leaf(p: &Pki, name: &str) -> Identity {
+pub(super) fn leaf(p: &Pki, name: &str) -> Identity {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -119,6 +119,17 @@ fn limits() -> crate::serve::ServerLimits {
 /// `p`'s authority, and return the port. The files outlive the boot only;
 /// `serve::builder` reads them once.
 async fn serve_iam(p: &Pki, mode: &str) -> u16 {
+    let (iam, _rec, _inv) = iam_with(FakeDb {
+        resolves_to: Some("yadgar:user:1".into()),
+        ..Default::default()
+    })
+    .await;
+    serve_iam_with(p, mode, iam).await
+}
+
+/// [`serve_iam`] serving `iam` as given: the same TLS listener and gate, in
+/// front of whatever twin and floors the caller built it with.
+pub(super) async fn serve_iam_with(p: &Pki, mode: &str, iam: Iam) -> u16 {
     let cert = TempPem::with(&p.cert_pem);
     let key = TempPem::with(&p.key_pem);
     let ca = TempPem::with(&p.ca_pem);
@@ -135,11 +146,6 @@ async fn serve_iam(p: &Pki, mode: &str) -> u16 {
     .expect("a complete configuration")
     .expect("the TLS path");
 
-    let (iam, _rec, _inv) = iam_with(FakeDb {
-        resolves_to: Some("yadgar:user:1".into()),
-        ..Default::default()
-    })
-    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let router = crate::serve::builder(Some(&tls), &limits())

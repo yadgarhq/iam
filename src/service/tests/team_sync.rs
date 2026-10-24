@@ -326,7 +326,7 @@ async fn red_15_a_store_without_sync_teams_answers_unimplemented_and_nobody_is_e
     let inv = Invalidator::connect(None, None, None).await;
     let iam = Iam::new(
         crate::crypto::tests::keys(),
-        channel,
+        IamDb::new(channel, TEST_CEILING),
         inv.clone(),
         ResponseFloors {
             login: NOMINAL_FLOOR,
