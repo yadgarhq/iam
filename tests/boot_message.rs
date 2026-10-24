@@ -48,6 +48,18 @@ fn refusal_without_mounts(vars: &[(&str, String)]) -> String {
     refusal_line(out.status, &String::from_utf8_lossy(&out.stderr))
 }
 
+/// The four listener limits (ADR-1006), at the chart's defaults. The listener
+/// reads them beside its transport, so every case that must get PAST the
+/// listener states them.
+fn limits_env() -> Vec<(&'static str, String)> {
+    vec![
+        ("LISTEN_MAX_CONCURRENT_STREAMS", "256".to_string()),
+        ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30".to_string()),
+        ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10".to_string()),
+        ("LISTEN_MAX_HEADER_LIST_BYTES", "16384".to_string()),
+    ]
+}
+
 /// A TYPED error: `KeyError::Unconfigured`, reached by a bare `?` — `run`'s
 /// first typed refusal once `boot::listener` is past. Debug of the error
 /// would print `Unconfigured`, the bare variant name with nothing an
@@ -62,10 +74,10 @@ fn refusal_without_mounts(vars: &[(&str, String)]) -> String {
 /// B-U5): it is read beside the switch and refuses when absent.
 #[test]
 fn a_typed_refusal_is_printed_as_its_sentence() {
-    let line = refusal_without_mounts(&[
-        ("LISTEN_TLS_ENABLED", "0".to_string()),
-        ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
-    ]);
+    let mut vars = limits_env();
+    vars.push(("LISTEN_TLS_ENABLED", "0".to_string()));
+    vars.push(("LISTEN_TLS_CLIENT_AUTH", "off".to_string()));
+    let line = refusal_without_mounts(&vars);
     assert!(
         line.contains("YADGAR_KEYS_DIR is not set"),
         "the refusal must name the variable: {line}"
@@ -119,17 +131,49 @@ fn a_mismatched_serving_pair_names_the_reason() {
     std::fs::write(&cert, leaf.cert.pem()).unwrap();
     std::fs::write(&key, other.serialize_pem()).unwrap();
 
-    let line = refusal_without_mounts(&[
+    let mut vars = limits_env();
+    vars.extend([
         ("LISTEN_TLS_ENABLED", "1".to_string()),
         ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
         ("LISTEN_TLS_CERT_FILE", cert.display().to_string()),
         ("LISTEN_TLS_KEY_FILE", key.display().to_string()),
     ]);
+    let line = refusal_without_mounts(&vars);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         line.contains("keys may not be consistent"),
         "the boot refusal must carry the reason under tonic's transport error"
     );
+}
+
+/// ADR-1006: EACH OF THE FIVE LISTENER LIMITS IS REQUIRED. The binary has no
+/// default for any of them, so an absent key refuses the boot naming the
+/// variable AND the chart value that renders it. Read in `boot::listener`,
+/// before `shared.yaml`, so no mount namespace.
+///
+/// MUTATION: `boot::listener` taking a compiled-in default for any one key
+/// turns that key's case red.
+#[test]
+fn an_absent_listener_limit_refuses_the_boot_naming_the_variable_and_the_chart_value() {
+    for (var, leaf) in [
+        ("LISTEN_MAX_CONCURRENT_STREAMS", "maxConcurrentStreams"),
+        ("LISTEN_KEEPALIVE_INTERVAL_SECS", "keepaliveIntervalSeconds"),
+        ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "keepaliveTimeoutSeconds"),
+        ("LISTEN_MAX_HEADER_LIST_BYTES", "maxHeaderListBytes"),
+    ] {
+        let keys_dir = fresh_keys_dir();
+        let mut vars = cleartext_env(&keys_dir);
+        vars.retain(|(k, _)| *k != var);
+        let line = refusal_without_mounts(&vars);
+        assert!(
+            line.contains(var),
+            "{var}: the refusal must name the variable: {line}"
+        );
+        assert!(
+            line.contains(&format!("server.limits.{leaf}")),
+            "{var}: the refusal must name the chart value server.limits.{leaf}: {line}"
+        );
+    }
 }
 
 /// A bare parse, named on the way out: `IAM_DB_PORT` is read before the shared

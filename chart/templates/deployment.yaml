@@ -251,6 +251,19 @@ spec:
             - name: LISTEN_TLS_CLIENT_CA_FILE
               value: /var/run/config/client-ca/ca.crt
             {{- end }}
+            # THE LISTENER'S PROTOCOL LIMITS (ADR-1006), RENDERED
+            # UNCONDITIONALLY: the binary has no default for any of the four and
+            # refuses to boot on an absent, non-numeric or out-of-range one.
+            # Ranges are `values.schema.json`'s; the one cross-key rule is in
+            # `render-checks.yaml`.
+            - name: LISTEN_MAX_CONCURRENT_STREAMS
+              value: {{ .Values.server.limits.maxConcurrentStreams | int64 | quote }}
+            - name: LISTEN_KEEPALIVE_INTERVAL_SECS
+              value: {{ .Values.server.limits.keepaliveIntervalSeconds | int64 | quote }}
+            - name: LISTEN_KEEPALIVE_TIMEOUT_SECS
+              value: {{ .Values.server.limits.keepaliveTimeoutSeconds | int64 | quote }}
+            - name: LISTEN_MAX_HEADER_LIST_BYTES
+              value: {{ .Values.server.limits.maxHeaderListBytes | int64 | quote }}
             - name: IAM_DB_HOST
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT

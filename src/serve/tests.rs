@@ -196,3 +196,45 @@ fn from_lookup_does_not_read_the_files() {
     ];
     assert!(from_lookup(lookup(&vars)).is_ok());
 }
+
+/// ADR-1006: the four listener limits render from the `server.limits` block, and
+/// the library range-checks them. A different block would make every refusal
+/// name a chart value the chart has not got.
+#[test]
+fn the_limits_chart_key_is_the_values_block_the_limits_render_from() {
+    assert_eq!(LIMITS_CHART_KEY, "server.limits");
+}
+
+const LIMITS: [(&str, &str); 4] = [
+    ("LISTEN_MAX_CONCURRENT_STREAMS", "256"),
+    ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
+    ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
+    ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+];
+
+#[test]
+fn the_chart_defaults_are_a_complete_configuration() {
+    let limits = limits_from_lookup(lookup(&LIMITS)).expect("the ADR-1006 defaults");
+    assert_eq!(limits.max_concurrent_streams(), 256);
+    assert_eq!(limits.keepalive_interval().as_secs(), 30);
+    assert_eq!(limits.keepalive_timeout().as_secs(), 10);
+    assert_eq!(limits.max_header_list_bytes(), 16384);
+}
+
+/// NO DEFAULT LIVES IN THE BINARY: each absent key refuses, naming the variable
+/// and the `server.limits` leaf this service hands the library.
+#[test]
+fn an_absent_limit_is_refused_naming_the_variable_and_the_chart_value() {
+    for (absent, _) in LIMITS {
+        let present: Vec<_> = LIMITS
+            .iter()
+            .copied()
+            .filter(|(k, _)| *k != absent)
+            .collect();
+        let message = limits_from_lookup(lookup(&present))
+            .expect_err(absent)
+            .to_string();
+        assert!(message.contains(absent), "{absent}: {message}");
+        assert!(message.contains("server.limits."), "{absent}: {message}");
+    }
+}

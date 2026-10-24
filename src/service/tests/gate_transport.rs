@@ -99,6 +99,22 @@ impl Drop for TempPem {
     }
 }
 
+/// The chart's `server.limits` defaults (ADR-1006), through the same lookup a
+/// deployment's environment goes through.
+fn limits() -> crate::serve::ServerLimits {
+    crate::serve::limits_from_lookup(|key| {
+        match key {
+            "LISTEN_MAX_CONCURRENT_STREAMS" => Some("256"),
+            "LISTEN_KEEPALIVE_INTERVAL_SECS" => Some("30"),
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS" => Some("10"),
+            "LISTEN_MAX_HEADER_LIST_BYTES" => Some("16384"),
+            _ => None,
+        }
+        .map(str::to_string)
+    })
+    .expect("the chart defaults are a complete, in-range configuration")
+}
+
 /// Serve an `Iam` over TLS in client-auth `mode`, verifying callers against
 /// `p`'s authority, and return the port. The files outlive the boot only;
 /// `serve::builder` reads them once.
@@ -126,7 +142,7 @@ async fn serve_iam(p: &Pki, mode: &str) -> u16 {
     .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let router = crate::serve::builder(Some(&tls))
+    let router = crate::serve::builder(Some(&tls), &limits())
         .expect("a usable certificate and key")
         .add_service(IamServiceServer::new(iam));
     tokio::spawn(async move {

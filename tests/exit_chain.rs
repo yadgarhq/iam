@@ -139,15 +139,10 @@ fn a_rewritten_shared_document_drains_and_exits_zero() {
 /// way `serve_with_shutdown` never gets to accept at all — the same failure
 /// an operator sees from a chart that collided two deployments on one port.
 ///
-/// **`serve_and_drain`'s `"iam listening"` line is logged before the server
-/// is spawned, so it says nothing about whether the bind below it succeeds —
-/// `drain_within` only CHECKS the serving task once its own `stop` resolves.**
-/// A boot held on an occupied port therefore sits until something ends `stop`;
-/// SIGTERM is what a real rollout sends, and it is what this case sends too.
-/// Whether SIGTERM arrives before or after the spawned task's bind fails,
-/// tonic binds before it polls shutdown, so `drain_within` always reaps
-/// `Finished(Err)` — `result?` fires before `ended_rx` is ever read, so
-/// SIGTERM itself decides nothing about the exit code here.
+/// **A FAILED BIND ENDS THE PROCESS ON ITS OWN** (yaadgaar #313). `drain_within`
+/// returns `Finished(Err)` at once when the serving task ends by itself, so
+/// this case sends NO signal: it waits for the exit, and a process that sits
+/// Ready-but-deaf until SIGTERM fails the deadline below.
 #[test]
 fn a_bound_listen_port_is_printed_as_its_sentence() {
     let keys_dir = fresh_keys_dir();
@@ -162,9 +157,10 @@ fn a_bound_listen_port_is_printed_as_its_sentence() {
     vars.push(("LISTEN", addr.to_string()));
 
     let mut iam = Booted::start(&vars);
+    // The boot's own work (the Argon2id dummy hash) is not under test: the MARGIN
+    // clock starts at the "listening" line, which is logged before the bind.
     iam.wait_until_listening();
-    iam.terminate();
-    let status = iam.wait_for_exit("after the occupied port failed to bind", MARGIN);
+    let status = iam.wait_for_exit("on its own after the occupied port failed to bind", MARGIN);
     drop(holder);
 
     assert!(
@@ -182,13 +178,13 @@ fn a_bound_listen_port_is_printed_as_its_sentence() {
         "the operator got tonic's dead-end Display, not the chain below it: {line}"
     );
     assert!(
-        line.contains(&addr.to_string()),
-        "the sentence must name the address that could not be bound: {line}"
+        line.contains(&format!("LISTEN={addr}")),
+        "the sentence must name LISTEN and the address that could not be bound: {line}"
     );
     // The CAUSE, one level below tonic's `transport error`: only the chain
     // walk reaches it, so this is the assertion that holds `boot::refusal`.
     assert!(
-        line.contains("already in use"),
+        line.contains("Address already in use"),
         "the sentence must carry the bind failure's cause, not stop at `transport error`: {line}"
     );
 }

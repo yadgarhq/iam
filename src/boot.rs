@@ -280,7 +280,11 @@ pub fn listener() -> Result<(Option<ServerTls>, Server), Box<dyn std::error::Err
     // consistent" — is one `source()` hop down. A bare `to_string()` here
     // would drop it; `tests/boot_message.rs` turns red if it does.
     let listen_tls = serve::from_env().map_err(|e| e.to_string())?;
-    let server = serve::builder(listen_tls.as_ref()).map_err(|e| refusal(&e))?;
+    // ADR-1006: the four protocol limits, read beside the transport. Each is
+    // required; the refusal is a complete sentence naming the variable and the
+    // chart value, so `.to_string()` like the transport's configuration above.
+    let limits = serve::limits_from_env().map_err(|e| e.to_string())?;
+    let server = serve::builder(listen_tls.as_ref(), &limits).map_err(|e| refusal(&e))?;
     Ok((listen_tls, server))
 }
 
