@@ -6,6 +6,8 @@
 //! under the `complexity` hook's 500-line ceiling, which it was within thirteen
 //! lines of.
 
+use std::time::Duration;
+
 use tonic::transport::Channel;
 
 use super::{watch, Identity, Mismatch, Retry};
@@ -84,6 +86,8 @@ pub async fn until_stopped(
 /// which is the shape [`until_stopped_with`] exists to remove.
 pub struct Check {
     client: IamDbServiceClient<Channel>,
+    /// The request timeout `channel` was dialled with; see [`watch`].
+    ceiling: Duration,
     identity: Identity,
     retry: Retry,
 }
@@ -92,9 +96,10 @@ impl Check {
     /// Build it from the SAME lazy channel every RPC uses — a clone, not a
     /// second dial. `Channel` is cheap to clone and reconnects nowhere, so
     /// nothing new is opened and nothing new is waited on.
-    pub fn new(channel: Channel, identity: Identity, retry: Retry) -> Self {
+    pub fn new(channel: Channel, ceiling: Duration, identity: Identity, retry: Retry) -> Self {
         Self {
             client: IamDbServiceClient::new(channel),
+            ceiling,
             identity,
             retry,
         }
@@ -131,7 +136,7 @@ pub async fn until_stopped_with(
     until_stopped(
         signals,
         rotation,
-        watch(check.client, check.identity, check.retry),
+        watch(check.client, check.ceiling, check.identity, check.retry),
     )
     .await
 }

@@ -45,6 +45,13 @@ struct Recorded {
     /// test asserts ZERO here, and a refusal placed after an upstream hop
     /// cannot pass it.
     calls: usize,
+    /// **THE DEADLINE WITNESS (ADR-1019).** The raw `grpc-timeout` every arm
+    /// arrived with, in call order, `None` when it carried none. Pushed by
+    /// [`FakeDb::asked`], so no arm can be reached without leaving one.
+    told: Vec<Option<String>>,
+    /// Set when [`FakeDb::resolve_hangs`]'s never-answering future is dropped:
+    /// the store's handler stopped working on a request nobody waits for.
+    hung_handler_dropped: bool,
     /// The `x-yadgar-request-id` each `ResolveCredential` arrived with, read
     /// EXACTLY as `iam-db`'s `request_id_of` reads it: through `to_str()`, which
     /// refuses any non-ASCII byte. A value that does not survive that read is
@@ -116,6 +123,15 @@ struct FakeDb {
     set_user_admin_fails: Option<(tonic::Code, &'static str)>,
     /// What `ResolveCredential` answers.
     resolves_to: Option<String>,
+    /// `ResolveCredential` NEVER answers: a wedged `iam-db`. The arm records,
+    /// then waits for ever, and [`DroppedWitness`] says when it was dropped.
+    resolves_hangs: bool,
+    /// How long `GetPasswordHash`, `CreateCredential` and `RedeemEnrolment`
+    /// each take to answer, after recording: a slow store, for the tests that
+    /// cut a call off at the caller's deadline. Zero by default.
+    lookup_delay: Duration,
+    mint_delay: Duration,
+    spend_delay: Duration,
     /// D73's flag, as the STORE reports it. Separate from `resolves_to` so a
     /// test can pin that the value travels rather than being invented here.
     resolves_admin: bool,
@@ -187,9 +203,25 @@ struct FakeDb {
 }
 
 impl FakeDb {
-    /// Count one arm reached. See [`Recorded::calls`].
-    fn asked(&self) {
-        self.recorded.lock().expect("recorded").calls += 1;
+    /// Count one arm reached, and keep the `grpc-timeout` it was told. See
+    /// [`Recorded::calls`] and [`Recorded::told`].
+    fn asked(&self, metadata: &tonic::metadata::MetadataMap) {
+        let mut seen = self.recorded.lock().expect("recorded");
+        seen.calls += 1;
+        let told = metadata
+            .get(yadgar_dial::GRPC_TIMEOUT)
+            .map(|v| v.to_str().unwrap_or_default().to_string());
+        seen.told.push(told);
+    }
+}
+
+/// Sets [`Recorded::hung_handler_dropped`] when the hanging arm's future is
+/// dropped, which is the only way it ever ends.
+struct DroppedWitness(Arc<Mutex<Recorded>>);
+
+impl Drop for DroppedWitness {
+    fn drop(&mut self) {
+        self.0.lock().expect("recorded").hung_handler_dropped = true;
     }
 }
 
@@ -199,7 +231,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::ResolveCredentialRequest>,
     ) -> Result<Response<db::ResolveCredentialResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         let header = req
             .metadata()
             .get("x-yadgar-request-id")
@@ -208,6 +240,10 @@ impl IamDbService for FakeDb {
             let mut seen = self.recorded.lock().expect("recorded");
             seen.resolve_request_ids.push(header);
             seen.resolve_credential.push(req.get_ref().clone());
+        }
+        if self.resolves_hangs {
+            let _witness = DroppedWitness(self.recorded.clone());
+            std::future::pending::<()>().await;
         }
         // A WRITE THIS FAKE ACCEPTED IS VISIBLE TO THE NEXT READ, which is the
         // one property a script of fixed answers cannot have and the promote →
@@ -242,12 +278,13 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::GetPasswordHashRequest>,
     ) -> Result<Response<db::GetPasswordHashResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
             .get_password_hash
             .push(req.into_inner());
+        tokio::time::sleep(self.lookup_delay).await;
         let (user_id, argon2id_hash) = self.password.clone().unwrap_or_default();
         Ok(Response::new(db::GetPasswordHashResponse {
             user_id,
@@ -258,9 +295,9 @@ impl IamDbService for FakeDb {
 
     async fn set_password(
         &self,
-        _req: Request<db::SetPasswordRequest>,
+        req: Request<db::SetPasswordRequest>,
     ) -> Result<Response<db::SetPasswordResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         Ok(Response::new(db::SetPasswordResponse {}))
     }
 
@@ -268,7 +305,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::CreateEnrolmentRequest>,
     ) -> Result<Response<db::CreateEnrolmentResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -283,12 +320,13 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RedeemEnrolmentRequest>,
     ) -> Result<Response<db::RedeemEnrolmentResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
             .redeem_enrolment
             .push(req.into_inner());
+        tokio::time::sleep(self.spend_delay).await;
         if let Some((code, message)) = self.redeem_fails {
             return Err(Status::new(code, message));
         }
@@ -304,7 +342,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::ListCredentialsRequest>,
     ) -> Result<Response<db::ListCredentialsResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         let header = req
             .metadata()
             .get("x-yadgar-request-id")
@@ -324,7 +362,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::SetUserAdminRequest>,
     ) -> Result<Response<db::SetUserAdminResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         // RECORDED BEFORE THE REFUSAL, so a test can tell "the store refused"
         // from "the store was never asked" — the two produce the same `Err` at
         // the caller and only this log tells them apart.
@@ -341,9 +379,9 @@ impl IamDbService for FakeDb {
 
     async fn set_rate_limit_override(
         &self,
-        _req: Request<db::SetRateLimitOverrideRequest>,
+        req: Request<db::SetRateLimitOverrideRequest>,
     ) -> Result<Response<db::SetRateLimitOverrideResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         Ok(Response::new(db::SetRateLimitOverrideResponse {}))
     }
 
@@ -351,7 +389,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::SetInheritedSettingRequest>,
     ) -> Result<Response<db::SetInheritedSettingResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -366,12 +404,13 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::CreateCredentialRequest>,
     ) -> Result<Response<db::CreateCredentialResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
             .create_credential
             .push(req.into_inner());
+        tokio::time::sleep(self.mint_delay).await;
         if let Some((code, message)) = self.create_credential_fails {
             return Err(Status::new(code, message));
         }
@@ -384,7 +423,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RevokeCredentialRequest>,
     ) -> Result<Response<db::RevokeCredentialResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -408,7 +447,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RevokeAllCredentialsRequest>,
     ) -> Result<Response<db::RevokeAllCredentialsResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -427,7 +466,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::CreateUserRequest>,
     ) -> Result<Response<db::CreateUserResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -448,7 +487,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::AddTeamMemberRequest>,
     ) -> Result<Response<db::AddTeamMemberResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -461,7 +500,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::RemoveTeamMemberRequest>,
     ) -> Result<Response<db::RemoveTeamMemberResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -474,7 +513,7 @@ impl IamDbService for FakeDb {
         &self,
         req: Request<db::SyncTeamsRequest>,
     ) -> Result<Response<db::SyncTeamsResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         self.recorded
             .lock()
             .expect("recorded")
@@ -495,17 +534,17 @@ impl IamDbService for FakeDb {
     // about the fourteen arms it never serves.
     async fn get_key_identity(
         &self,
-        _req: Request<db::GetKeyIdentityRequest>,
+        req: Request<db::GetKeyIdentityRequest>,
     ) -> Result<Response<db::GetKeyIdentityResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         unimplemented!("no IamService handler asks the twin about the key identity")
     }
 
     async fn set_key_identity(
         &self,
-        _req: Request<db::SetKeyIdentityRequest>,
+        req: Request<db::SetKeyIdentityRequest>,
     ) -> Result<Response<db::SetKeyIdentityResponse>, Status> {
-        self.asked();
+        self.asked(req.metadata());
         unimplemented!("no IamService handler asks the twin about the key identity")
     }
 }
@@ -562,6 +601,11 @@ async fn twin(fake: FakeDb) -> (Channel, Arc<Mutex<Recorded>>) {
 /// a count that is mysteriously zero, so this is written down rather than
 /// discovered.
 const NOMINAL_FLOOR: Duration = Duration::from_millis(5);
+
+/// The `iam-db` request timeout every harness is built with: the chart's
+/// default for `iamDb.requestTimeoutSeconds`, so a test about the ceiling reads
+/// the number a deployment runs with.
+pub(crate) const TEST_CEILING: Duration = Duration::from_secs(14);
 
 /// The gateway address and CA a minted token carries, in tests.
 ///
@@ -694,7 +738,7 @@ async fn iam_assembled(
     let invalidator = Invalidator::connect(None, None, None).await;
     let iam = Iam::new(
         keys,
-        channel,
+        IamDb::new(channel, TEST_CEILING),
         invalidator.clone(),
         floors,
         enrolment,
@@ -1564,7 +1608,7 @@ async fn revoking_all_credentials_answers_ok_when_the_broker_is_unreachable() {
     let invalidator = Invalidator::connect(Some("nats://127.0.0.1:1"), None, None).await;
     let iam = Iam::new(
         crate::crypto::tests::keys(),
-        channel,
+        IamDb::new(channel, TEST_CEILING),
         invalidator.clone(),
         ResponseFloors {
             login: NOMINAL_FLOOR,
@@ -4686,6 +4730,7 @@ async fn a_gateway_request_id_reaches_the_record_and_the_twin_unchanged() {
 // The caller gate (ADR-0972, ledger 1629): every RPC through the `_as` seam
 // and the trait methods, and the same gate through a real TLS listener.
 mod credentials;
+pub(crate) mod deadline;
 mod epoch;
 mod gate;
 mod gate_transport;

@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status};
 
 use super::*;
 use crate::pb::yadgar::iamdb::v1::iam_db_service_server::{IamDbService, IamDbServiceServer};
+use crate::service::tests::TEST_CEILING;
 
 /// One scripted answer from the fake twin.
 #[derive(Clone, Copy, Debug)]
@@ -46,6 +47,15 @@ struct Script {
 struct Asked {
     get: Vec<db::GetKeyIdentityRequest>,
     set: Vec<db::SetKeyIdentityRequest>,
+    /// The raw `grpc-timeout` each round trip arrived with (ADR-1019).
+    told: Vec<Option<String>>,
+}
+
+/// The `grpc-timeout` `r` carries, as the twin reads it.
+fn told_by<T>(r: &Request<T>) -> Option<String> {
+    r.metadata()
+        .get(yadgar_dial::GRPC_TIMEOUT)
+        .map(|v| v.to_str().unwrap_or_default().to_string())
 }
 
 struct FakeTwin {
@@ -68,6 +78,7 @@ impl IamDbService for FakeTwin {
     ) -> Result<Response<db::GetKeyIdentityResponse>, Status> {
         let n = {
             let mut asked = self.asked.lock().expect("asked");
+            asked.told.push(told_by(&r));
             asked.get.push(r.into_inner());
             asked.get.len() - 1
         };
@@ -83,6 +94,7 @@ impl IamDbService for FakeTwin {
     ) -> Result<Response<db::SetKeyIdentityResponse>, Status> {
         let n = {
             let mut asked = self.asked.lock().expect("asked");
+            asked.told.push(told_by(&r));
             asked.set.push(r.into_inner());
             asked.set.len() - 1
         };
@@ -304,7 +316,8 @@ async fn a_wrong_key_ends_the_serve_and_exits_non_zero() {
     })
     .await;
 
-    let refusal = tokio::time::timeout(WINDOW, watch(client, identity(), brisk())).await;
+    let refusal =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, identity(), brisk())).await;
     let refusal = refusal.expect("a MISMATCH ends the serve rather than being retried");
 
     // THE SERVE ENDS: `until_stopped` reaches this arm and reports it as the
@@ -350,7 +363,8 @@ async fn an_empty_store_is_recorded_and_then_passes() {
     .await;
     let id = identity();
 
-    let outcome = tokio::time::timeout(WINDOW, watch(client, id.clone(), brisk())).await;
+    let outcome =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, id.clone(), brisk())).await;
     assert!(
         outcome.is_err(),
         "a passed check never resolves, so it never ends the serve"
@@ -381,7 +395,8 @@ async fn an_empty_store_is_recorded_and_then_passes() {
 /// so a count above one is the whole oracle.
 async fn never_passes_and_never_exits(script: Script) -> Asked {
     let (client, asked) = twin(script).await;
-    let outcome = tokio::time::timeout(WINDOW, watch(client, identity(), brisk())).await;
+    let outcome =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, identity(), brisk())).await;
     assert!(
         outcome.is_err(),
         "this must not end the serve: it is not a MISMATCH"
@@ -460,7 +475,8 @@ async fn a_matching_marker_passes_and_writes_nothing() {
         ..Default::default()
     })
     .await;
-    let outcome = tokio::time::timeout(WINDOW, watch(client, identity(), brisk())).await;
+    let outcome =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, identity(), brisk())).await;
     assert!(outcome.is_err(), "a passed check never ends the serve");
     let asked = asked.lock().expect("asked");
     assert_eq!(asked.get.len(), 1, "a passed check stops calling");
@@ -537,7 +553,8 @@ async fn a_mismatch_on_the_recording_arm_ends_the_serve() {
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Mismatch))],
     })
     .await;
-    let refusal = tokio::time::timeout(WINDOW, watch(client, identity(), brisk())).await;
+    let refusal =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, identity(), brisk())).await;
     assert!(
         refusal.is_ok(),
         "losing a split rollout under one version is still a wrong key"
@@ -553,7 +570,8 @@ async fn a_match_on_the_recording_arm_passes() {
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Match))],
     })
     .await;
-    let outcome = tokio::time::timeout(WINDOW, watch(client, identity(), brisk())).await;
+    let outcome =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, identity(), brisk())).await;
     assert!(outcome.is_err(), "a passed check never ends the serve");
     assert_eq!(asked.lock().expect("asked").set.len(), 1);
 }
@@ -981,6 +999,7 @@ async fn the_cadence_an_operator_gets_is_produced_by_the_loop() {
     tokio::time::pause();
     let refusal = watch_with_seed(
         IamDbServiceClient::new(channel),
+        TEST_CEILING,
         identity(),
         Retry::of(Duration::from_secs(100), Duration::from_secs(100)),
         0x5eed_5eed_5eed_5eed,
@@ -1053,7 +1072,7 @@ async fn the_check_main_hands_over_is_the_one_that_ends_the_serve() {
         until_stopped_with(
             std::future::pending(),
             std::future::pending(),
-            Check::new(channel, identity(), brisk()),
+            Check::new(channel, TEST_CEILING, identity(), brisk()),
         ),
     )
     .await
@@ -1091,5 +1110,37 @@ fn the_refusal_names_the_arm_that_answered_it() {
     assert_ne!(
         read, write,
         "the two arms must not render to the same sentence"
+    );
+}
+
+/// ADR-1019: the check has no caller, so no deadline to propagate. Both of its
+/// round trips are stamped with the ceiling the channel was dialled with,
+/// which is what tells `iam-db` how long this side waits.
+#[tokio::test]
+async fn both_round_trips_tell_the_store_the_ceiling() {
+    let (client, asked) = twin(Script {
+        get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Absent))],
+        set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Recorded))],
+    })
+    .await;
+
+    let passed =
+        tokio::time::timeout(WINDOW, watch(client, TEST_CEILING, identity(), brisk())).await;
+    assert!(
+        passed.is_err(),
+        "a recorded marker passes, and a pass never resolves"
+    );
+
+    let told: Vec<Duration> = asked
+        .lock()
+        .expect("asked")
+        .told
+        .iter()
+        .map(|t| crate::service::tests::deadline::told(t.as_deref().expect("a grpc-timeout")))
+        .collect();
+    assert_eq!(
+        told,
+        vec![TEST_CEILING, TEST_CEILING],
+        "the read, then the write"
     );
 }

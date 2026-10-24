@@ -171,6 +171,7 @@ impl Iam {
         req: Request<SetInheritedSettingRequest>,
         call: Call,
     ) -> Result<Response<SetInheritedSettingResponse>, Status> {
+        let deadline = Deadline::of(&req);
         if let Err(refusal) = check_inherited_setting(req.get_ref()) {
             call.fail("INVALID_ARGUMENT");
             return Err(refusal);
@@ -211,12 +212,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        let set = self
-            .client()
-            .set_inherited_setting(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (set, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.set_inherited_setting(r).await
+            })
+            .await?;
 
         call.finish(Outcome {
             status: "OK",
