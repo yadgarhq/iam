@@ -152,6 +152,7 @@
       },
       "additionalProperties": false
     },
+    "adminFromTeam": {},
     "enrolment": {
       "properties": {
         "enabled": {},

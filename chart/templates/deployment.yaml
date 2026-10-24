@@ -435,6 +435,11 @@ spec:
             # guarded so a non-map `credential` cannot panic the render first.
             - name: CREDENTIAL_LIFETIME_SECONDS
               value: {{ required "iam: credential.lifetimeSeconds must be set: it renders CREDENTIAL_LIFETIME_SECONDS, which iam requires to boot (ADR-0972)" (dig "lifetimeSeconds" "" (ternary .Values.credential dict (kindIs "map" .Values.credential))) | int64 | quote }}
+            # Team access (ADR-0962, ADR-0963): where is_admin comes from. iam
+            # refuses to boot without it; render-checks.yaml refuses a
+            # non-boolean `adminFromTeam` by name before this line renders it.
+            - name: IAM_ADMIN_FROM_TEAM
+              value: {{ .Values.adminFromTeam | quote }}
             # The gateway address every enrolment token carries (D73).
             #
             # NOT `required`, and NOT a boot failure either. No default can know

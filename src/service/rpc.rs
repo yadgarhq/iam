@@ -307,4 +307,14 @@ impl IamService for Iam {
         self.remove_team_member_as(caller_common_name(&req).as_deref(), req)
             .await
     }
+
+    /// The seeder's whole-set team sync (ADR-0963 (1)). The ONE verb whose
+    /// caller is not the gateway: see `sync_teams_as` in `teams.rs`.
+    async fn sync_teams(
+        &self,
+        req: Request<SyncTeamsRequest>,
+    ) -> Result<Response<SyncTeamsResponse>, Status> {
+        self.sync_teams_as(caller_common_name(&req).as_deref(), req)
+            .await
+    }
 }

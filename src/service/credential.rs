@@ -98,6 +98,8 @@ impl Iam {
     ) -> Result<Response<ResolveCredentialResponse>, Status> {
         let mut upstream = Request::new(db::ResolveCredentialRequest {
             token_hash: Keys::token_hash(&req.get_ref().token),
+            // IAM_ADMIN_FROM_TEAM, relayed on every call (team access, `teams.rs`).
+            admin_from_team: self.admin_from_team(),
         });
         forward_request_id(&req, &mut upstream);
 

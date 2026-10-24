@@ -1,5 +1,6 @@
-//! The caller gate (ADR-0972 (1), ledger 1629), driven over all fourteen
-//! `IamService` RPCs.
+//! The caller gate (ADR-0972 (1), ledger 1629), driven over the fourteen
+//! `IamService` RPCs that admit the gateway. The fifteenth, `SyncTeams`,
+//! admits the seeder only; its gate is in [`super::team_sync`].
 //!
 //! **THE THREE LOOPS PROVE EACH OTHER.** The refusal loops assert that the
 //! fake twin recorded ZERO calls, which is only an oracle if each request would
@@ -32,6 +33,10 @@ const NOT_THE_GATEWAY: &str = "task-caller";
 
 /// The RPCs this build answers `UNIMPLEMENTED` without a hop to the twin.
 const NO_UPSTREAM: [&str; 1] = ["SetRateLimitOverride"];
+
+/// The RPCs team access retired (ADR-0963 (7)): admitted, then answered
+/// `FAILED_PRECONDITION` without a hop to the twin.
+const RETIRED: [&str; 2] = ["AddTeamMember", "RemoveTeamMember"];
 
 /// How a loop reaches the RPC.
 #[derive(Clone, Copy)]
@@ -362,6 +367,16 @@ async fn the_gateway_leaf_is_admitted_on_every_rpc() {
                 a.rpc
             );
             assert_eq!(a.upstream, 0, "{} has no upstream hop", a.rpc);
+            continue;
+        }
+        if RETIRED.contains(&a.rpc) {
+            assert_eq!(
+                a.status.as_ref().map_err(Status::code),
+                Err(tonic::Code::FailedPrecondition),
+                "{}: admitted, and answered as retired",
+                a.rpc
+            );
+            assert_eq!(a.upstream, 0, "{} is retired before the twin", a.rpc);
             continue;
         }
         assert!(

@@ -548,6 +548,19 @@ credential:
   # expiry. People re-run `yaadgaar login` when theirs expires.
   lifetimeSeconds: 7776000
 
+# WHERE `is_admin` COMES FROM (team access, ADR-0962, ADR-0963;
+# docs plans/team-access.md §6). Rendered as IAM_ADMIN_FROM_TEAM, "true" or
+# "false"; iam refuses to boot without it.
+#
+# `false` (shipped): the iam_user.is_admin column decides, as before, and
+# SetUserAdmin works. `true`: admin is membership of the declared, live
+# `administrators` team; SetUserAdmin and CreateUser with is_admin true are
+# refused, and the bootstrap CreateUser with a pre-minted user_id (F2) is
+# admitted. Turn it on only after the declared administrators are proved
+# members (stage 10); a cold install sets it true from the start (F2 needs it).
+# A bare `true` or `false`; anything else is refused at render.
+adminFromTeam: false
+
 # What iam puts into every enrolment token it mints (D73). An admin assembles
 # neither value and so cannot get either wrong — which puts the whole burden of
 # holding correct ones here.

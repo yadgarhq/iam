@@ -214,3 +214,74 @@ async fn an_off_listener_refuses_even_the_gateway_leaf() {
         Err(tonic::Code::PermissionDenied)
     );
 }
+
+/// Dial `port` presenting `identity`, and ask `SyncTeams` once with the
+/// seeder's principal.
+async fn sync(p: &Pki, port: u16, identity: Option<Identity>) -> Result<(), tonic::Code> {
+    let mut tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&p.ca_pem))
+        .domain_name(SERVED_NAME);
+    if let Some(identity) = identity {
+        tls = tls.identity(identity);
+    }
+    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .tls_config(tls)
+        .unwrap()
+        .connect_lazy();
+    let answered = tokio::time::timeout(
+        Duration::from_secs(10),
+        IamServiceClient::new(channel).sync_teams(SyncTeamsRequest {
+            scope: Some(crate::pb::yadgar::common::v1::Scope {
+                user_id: "yadgar:system:seeder".into(),
+                ..Default::default()
+            }),
+            teams: vec![],
+        }),
+    )
+    .await
+    .expect("the call answered in time");
+    answered.map(drop).map_err(|s| s.code())
+}
+
+/// TEAM ACCESS STAGE 3, GATE ITEM 2: the seeder's client chain reaches the
+/// `SyncTeams` handler through `serve_tls` with a client CA set. The gate
+/// admits only a parsed leaf naming exactly `seeder-caller`, so an `Ok` here
+/// is `peer_certs()` returning `Some` with that leaf, read in the handler.
+#[tokio::test]
+async fn the_seeder_caller_leaf_reaches_sync_teams_through_tonic() {
+    let p = pki();
+    let port = serve_iam(&p, "required").await;
+    assert_eq!(
+        sync(&p, port, Some(leaf(&p, "seeder-caller"))).await,
+        Ok(())
+    );
+}
+
+/// The gateway's leaf, verified at the same handshake, is refused on
+/// `SyncTeams`: the one verb it may not call.
+#[tokio::test]
+async fn the_gateway_leaf_is_refused_on_sync_teams_through_tonic() {
+    let p = pki();
+    let port = serve_iam(&p, "required").await;
+    assert_eq!(
+        sync(&p, port, Some(leaf(&p, GATEWAY_CALLER))).await,
+        Err(tonic::Code::PermissionDenied)
+    );
+}
+
+/// A client with no leaf is never admitted: the `required` listener fails
+/// the handshake, and an `optional` one hands the handler no name.
+#[tokio::test]
+async fn a_client_with_no_leaf_is_never_admitted_to_sync_teams() {
+    let p = pki();
+    let port = serve_iam(&p, "required").await;
+    assert!(sync(&p, port, None).await.is_err(), "required: refused");
+    let port = serve_iam(&p, "optional").await;
+    assert_eq!(
+        sync(&p, port, None).await,
+        Err(tonic::Code::PermissionDenied),
+        "optional: no name, refused by the gate"
+    );
+}

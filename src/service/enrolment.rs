@@ -430,6 +430,11 @@ impl Iam {
             // enrolment and refuses it beside the demand above. Dropping it here
             // would make an administrator's containing reset a plain one.
             revoke_existing_credentials: req.get_ref().revoke_existing_credentials,
+            // IAM_ADMIN_FROM_TEAM, relayed on every call (team access). With it
+            // true and the demand above set, `iam-db` evaluates ADR-0966's
+            // predicate and admits the revoke instruction beside it; iam refuses
+            // neither pair itself.
+            admin_from_team: self.admin_from_team(),
         });
         forward_request_id(&req, &mut create);
 
