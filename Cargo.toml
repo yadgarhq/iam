@@ -53,7 +53,7 @@ tonic-prost = "0.14"
 # common name and admits only the gateway's (`service::caller`).
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.24", features = [
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.0", features = [
   "serve-tls",
 ] }
 # Pinned by RELEASE TAG. A published tag never moves in this organisation — a

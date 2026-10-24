@@ -60,6 +60,22 @@ async fn accepts(port: u16) -> bool {
         .is_ok()
 }
 
+/// The chart's `server.limits` defaults (ADR-1006), through the same lookup a
+/// deployment's environment goes through.
+fn limits() -> serve::ServerLimits {
+    serve::limits_from_lookup(|key| {
+        match key {
+            "LISTEN_MAX_CONCURRENT_STREAMS" => Some("256"),
+            "LISTEN_KEEPALIVE_INTERVAL_SECS" => Some("30"),
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS" => Some("10"),
+            "LISTEN_MAX_HEADER_LIST_BYTES" => Some("16384"),
+            _ => None,
+        }
+        .map(str::to_string)
+    })
+    .expect("the chart defaults are a complete, in-range configuration")
+}
+
 /// A real tonic server, already spawned, with a oneshot as its shutdown future
 /// — the shape `main` uses.
 ///
@@ -77,7 +93,7 @@ async fn spawned() -> (
     let port = listener.local_addr().unwrap().port();
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
 
-    let mut builder = serve::builder(None).expect("a cleartext listener");
+    let mut builder = serve::builder(None, &limits()).expect("a cleartext listener");
     let router = builder.add_routes(tonic::service::Routes::default());
     let serving = tokio::spawn(async move {
         router

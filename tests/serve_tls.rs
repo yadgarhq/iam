@@ -374,8 +374,24 @@ async fn a_permanent_failure_on_the_first_address_is_reported_not_retried() {
     bind_one_port_on_every_address(&addrs).await;
 }
 
+/// The chart's `server.limits` defaults (ADR-1006), through the same lookup a
+/// deployment's environment goes through.
+fn limits() -> serve::ServerLimits {
+    serve::limits_from_lookup(|key| {
+        match key {
+            "LISTEN_MAX_CONCURRENT_STREAMS" => Some("256"),
+            "LISTEN_KEEPALIVE_INTERVAL_SECS" => Some("30"),
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS" => Some("10"),
+            "LISTEN_MAX_HEADER_LIST_BYTES" => Some("16384"),
+            _ => None,
+        }
+        .map(str::to_string)
+    })
+    .expect("the chart defaults are a complete, in-range configuration")
+}
+
 fn spawn(listener: TcpListener, tls: Option<&ServerTls>) {
-    let mut server = serve::builder(tls).expect("a usable certificate and key");
+    let mut server = serve::builder(tls, &limits()).expect("a usable certificate and key");
     let router = server.add_routes(tonic::service::Routes::default());
     tokio::spawn(async move {
         let _ = router
@@ -553,7 +569,7 @@ async fn a_certificate_path_that_cannot_be_read_is_an_error() {
     let key = TempPem::with("irrelevant, the certificate is checked first");
     let tls = configured(&missing, key.path());
 
-    let outcome = serve::builder(Some(&tls));
+    let outcome = serve::builder(Some(&tls), &limits());
     assert!(
         matches!(outcome, Err(ServeTlsError::Unreadable { .. })),
         "a certificate path that does not exist must be refused, not served in cleartext"
@@ -577,7 +593,7 @@ async fn a_key_path_that_cannot_be_read_is_an_error() {
     let missing = std::env::temp_dir().join("yadgar-iam-no-such-key-6a17d4.pem");
     let tls = configured(cert.path(), &missing);
 
-    let outcome = serve::builder(Some(&tls));
+    let outcome = serve::builder(Some(&tls), &limits());
     assert!(
         matches!(outcome, Err(ServeTlsError::Unreadable { .. })),
         "a key path that does not exist must be refused, not served in cleartext"
@@ -611,7 +627,7 @@ async fn a_certificate_or_key_file_with_nothing_in_it_is_an_error() {
                 (TempPem::with(&p.cert_pem), TempPem::with(contents))
             };
             let tls = configured(cert.path(), key.path());
-            let outcome = serve::builder(Some(&tls));
+            let outcome = serve::builder(Some(&tls), &limits());
             assert!(
                 matches!(outcome, Err(ServeTlsError::Unusable { .. })),
                 "a serving file with nothing usable in it must be refused at boot"
@@ -639,7 +655,7 @@ async fn a_certificate_and_a_key_that_do_not_match_are_an_error() {
     let key = TempPem::with(&other.key_pem);
     let tls = configured(cert.path(), key.path());
 
-    let outcome = serve::builder(Some(&tls));
+    let outcome = serve::builder(Some(&tls), &limits());
     assert!(
         matches!(outcome, Err(ServeTlsError::Unusable { .. })),
         "a key that does not match the certificate must be refused at boot"
@@ -673,7 +689,7 @@ async fn the_refusal_names_the_reason_rather_than_just_transport_error() {
     let key = TempPem::with(&other.key_pem);
     let tls = configured(cert.path(), key.path());
 
-    let Err(err) = serve::builder(Some(&tls)) else {
+    let Err(err) = serve::builder(Some(&tls), &limits()) else {
         panic!("a key that does not match the certificate must be refused at boot");
     };
     let rendered = yadgar_iam::boot::refusal(&err);
