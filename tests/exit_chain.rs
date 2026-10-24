@@ -3,7 +3,10 @@
 //! server that can never start reaches 1 with its reason intact.
 //!
 //! **This file proves only that each real path reaches its real exit code —
-//! never that an in-flight call survives to finish.** The library tests prove
+//! never that an in-flight call survives to finish.** That case lives in one
+//! place: `yadgarhq/task`'s `sigterm_lets_an_in_flight_call_finish` (task#87,
+//! merged; yaadgaar #318) is the single in-flight canary, and this repository
+//! does not copy it. The library tests prove
 //! the rest: `yadgar-lifecycle`'s own `tests/drain.rs` proves the budget and
 //! that a call in flight when shutdown is requested is given until the budget
 //! to finish; its `tests/shutdown.rs` proves a real SIGTERM reaches a real
