@@ -136,13 +136,20 @@ pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
         ("METRICS_LISTEN", "127.0.0.1:0".to_string()),
         ("LISTEN_TLS_ENABLED", "0".to_string()),
         ("LISTEN_TLS_CLIENT_AUTH", "off".to_string()),
+        // ADR-1006: the five listener limits have no default either. The
+        // chart's `server.limits` defaults.
+        ("LISTEN_MAX_CONCURRENT_STREAMS", "256".to_string()),
+        ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30".to_string()),
+        ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10".to_string()),
+        ("LISTEN_MAX_HEADER_LIST_BYTES", "16384".to_string()),
         ("IAM_DB_TLS_ENABLED", "0".to_string()),
-        ("IAM_DB_REQUEST_TIMEOUT_SECONDS", "30".to_string()),
+        ("IAM_DB_REQUEST_TIMEOUT_SECONDS", "14".to_string()),
         ("YADGAR_KEYS_DIR", keys_dir.display().to_string()),
         ("LOGIN_RESPONSE_FLOOR_MS", "0".to_string()),
         ("REDEEM_RESPONSE_FLOOR_MS", "0".to_string()),
         // ADR-0972 (3): required, no default. The chart's 90 days.
         ("CREDENTIAL_LIFETIME_SECONDS", "7776000".to_string()),
+        ("IAM_ADMIN_FROM_TEAM", "false".to_string()),
     ]
 }
 

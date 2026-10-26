@@ -20,6 +20,8 @@
 //! | [`validate`] | the bounds on fields that appear in more than one request |
 //! | [`rpc`] | the `IamService` impl: contract docs, and the caller handed on |
 //! | [`caller`] | the caller gate (ADR-0972): the `_as` seam, telemetry scope, floors |
+//! | [`teams`] | `SyncTeams`, its seeder gate, and `IAM_ADMIN_FROM_TEAM` (team access) |
+//! | [`store`] | the `iam-db` hop under the caller's deadline (ADR-1019) |
 //!
 //! A BOUND STAYS WITH THE REQUEST IT WAS ARGUED FOR, which is ADR-0565's rule
 //! about re-arguing a bound per field, applied to where the bound lives. Only
@@ -31,6 +33,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use tonic::{Request, Response, Status};
+use yadgar_dial::Deadline;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
@@ -50,6 +53,8 @@ mod lifetime;
 mod login;
 mod rpc;
 mod settings;
+mod store;
+mod teams;
 mod validate;
 
 /// The `service` label every metric this binary emits carries (D67). Public so
@@ -58,6 +63,12 @@ mod validate;
 pub const SERVICE: &str = "iam";
 
 pub use lifetime::{CredentialLifetime, LIFETIME_CHART_KEY, LIFETIME_ENV};
+pub use store::IamDb;
+use store::{cut_off, recorded, store_failed};
+pub use teams::{
+    parse_admin_from_team, ADMIN_FROM_TEAM_CHART_KEY, ADMIN_FROM_TEAM_ENV, SEEDER_CALLER,
+    SEEDER_PRINCIPAL,
+};
 
 /// The measured response-time floor for [`IamService::login`].
 ///
@@ -280,6 +291,8 @@ impl EnrolmentConfig {
 pub struct Iam {
     keys: Keys,
     channel: tonic::transport::Channel,
+    /// The ceiling on every `iam-db` call (ADR-1019). See [`IamDb`].
+    ceiling: Duration,
     invalidator: Invalidator,
     /// See [`MEASURED_LOGIN_RESPONSE_FLOOR`] and `Iam::hold_until_floor`.
     login_floor: Floor,
@@ -291,6 +304,9 @@ pub struct Iam {
     enrolment: Option<EnrolmentConfig>,
     /// ADR-0972 (3): what every `Login` and redemption credential lives for.
     credential_lifetime: CredentialLifetime,
+    /// `IAM_ADMIN_FROM_TEAM` (ADR-0962, ADR-0963; plans/team-access.md §6).
+    /// See [`teams`] for what it changes.
+    admin_from_team: bool,
 }
 
 impl Iam {
@@ -307,15 +323,17 @@ impl Iam {
     /// default, which for a security control is the change nobody sees.
     pub fn new(
         keys: Keys,
-        channel: tonic::transport::Channel,
+        db: IamDb,
         invalidator: Invalidator,
         floors: ResponseFloors,
         enrolment: Option<EnrolmentConfig>,
         credential_lifetime: CredentialLifetime,
+        admin_from_team: bool,
     ) -> Self {
         Self {
             keys,
-            channel,
+            channel: db.channel,
+            ceiling: db.ceiling,
             invalidator,
             login_floor: Floor {
                 rpc: "Login",
@@ -329,6 +347,7 @@ impl Iam {
             },
             enrolment,
             credential_lifetime,
+            admin_from_team,
         }
     }
 
@@ -366,7 +385,7 @@ fn forward_request_id<T, U>(from: &Request<T>, to: &mut Request<U>) {
         return;
     }
     // Always parses: `to_str()` admitted the inbound value and the marker is
-    // ASCII. Dropped rather than unwrapped if it ever did not (D25).
+    // ASCII. Dropped rather than unwrapped if it ever did not (D67).
     if let Ok(v) = id.parse() {
         to.metadata_mut().insert("x-yadgar-request-id", v);
     }
@@ -403,7 +422,7 @@ fn capped(s: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// A header is bounded only by the transport, and this one `String` reaches the
 /// `CallRecord` through `tel`'s `Scope`. Capped rather than refused, because a
-/// correlation id is transport-level context and must never fail a call (D25).
+/// correlation id is transport-level context and must never fail a call (D67).
 /// The gateway mints every legitimate id as a 36-character UUIDv7, so a value
 /// long enough to be cut did not come from it.
 fn request_id_of<T>(req: &Request<T>) -> String {
@@ -462,6 +481,7 @@ fn refusal_for(code: tonic::Code) -> &'static str {
         tonic::Code::NotFound => "no such record",
         tonic::Code::InvalidArgument => "the store refused the request",
         tonic::Code::Unavailable => "storage unavailable",
+        tonic::Code::DeadlineExceeded => "iam-db did not answer before the caller's deadline",
         _ => "the iam-db call failed",
     }
 }

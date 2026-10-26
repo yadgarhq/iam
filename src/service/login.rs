@@ -11,6 +11,10 @@ use super::*;
 pub(super) enum MintRefused {
     /// The user's credential epoch moved since it was read.
     EpochMoved,
+    /// Cut off at the caller's deadline ([`super::cut_off`]). The password is
+    /// verified but the answer is not decided, so each caller answers as its
+    /// own wrong-password refusal.
+    CutOff,
     /// Any other store failure, already redacted by `upstream_failed`.
     Failed(Status),
 }
@@ -43,6 +47,7 @@ impl Iam {
         req: Request<LoginRequest>,
         call: Call,
     ) -> Result<Response<LoginResponse>, Status> {
+        let deadline = Deadline::of(&req);
         // VALIDATION BEFORE LOOKUP, and this check was ABSENT ENTIRELY. `Login`
         // stores a caller-supplied `label` in the same column `RedeemEnrolment`
         // and `IssueCredential` do, and it was the only one of the three with no
@@ -71,36 +76,15 @@ impl Iam {
             return Err(refusal);
         }
 
-        // The username never leaves this process. What goes to the store is its
-        // blind index, so the plaintext reaches no query log and no backup.
-        let mut lookup = Request::new(db::GetPasswordHashRequest {
-            // DEAD FIELD, AND EMPTY IS THE SECURITY PROPERTY RATHER THAN AN
-            // OMISSION. The plaintext username never crosses this boundary — it
-            // would otherwise reach a query log and a database backup — so the
-            // superseded field is written out empty rather than left to a rest
-            // pattern that would say the same thing silently.
-            //
-            // THE EXPECTATION IS ON THIS FIELD AND NOT ON THE STATEMENT, which
-            // is the same distinction the rest of this change is about. On the
-            // statement it is satisfied by ANY deprecated field in the literal,
-            // so a `#[deprecated]` later landing on `username_blind_index` would
-            // be absorbed silently and `unfulfilled_lint_expectations` would
-            // never fire. One field, one expectation.
-            #[expect(
-                deprecated,
-                reason = "the dead field is written out rather than defaulted: see above"
-            )]
-            username: String::new(),
-            username_blind_index: self.keys.blind_index(&req.get_ref().username),
-        });
-        forward_request_id(&req, &mut lookup);
-
-        let found = self
-            .client()
-            .get_password_hash(lookup)
+        // ADR-1019: a lookup cut off at the caller's deadline is `None`, and is
+        // verified and refused exactly as an unknown username (see `cut_off`).
+        let found = match self
+            .hash_on_file(deadline, &req, &req.get_ref().username)
             .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        {
+            Ok(found) => found,
+            Err(failed) => return Err(store_failed(call, failed)),
+        };
 
         // THE ORDER HERE IS THE SECURITY PROPERTY.
         //
@@ -110,11 +94,20 @@ impl Iam {
         // username would make it answer in microseconds while a known one takes
         // the ~50ms Argon2id costs, and that difference is measurable over a
         // network. The endpoint would enumerate accounts.
-        let stored = (!found.user_id.is_empty()).then_some(found.argon2id_hash.as_str());
-        if !self.keys.verify_password(stored, &req.get_ref().password) {
-            call.fail("UNAUTHENTICATED");
+        let cut = found.is_none();
+        let stored = found
+            .as_ref()
+            .filter(|f| !f.user_id.is_empty())
+            .map(|f| f.argon2id_hash.as_str());
+        let verified = self.keys.verify_password(stored, &req.get_ref().password);
+        let Some(found) = found.filter(|_| verified) else {
+            call.fail(if cut {
+                "DEADLINE_EXCEEDED"
+            } else {
+                "UNAUTHENTICATED"
+            });
             return Err(refused());
-        }
+        };
 
         let token = Keys::mint_token().map_err(|_| Status::internal("cannot mint a credential"))?;
         let expires_at = super::lifetime::deadline(self.credential_lifetime);
@@ -138,13 +131,18 @@ impl Iam {
         });
         forward_request_id(&req, &mut create);
 
-        let created = match self.mint_under_epoch(create).await {
+        let created = match self.mint_under_epoch(deadline, create).await {
             Ok(created) => created,
             Err(MintRefused::EpochMoved) => {
                 call.fail("UNAUTHENTICATED");
                 return Err(refused());
             }
-            Err(MintRefused::Failed(failed)) => return Err(failed),
+            // Verified, but the answer is not decided: a wrong password's.
+            Err(MintRefused::CutOff) => {
+                call.fail("DEADLINE_EXCEEDED");
+                return Err(refused());
+            }
+            Err(MintRefused::Failed(failed)) => return Err(recorded(call, failed)),
         };
 
         call.finish(Outcome {
@@ -159,6 +157,55 @@ impl Iam {
         }))
     }
 
+    /// The password hash on file for `username`, read under `deadline`, with
+    /// the request id of `from` forwarded. `Login` and the redemption's replay
+    /// check both read it this way.
+    ///
+    /// **`Ok(None)` IS A LOOKUP CUT OFF AT THE CALLER'S DEADLINE** ([`cut_off`]).
+    /// Both callers verify against no hash and refuse exactly as for an
+    /// unknown name, so the deadline a caller chose never shows as a status.
+    pub(super) async fn hash_on_file<T>(
+        &self,
+        deadline: Deadline,
+        from: &Request<T>,
+        username: &str,
+    ) -> Result<Option<db::GetPasswordHashResponse>, Status> {
+        // The username never leaves this process. What goes to the store is its
+        // blind index, so the plaintext reaches no query log and no backup.
+        let mut lookup = Request::new(db::GetPasswordHashRequest {
+            // DEAD FIELD, AND EMPTY IS THE SECURITY PROPERTY RATHER THAN AN
+            // OMISSION. The plaintext username never crosses this boundary — it
+            // would otherwise reach a query log and a database backup — so the
+            // superseded field is written out empty rather than left to a rest
+            // pattern that would say the same thing silently.
+            //
+            // THE EXPECTATION IS ON THIS FIELD AND NOT ON THE STATEMENT, which
+            // is the same distinction the rest of this change is about. On the
+            // statement it is satisfied by ANY deprecated field in the literal,
+            // so a `#[deprecated]` later landing on `username_blind_index` would
+            // be absorbed silently and `unfulfilled_lint_expectations` would
+            // never fire. One field, one expectation.
+            #[expect(
+                deprecated,
+                reason = "the dead field is written out rather than defaulted: see above"
+            )]
+            username: String::new(),
+            username_blind_index: self.keys.blind_index(username),
+        });
+        forward_request_id(from, &mut lookup);
+
+        let found = self
+            .ask(deadline, lookup, |mut c, r| async move {
+                c.get_password_hash(r).await
+            })
+            .await;
+        match found {
+            Ok(found) => Ok(Some(found)),
+            Err(cut) if cut_off(&cut) => Ok(None),
+            Err(failed) => Err(failed),
+        }
+    }
+
     /// Mint a `Login` or redemption credential under the epoch the caller read,
     /// telling a moved epoch apart from every other store failure.
     ///
@@ -171,16 +218,25 @@ impl Iam {
     /// its own answer, because only a redemption has already set a password.
     /// `Login` answers EXACTLY as a wrong password, inside its floor, so the
     /// race opens no oracle.
+    ///
+    /// `deadline` is the caller's, captured at handler entry (ADR-1019).
     pub(super) async fn mint_under_epoch(
         &self,
+        deadline: Deadline,
         create: Request<db::CreateCredentialRequest>,
     ) -> Result<db::CreateCredentialResponse, MintRefused> {
-        match self.client().create_credential(create).await {
-            Ok(created) => Ok(created.into_inner()),
+        let minted = self
+            .ask(deadline, create, |mut c, r| async move {
+                c.create_credential(r).await
+            })
+            .await;
+        match minted {
+            Ok(created) => Ok(created),
             Err(moved) if moved.code() == tonic::Code::FailedPrecondition => {
                 tracing::info!(upstream = %moved.message(), "a mint lost the credential epoch race");
                 Err(MintRefused::EpochMoved)
             }
+            Err(cut) if cut_off(&cut) => Err(MintRefused::CutOff),
             Err(other) => Err(MintRefused::Failed(upstream_failed(other))),
         }
     }

@@ -15,10 +15,11 @@ use tonic::transport::{Channel, Server};
 use crate::invalidate::Credentials;
 use crate::rotate::{self, Configuration, Schedule};
 use crate::serve::{self, ServerTls};
-use crate::service::{
-    CredentialLifetime, EnrolmentConfig, ResponseFloors, LIFETIME_CHART_KEY, LIFETIME_ENV,
-};
+use crate::service::EnrolmentConfig;
 use crate::upstream::{self, UpstreamTls};
+
+mod settings;
+pub use settings::{admin_from_team, credential_lifetime, response_floors};
 
 /// The file holding the broker password. A PATH, never the value (D80).
 const PASSWORD_FILE_KEY: &str = "NATS_PASSWORD_FILE";
@@ -280,16 +281,24 @@ pub fn listener() -> Result<(Option<ServerTls>, Server), Box<dyn std::error::Err
     // consistent" — is one `source()` hop down. A bare `to_string()` here
     // would drop it; `tests/boot_message.rs` turns red if it does.
     let listen_tls = serve::from_env().map_err(|e| e.to_string())?;
-    let server = serve::builder(listen_tls.as_ref()).map_err(|e| refusal(&e))?;
+    // ADR-1006: the four protocol limits, read beside the transport. Each is
+    // required; the refusal is a complete sentence naming the variable and the
+    // chart value, so `.to_string()` like the transport's configuration above.
+    let limits = serve::limits_from_env().map_err(|e| e.to_string())?;
+    let server = serve::builder(listen_tls.as_ref(), &limits).map_err(|e| refusal(&e))?;
     Ok((listen_tls, server))
 }
 
-/// The channel to `iam-db`, and the TLS configuration it was dialled under.
+/// The channel to `iam-db`, the request timeout it was dialled with, and the
+/// TLS configuration it was dialled under.
 ///
 /// The configuration comes back with the channel because [`crate::rotate`]
 /// watches the files it names; a dial that dropped it would leave a rotated CA
-/// bundle unnoticed.
-pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::error::Error>> {
+/// bundle unnoticed. The timeout comes back because it is also the CEILING
+/// every `iam-db` call is stamped with (ADR-1019): the caller's remaining time
+/// bounds a call below it, never above it.
+pub async fn iam_db() -> Result<(Channel, Duration, Option<UpstreamTls>), Box<dyn std::error::Error>>
+{
     // The HEADLESS Service name (D23). Resolving it yields every ready pod
     // address rather than one virtual IP.
     let db_host = env_required("IAM_DB_HOST")?;
@@ -333,7 +342,7 @@ pub async fn iam_db() -> Result<(Channel, Option<UpstreamTls>), Box<dyn std::err
         request_timeout_secs = request_timeout.as_secs(),
         "connected to iam-db"
     );
-    Ok((db, db_tls))
+    Ok((db, request_timeout, db_tls))
 }
 
 /// The mounted configuration document, and the rotation schedule it states.
@@ -368,7 +377,7 @@ pub fn metrics() -> Result<(), Box<dyn std::error::Error>> {
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure here
     // is logged and ignored: a service that cannot export metrics should still
-    // serve traffic, which is D25's rule applied to the metrics path too.
+    // serve traffic, which is D67's rule applied to the metrics path too.
     let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
         .parse()
         .map_err(|e| format!("METRICS_LISTEN is not a host:port address: {e}"))?;
@@ -412,67 +421,6 @@ pub fn enrolment() -> Option<EnrolmentConfig> {
             None
         }
     }
-}
-
-/// The shortest times `Login` and `RedeemEnrolment` may answer in.
-pub fn response_floors() -> Result<ResponseFloors, Box<dyn std::error::Error>> {
-    // The shortest time `Login` may answer in, whatever it found. Argon2id takes
-    // its cost from the PHC string it is verifying, so a stored hash provisioned
-    // at parameters other than this build's makes the response time report which
-    // usernames exist — see `crypto::Keys::verify_password`.
-    //
-    // PARSED, NOT SALVAGED, AND NOT INVENTED EITHER: the chart is the one source
-    // of this number (ADR-0569), so an absent, empty or mistyped value fails the
-    // boot naming the variable. There is no longer a compiled-in floor to fall
-    // back to. Substituting one silently would leave an operator who believes
-    // they raised the floor running the old one, and a security control nobody
-    // can tell is misconfigured is the failure this floor's own warning exists
-    // to prevent. `service::MEASURED_LOGIN_RESPONSE_FLOOR` survives as the
-    // MEASUREMENT the chart's value was calibrated from — documentation, read by
-    // no knob path.
-    let login_response_floor = Duration::from_millis(
-        env_required("LOGIN_RESPONSE_FLOOR_MS")?
-            .parse()
-            .map_err(|e| format!("LOGIN_RESPONSE_FLOOR_MS is not a number of milliseconds: {e}"))?,
-    );
-
-    // ITS OWN VALUE, because `RedeemEnrolment` legitimately does more work — two
-    // Argon2id operations and a further round trip — and a floor sized for
-    // `Login` would be exceeded by every successful redemption, turning the
-    // warning that says "raise this" into one that fires on every call.
-    let redeem_response_floor = Duration::from_millis(
-        env_required("REDEEM_RESPONSE_FLOOR_MS")?
-            .parse()
-            .map_err(|e| {
-                format!("REDEEM_RESPONSE_FLOOR_MS is not a number of milliseconds: {e}")
-            })?,
-    );
-    tracing::info!(
-        login_floor_ms = login_response_floor.as_millis() as u64,
-        redeem_floor_ms = redeem_response_floor.as_millis() as u64,
-        "Login and RedeemEnrolment answer no sooner than their response-time floors"
-    );
-    Ok(ResponseFloors {
-        login: login_response_floor,
-        redeem: redeem_response_floor,
-    })
-}
-
-/// ADR-0972 (3): how long every `Login` and redemption credential lives.
-///
-/// REQUIRED, like the floors: no compiled-in default (ADR-0569), and no "never"
-/// value. The chart renders it from `credential.lifetimeSeconds`.
-pub fn credential_lifetime() -> Result<CredentialLifetime, Box<dyn std::error::Error>> {
-    // Absent and empty get `env_required`'s own sentence, plus the chart key,
-    // so every refusal of this knob names where to set it.
-    let raw = env_required(LIFETIME_ENV)
-        .map_err(|e| format!("{e} Set the chart's {LIFETIME_CHART_KEY}."))?;
-    let lifetime = CredentialLifetime::parse(&raw)?;
-    tracing::info!(
-        lifetime_seconds = lifetime.seconds(),
-        "Login and RedeemEnrolment credentials expire after CREDENTIAL_LIFETIME_SECONDS"
-    );
-    Ok(lifetime)
 }
 
 #[cfg(test)]

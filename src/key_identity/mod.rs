@@ -50,6 +50,8 @@
 use std::time::Duration;
 
 use tonic::transport::Channel;
+use tonic::Request;
+use yadgar_dial::Deadline;
 
 use crate::crypto::Keys;
 use crate::pb::yadgar::common::v1::Idempotency;
@@ -208,18 +210,25 @@ pub struct Mismatch {
 /// fires for one reason and one reason only. A check that has PASSED stops
 /// asking and never resolves; a check that has not passed keeps asking for ever
 /// and never resolves either.
+///
+/// `ceiling` is the request timeout the channel was dialled with. THIS CHECK
+/// HAS NO CALLER, so no deadline arrives to propagate: every round trip is
+/// stamped with the ceiling alone ([`Deadline::none`], ADR-1019), which is what
+/// tells `iam-db` how long this side will wait.
 pub async fn watch(
     client: IamDbServiceClient<Channel>,
+    ceiling: Duration,
     identity: Identity,
     retry: Retry,
 ) -> Mismatch {
-    watch_with_seed(client, identity, retry, retry::seed()).await
+    watch_with_seed(client, ceiling, identity, retry, retry::seed()).await
 }
 
 /// [`watch`] with the jitter's seed supplied, so a test can assert an exact wait
 /// rather than a distribution.
 pub async fn watch_with_seed(
     mut client: IamDbServiceClient<Channel>,
+    ceiling: Duration,
     identity: Identity,
     retry: Retry,
     seed: u64,
@@ -231,7 +240,7 @@ pub async fn watch_with_seed(
     let mut standing: Option<(&'static str, Duration)> = None;
 
     loop {
-        match step(&mut client, &identity).await {
+        match step(&mut client, ceiling, &identity).await {
             Step::Passed(arm) => {
                 tracing::info!(
                     arm,
@@ -377,12 +386,17 @@ enum Step {
 const READ: &str = "GetKeyIdentity";
 const WRITE: &str = "SetKeyIdentity";
 
-async fn step(client: &mut IamDbServiceClient<Channel>, identity: &Identity) -> Step {
-    let asked = client
-        .get_key_identity(db::GetKeyIdentityRequest {
-            key_fingerprint: identity.fingerprint(),
-            derivation_version: DERIVATION_VERSION,
-        })
+async fn step(
+    client: &mut IamDbServiceClient<Channel>,
+    ceiling: Duration,
+    identity: &Identity,
+) -> Step {
+    let read = Request::new(db::GetKeyIdentityRequest {
+        key_fingerprint: identity.fingerprint(),
+        derivation_version: DERIVATION_VERSION,
+    });
+    let asked = Deadline::none()
+        .call(ceiling, read, |r| client.get_key_identity(r))
         .await;
     match asked {
         Err(status) => Step::NotYet(Unverified::of_status(status.code())),
@@ -392,7 +406,7 @@ async fn step(client: &mut IamDbServiceClient<Channel>, identity: &Identity) -> 
             // `iam-db` can tell that, and its `SetKeyIdentity` refuses to record
             // over a store that already holds rows. This service asks; it never
             // concludes.
-            Read::Absent => record(client, identity).await,
+            Read::Absent => record(client, ceiling, identity).await,
             Read::Settled(step) => step,
         },
     }
@@ -441,15 +455,20 @@ fn outcome_of_write(raw: i32) -> Step {
     }
 }
 
-async fn record(client: &mut IamDbServiceClient<Channel>, identity: &Identity) -> Step {
-    let asked = client
-        .set_key_identity(db::SetKeyIdentityRequest {
-            idempotency: Some(Idempotency {
-                key: identity.idempotency_key().to_string(),
-            }),
-            key_fingerprint: identity.fingerprint(),
-            derivation_version: DERIVATION_VERSION,
-        })
+async fn record(
+    client: &mut IamDbServiceClient<Channel>,
+    ceiling: Duration,
+    identity: &Identity,
+) -> Step {
+    let write = Request::new(db::SetKeyIdentityRequest {
+        idempotency: Some(Idempotency {
+            key: identity.idempotency_key().to_string(),
+        }),
+        key_fingerprint: identity.fingerprint(),
+        derivation_version: DERIVATION_VERSION,
+    });
+    let asked = Deadline::none()
+        .call(ceiling, write, |r| client.set_key_identity(r))
         .await;
     match asked {
         Err(status) => Step::NotYet(Unverified::of_status(status.code())),

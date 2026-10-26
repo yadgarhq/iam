@@ -134,6 +134,7 @@ impl Iam {
         req: Request<RedeemEnrolmentRequest>,
         call: Call,
     ) -> Result<Response<RedeemEnrolmentResponse>, Status> {
+        let deadline = Deadline::of(&req);
         // 1. VALIDATION BEFORE LOOKUP.
         if let Err(refusal) = validate_redemption(req.get_ref()) {
             call.fail("INVALID_ARGUMENT");
@@ -142,7 +143,7 @@ impl Iam {
         // 2-3. THE HASHING AND THE SPEND, in `Self::spend_enrolment`: every
         // refusal reachable before the secret is confirmed lives there, and
         // every one of them is indistinguishable from the others.
-        let (spent, call) = self.spend_enrolment(&req, call).await?;
+        let (spent, call) = self.spend_enrolment(deadline, &req, call).await?;
 
         // ADR-0943: THE STORE REVOKED EVERY OLD CREDENTIAL IN THE REDEMPTION'S
         // TRANSACTION, AND THE GATEWAY'S CACHE MUST HEAR OF IT. Published here,
@@ -167,37 +168,28 @@ impl Iam {
 
         // 4. THE REPLAY CHECK. The blind index is computed here from the name
         // just decrypted; the plaintext still crosses no boundary.
-        let mut lookup = Request::new(db::GetPasswordHashRequest {
-            // DEAD FIELD, EMPTY FOR THE REASON GIVEN IN `login`: the plaintext
-            // name just decrypted must not cross this boundary either. The
-            // expectation is per-field for the reason given there too.
-            #[expect(
-                deprecated,
-                reason = "the dead field is written out rather than defaulted: see above"
-            )]
-            username: String::new(),
-            username_blind_index: self.keys.blind_index(&username),
-        });
-        forward_request_id(&req, &mut lookup);
-        let held = self
-            .client()
-            .get_password_hash(lookup)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
-
-        let stored = (!held.user_id.is_empty()).then_some(held.argon2id_hash.as_str());
+        // A lookup cut off at the caller's deadline is `None`: refused below
+        // as a different password, never as itself (see `cut_off`).
+        let held = match self.hash_on_file(deadline, &req, &username).await {
+            Ok(held) => held,
+            Err(failed) => return Err(store_failed(call, failed)),
+        };
+        let stored = held
+            .as_ref()
+            .filter(|h| !h.user_id.is_empty())
+            .map(|h| h.argon2id_hash.as_str());
         if !self.keys.verify_password(stored, &req.get_ref().password) {
-            call.fail("INVALID_ARGUMENT");
+            call.fail(if held.is_none() {
+                "DEADLINE_EXCEEDED"
+            } else {
+                "INVALID_ARGUMENT"
+            });
             // NAMED, AND SAFE TO NAME. Reaching this line means the secret was
             // already confirmed and spent under this very key, so the refusal
             // reports nothing the caller did not already know. That is the
             // opposite of the refusals above it, and the reason validation runs
             // before the lookup rather than here.
-            return Err(Status::invalid_argument(
-                "this idempotency key was used with a different password; a \
-                 replay cannot change the password the first attempt set",
-            ));
+            return Err(replay_refused());
         }
 
         // A FRESH CREDENTIAL UNDER ITS OWN KEY. The caller's key deliberately
@@ -228,14 +220,19 @@ impl Iam {
         });
         forward_request_id(&req, &mut create);
 
-        let created = match self.mint_under_epoch(create).await {
+        let created = match self.mint_under_epoch(deadline, create).await {
             Ok(created) => created,
             // COMMITTED: not the single refusal, never "spent"/"expired".
             Err(super::login::MintRefused::EpochMoved) => {
                 call.fail("FAILED_PRECONDITION");
                 return Err(Status::failed_precondition(PASSWORD_SET_RUN_LOGIN));
             }
-            Err(super::login::MintRefused::Failed(failed)) => return Err(failed),
+            // The replay check passed, but the answer is not decided.
+            Err(super::login::MintRefused::CutOff) => {
+                call.fail("DEADLINE_EXCEEDED");
+                return Err(replay_refused());
+            }
+            Err(super::login::MintRefused::Failed(failed)) => return Err(recorded(call, failed)),
         };
 
         call.finish(Outcome {
@@ -266,6 +263,7 @@ impl Iam {
     /// the order, the statuses or the equalising verifications changes.
     async fn spend_enrolment(
         &self,
+        deadline: Deadline,
         req: &Request<RedeemEnrolmentRequest>,
         call: Call,
     ) -> Result<(db::RedeemEnrolmentResponse, Call), Status> {
@@ -323,9 +321,16 @@ impl Iam {
         // lookup and the credential mint — are safe for the reason step 4 gives:
         // both run only after the secret is confirmed and spent, so their codes
         // report nothing the caller does not already know.
-        let spent = match self.client().redeem_enrolment(spend).await {
-            Ok(answered) => answered.into_inner(),
-            Err(refused) if refused.code() == tonic::Code::InvalidArgument => {
+        let spent = match self
+            .ask(deadline, spend, |mut c, r| async move {
+                c.redeem_enrolment(r).await
+            })
+            .await
+        {
+            Ok(answered) => answered,
+            // A CUT-OFF IS THE SAME REFUSAL (see `cut_off`): before the secret
+            // is confirmed, the caller's deadline must not show as a status.
+            Err(refused) if refused.code() == tonic::Code::InvalidArgument || cut_off(&refused) => {
                 // THE VERIFICATION THE SUCCESS PATH PAYS, paid here too — the same
                 // reason step 3 below pays it, and this path would otherwise be
                 // the one refusal costing a single Argon2id operation.
@@ -337,10 +342,13 @@ impl Iam {
                     upstream = %refused.message(),
                     "enrolment redemption refused by the store"
                 );
-                call.fail("UNAUTHENTICATED");
+                call.fail(match refused.code() {
+                    tonic::Code::InvalidArgument => "UNAUTHENTICATED",
+                    _ => "DEADLINE_EXCEEDED",
+                });
                 return Err(enrolment_refused());
             }
-            Err(other) => return Err(upstream_failed(other)),
+            Err(other) => return Err(store_failed(call, other)),
         };
 
         // 3. ONE FAILURE, NOT THREE.
@@ -371,6 +379,7 @@ impl Iam {
         req: Request<IssueEnrolmentRequest>,
         call: Call,
     ) -> Result<Response<IssueEnrolmentResponse>, Status> {
+        let deadline = Deadline::of(&req);
         // BEFORE THE SECRET IS MINTED AND BEFORE THE STORE IS TOUCHED, so a
         // deployment without enrolment configured leaves no enrolment row and
         // no secret behind. FAILED_PRECONDITION rather than INTERNAL: the
@@ -430,15 +439,19 @@ impl Iam {
             // enrolment and refuses it beside the demand above. Dropping it here
             // would make an administrator's containing reset a plain one.
             revoke_existing_credentials: req.get_ref().revoke_existing_credentials,
+            // IAM_ADMIN_FROM_TEAM, relayed on every call (team access). With it
+            // true and the demand above set, `iam-db` evaluates ADR-0966's
+            // predicate and admits the revoke instruction beside it; iam refuses
+            // neither pair itself.
+            admin_from_team: self.admin_from_team(),
         });
         forward_request_id(&req, &mut create);
 
-        let created = self
-            .client()
-            .create_enrolment(create)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (created, call) = self
+            .ask_recorded(deadline, call, create, |mut c, r| async move {
+                c.create_enrolment(r).await
+            })
+            .await?;
 
         // THE TRUST ANCHOR TRAVELS WITH THE SECRET, and not merely the secret. A
         // client that has never met this deployment has nothing to verify the
@@ -475,4 +488,13 @@ impl Iam {
             expires_at: Some(expires_at),
         }))
     }
+}
+
+/// What a replay with a different password gets. NAMED, AND SAFE TO NAME: see
+/// the replay check in [`Iam::redeem_inner`].
+fn replay_refused() -> Status {
+    Status::invalid_argument(
+        "this idempotency key was used with a different password; a replay \
+         cannot change the password the first attempt set",
+    )
 }

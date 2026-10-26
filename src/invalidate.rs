@@ -20,7 +20,7 @@
 //!   broker outage.
 //!
 //! **Publishing never fails the call that caused it.** Same rule as telemetry
-//! (D25): a revocation that succeeded in the database has happened, and returning
+//! (D67): a revocation that succeeded in the database has happened, and returning
 //! an error because the broker was unreachable would tell the caller to retry
 //! something already done. A failed publish is logged loudly and the TTL becomes
 //! the mechanism for that one event — which is exactly the case it exists for.

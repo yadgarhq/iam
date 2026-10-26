@@ -251,6 +251,19 @@ spec:
             - name: LISTEN_TLS_CLIENT_CA_FILE
               value: /var/run/config/client-ca/ca.crt
             {{- end }}
+            # THE LISTENER'S PROTOCOL LIMITS (ADR-1006), RENDERED
+            # UNCONDITIONALLY: the binary has no default for any of the four and
+            # refuses to boot on an absent, non-numeric or out-of-range one.
+            # Ranges are `values.schema.json`'s; the one cross-key rule is in
+            # `render-checks.yaml`.
+            - name: LISTEN_MAX_CONCURRENT_STREAMS
+              value: {{ .Values.server.limits.maxConcurrentStreams | int64 | quote }}
+            - name: LISTEN_KEEPALIVE_INTERVAL_SECS
+              value: {{ .Values.server.limits.keepaliveIntervalSeconds | int64 | quote }}
+            - name: LISTEN_KEEPALIVE_TIMEOUT_SECS
+              value: {{ .Values.server.limits.keepaliveTimeoutSeconds | int64 | quote }}
+            - name: LISTEN_MAX_HEADER_LIST_BYTES
+              value: {{ .Values.server.limits.maxHeaderListBytes | int64 | quote }}
             - name: IAM_DB_HOST
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT
@@ -422,6 +435,11 @@ spec:
             # guarded so a non-map `credential` cannot panic the render first.
             - name: CREDENTIAL_LIFETIME_SECONDS
               value: {{ required "iam: credential.lifetimeSeconds must be set: it renders CREDENTIAL_LIFETIME_SECONDS, which iam requires to boot (ADR-0972)" (dig "lifetimeSeconds" "" (ternary .Values.credential dict (kindIs "map" .Values.credential))) | int64 | quote }}
+            # Team access (ADR-0962, ADR-0963): where is_admin comes from. iam
+            # refuses to boot without it; render-checks.yaml refuses a
+            # non-boolean `adminFromTeam` by name before this line renders it.
+            - name: IAM_ADMIN_FROM_TEAM
+              value: {{ .Values.adminFromTeam | quote }}
             # The gateway address every enrolment token carries (D73).
             #
             # NOT `required`, and NOT a boot failure either. No default can know

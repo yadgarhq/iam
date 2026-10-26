@@ -108,6 +108,13 @@ impl Iam {
         req: Request<SetUserAdminRequest>,
         call: Call,
     ) -> Result<Response<SetUserAdminResponse>, Status> {
+        let deadline = Deadline::of(&req);
+        // RETIRED WHILE IAM_ADMIN_FROM_TEAM IS TRUE (ADR-0962), before the store
+        // is asked and before any invalidation: see `teams.rs`.
+        if let Some(refusal) = self.set_user_admin_retired() {
+            call.fail("FAILED_PRECONDITION");
+            return Err(refusal);
+        }
         let mut upstream = Request::new(db::SetUserAdminRequest {
             // D9'S KEY TRAVELS AND `iam-db` DISCARDS IT, WHICH IS NOT THE SAME
             // ARGUMENT `revoke_credential` MAKES. There the key is what turns a
@@ -134,10 +141,11 @@ impl Iam {
         });
         forward_request_id(&req, &mut upstream);
 
-        self.client()
-            .set_user_admin(upstream)
-            .await
-            .map_err(upstream_failed)?;
+        let (_, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.set_user_admin(r).await
+            })
+            .await?;
 
         // **THE SUBJECT NAMES SOMETHING THAT DID NOT HAPPEN, AND THAT COST IS
         // PAID DELIBERATELY.** No credential was revoked here: a person's
@@ -183,7 +191,15 @@ impl Iam {
         req: Request<CreateUserRequest>,
         call: Call,
     ) -> Result<Response<CreateUserResponse>, Status> {
+        let deadline = Deadline::of(&req);
         let r = req.get_ref();
+
+        // TEAM ACCESS FIRST (`teams.rs`): the `user_id` format, the setting it
+        // needs, and `is_admin` while admin is derived. No store call.
+        if let Some((refusal, label)) = self.create_user_refusal(r) {
+            call.fail(label);
+            return Err(refusal);
+        }
 
         // VALIDATION BEFORE ENCRYPTION, and the order is what makes the refusal
         // legible. Encrypting first would spend the work and then refuse on a
@@ -241,15 +257,26 @@ impl Iam {
             // it is forwarded exactly as received, `None` stays `None`, and nothing
             // here authorises on it.
             unverified_actor: r.unverified_actor.clone(),
+            // F2 (ADR-0963 (5)): relayed byte-identical. Empty means "mint one",
+            // as before; a non-empty one passed `create_user_refusal` above, and
+            // `iam-db` evaluates the bootstrap predicate inside the insert.
+            user_id: r.user_id.clone(),
         });
         forward_request_id(&req, &mut upstream);
 
-        let created = self
-            .client()
-            .create_user(upstream)
-            .await
-            .map_err(upstream_failed)?
-            .into_inner();
+        let (created, call) = self
+            .ask_recorded(deadline, call, upstream, |mut c, r| async move {
+                c.create_user(r).await
+            })
+            .await?;
+
+        // AFTER AN F2 CREATE COMMITTED: the store moved the pending
+        // administrator into `iam_team_member`, so that user's team set
+        // changed. On the id the caller declared, which the gateway checks the
+        // answer against (stage 3b). An ordinary create joins no team.
+        if !req.get_ref().user_id.is_empty() {
+            self.invalidator.teams_changed(&req.get_ref().user_id).await;
+        }
 
         call.finish(Outcome {
             status: "OK",
@@ -258,69 +285,22 @@ impl Iam {
         Ok(Response::new(CreateUserResponse { meta: created.meta }))
     }
 
+    /// RETIRED (ADR-0963 (7)): teams are declared in GitOps and written by
+    /// `SyncTeams` only. No store call and no event, in either setting.
     pub(super) async fn add_team_member_inner(
         &self,
-        req: Request<AddTeamMemberRequest>,
+        _req: Request<AddTeamMemberRequest>,
         call: Call,
     ) -> Result<Response<AddTeamMemberResponse>, Status> {
-        let mut upstream = Request::new(db::AddTeamMemberRequest {
-            // D9's key travels, on `revoke_credential`'s reasoning.
-            idempotency: req.get_ref().idempotency.clone(),
-            team_id: req.get_ref().team_id.clone(),
-            user_id: req.get_ref().user_id.clone(),
-            // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's four remaining `None` sites.
-            unverified_actor: None,
-        });
-        forward_request_id(&req, &mut upstream);
-
-        self.client()
-            .add_team_member(upstream)
-            .await
-            .map_err(upstream_failed)?;
-
-        // ADDING invalidates too, and the subject is named `teams-changed`
-        // rather than `teams-removed` precisely so this is not forgotten — see
-        // `invalidate::subject::TEAMS_CHANGED`. Granting a team changes what a
-        // cached identity says just as removing one does; without this, a newly
-        // granted permission arrives up to 300s late and reads as a bug in
-        // whatever the person was trying to reach.
-        self.invalidator.teams_changed(&req.get_ref().user_id).await;
-
-        call.finish(Outcome {
-            status: "OK",
-            ..Default::default()
-        });
-        Ok(Response::new(AddTeamMemberResponse {}))
+        Err(Self::team_verb_retired(call))
     }
 
+    /// RETIRED, as [`Self::add_team_member_inner`].
     pub(super) async fn remove_team_member_inner(
         &self,
-        req: Request<RemoveTeamMemberRequest>,
+        _req: Request<RemoveTeamMemberRequest>,
         call: Call,
     ) -> Result<Response<RemoveTeamMemberResponse>, Status> {
-        let mut upstream = Request::new(db::RemoveTeamMemberRequest {
-            // D9's key travels, on `revoke_credential`'s reasoning.
-            idempotency: req.get_ref().idempotency.clone(),
-            team_id: req.get_ref().team_id.clone(),
-            user_id: req.get_ref().user_id.clone(),
-            // NOT FORWARDED, for the reason given at `issue_credential`. One of
-            // that comment's four remaining `None` sites.
-            unverified_actor: None,
-        });
-        forward_request_id(&req, &mut upstream);
-
-        self.client()
-            .remove_team_member(upstream)
-            .await
-            .map_err(upstream_failed)?;
-
-        self.invalidator.teams_changed(&req.get_ref().user_id).await;
-
-        call.finish(Outcome {
-            status: "OK",
-            ..Default::default()
-        });
-        Ok(Response::new(RemoveTeamMemberResponse {}))
+        Err(Self::team_verb_retired(call))
     }
 }

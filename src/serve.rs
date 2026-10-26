@@ -56,12 +56,36 @@
 
 use tonic::transport::Server;
 
-pub use yadgar_lifecycle::serve_tls::{ClientAuth, ServeTlsError, ServerTls, LISTEN};
+pub use yadgar_lifecycle::serve_tls::{
+    ClientAuth, ServeTlsError, ServerLimits, ServerLimitsError, ServerTls, LISTEN,
+};
 
 /// The values block this listener's keys render from: `tls.enabled`,
 /// `tls.clientAuth` and the rest. Every refusal names `<CHART_KEY>.<leaf>`, so
 /// the operator reads the variable in the crash log and edits this key.
 pub const CHART_KEY: &str = "tls";
+
+/// The values block the listener's protocol limits render from: `server.limits`
+/// holds `maxConcurrentStreams` and four more (ADR-1006). Every refusal names
+/// `<LIMITS_CHART_KEY>.<leaf>`.
+pub const LIMITS_CHART_KEY: &str = "server.limits";
+
+/// Read the listener's protocol limits from the process environment (ADR-1006).
+///
+/// All four `LISTEN_*` keys are required: the library has no default
+/// (ADR-0569, ADR-0705), the chart supplies them, and an absent, non-numeric
+/// or out-of-range one refuses the boot naming the variable and the chart value.
+pub fn limits_from_env() -> Result<ServerLimits, ServerLimitsError> {
+    ServerLimits::from_env(LISTEN, LIMITS_CHART_KEY)
+}
+
+/// The same decision, over an injected lookup, for the reason [`from_lookup`]
+/// gives.
+pub fn limits_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ServerLimits, ServerLimitsError> {
+    ServerLimits::from_lookup(LISTEN, LIMITS_CHART_KEY, lookup)
+}
 
 /// Read the listener's transport from the process environment.
 ///
@@ -92,8 +116,8 @@ pub fn from_lookup(
 ///
 /// The caller adds its own services to what comes back, which is what lets
 /// `tests/serve_tls.rs` stand the real thing up on a port it chose.
-pub fn builder(tls: Option<&ServerTls>) -> Result<Server, ServeTlsError> {
-    yadgar_lifecycle::serve_tls::server(tls)
+pub fn builder(tls: Option<&ServerTls>, limits: &ServerLimits) -> Result<Server, ServeTlsError> {
+    yadgar_lifecycle::serve_tls::server(tls, limits)
 }
 
 #[cfg(test)]

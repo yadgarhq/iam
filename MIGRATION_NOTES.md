@@ -3,6 +3,27 @@
 Commands for a human to run, and orderings a human must decide. Nothing here is
 applied automatically.
 
+## Team access stage 3: `IAM_ADMIN_FROM_TEAM` is required; `SyncTeams`; the runtime team verbs retire
+
+**Breaking: iam refuses to boot without `IAM_ADMIN_FROM_TEAM`.** The chart
+renders it from the new value `adminFromTeam`, default `false`, so a deploy of
+this chart changes nothing about admin. A non-boolean `adminFromTeam` is
+refused at render, naming the key.
+
+- `AddTeamMember` and `RemoveTeamMember` answer `FAILED_PRECONDITION` ("teams
+  are declared in GitOps") in either setting. No gateway route calls them.
+- `SyncTeams` admits only the `seeder-caller` leaf with scope user
+  `yadgar:system:seeder`. Nothing calls it until the seeder's team access
+  stage ships.
+- Turn `adminFromTeam` on only after the declared administrators are proved
+  members (plans/team-access.md stage 10). With it on, `SetUserAdmin` is refused.
+
+```bash
+helm template iam chart -f chart/ci/values.yaml | grep -A1 IAM_ADMIN_FROM_TEAM
+```
+
+Rollback: revert this image and chart; nothing in the store changes.
+
 ## Credential lifetime: `CREDENTIAL_LIFETIME_SECONDS` is required (ADR-0972 (3); I1d)
 
 **Breaking: iam refuses to boot without `CREDENTIAL_LIFETIME_SECONDS`.** The

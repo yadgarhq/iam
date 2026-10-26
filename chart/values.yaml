@@ -149,6 +149,30 @@ tls:
 # and even without an enrolment CA, watches `shared.yaml` and restarts when an
 # operator edits it. That is ADR-0523 working as designed, not a fault.
 
+# THE LISTENER'S PROTOCOL LIMITS (ADR-1006, yaadgaar #218). Chart values with
+# stated defaults, not constants: an operator sizes them for the cluster. The
+# binary has NO compiled-in default (ADR-0569, ADR-0705) and refuses to boot
+# when one is absent, not a whole number or out of range, naming the variable
+# and the `server.limits` leaf. `values.schema.json` makes all four `required`
+# with the library's own ranges, and `tests/chart_server_limits.rs` holds them
+# to `yadgar_lifecycle::serve_tls::ServerLimits`.
+#
+# `templates/render-checks.yaml` refuses `keepaliveTimeoutSeconds` at or above
+# `keepaliveIntervalSeconds`, the one rule a schema cannot state.
+# Connection age (ADR-1006, 30 min) omitted until tonic#2780 ships; yaadgaar #417.
+server:
+  limits:
+    # Concurrent HTTP/2 streams per connection. Library range 1..=10000.
+    maxConcurrentStreams: 256
+    # How often an idle connection is PINGed, in seconds. Range 1..=3600.
+    keepaliveIntervalSeconds: 30
+    # How long a PING may go unanswered before the connection closes, in
+    # seconds. Range 1..=600, and BELOW `keepaliveIntervalSeconds`.
+    keepaliveTimeoutSeconds: 10
+    # The largest HTTP/2 header list a request may carry, in bytes (16 KiB).
+    # Range 1024..=1048576.
+    maxHeaderListBytes: 16384
+
 # The HEADLESS Service of the -db twin (D23). Resolving this name yields every
 # ready pod address rather than one virtual IP, which is what makes client-side
 # balancing possible at all.
@@ -158,18 +182,28 @@ iamDb:
 
   # HOW LONG ONE REQUEST TO iam-db MAY WAIT for a peer that is connected and
   # never replies, in whole seconds (ADR-0705, ADR-0925 Q-C1). The binary has NO
-  # compiled-in default (ADR-0569); this explicit default is the only place 30
+  # compiled-in default (ADR-0569); this explicit default is the only place 14
   # lives, and `chart/values.schema.json` makes the key `required`.
+  #
+  # 14 IS THE FLOOR, AND THE DEFAULT SITS ON IT (ADR-1006, yaadgaar #337): the
+  # timeout chain shrinks inward, so each hop is strictly below its caller.
+  # It was 30, which outlasted the caller's own bound.
   #
   # BOUNDED 14..=59 by `yadgar_dial`: below 14 the bound fires before HTTP/2
   # keepalive can notice a vanished peer, and from 60 up the answer arrives
   # after the ingress has given up. `tests/chart_request_timeout.rs` holds the
   # schema's `minimum` and `maximum` to the pinned dial's own.
   #
-  # KEEP IT ABOVE iam-db's pool acquire timeout (25s, ADR-0925): a request
+  # KEEP IT ABOVE iam-db's pool acquire timeout (12s, ADR-1006): a request
   # waiting on a pool slot must be allowed to wait as long as the pool does. The
-  # cross-chart check is ledger 1524, not this chart.
-  requestTimeoutSeconds: 30
+  # cross-chart check is ledger 1524, not this chart. The caller's bound is not
+  # known here either: the parent chart (`yadgarhq/yadgar`) is where "strictly
+  # below the caller" can be checked.
+  #
+  # A CEILING, NOT THE BOUND (ADR-1019). Each iam-db call is told, and cut off
+  # at, min(this, the caller's remaining time - 50 ms). Only a call whose caller
+  # sent no deadline gets this value whole.
+  requestTimeoutSeconds: 14
 
   # HOW THIS SERVICE VERIFIES THE CERTIFICATE iam-db PRESENTS — the opposite
   # direction from the top-level `tls` block above, which is what iam itself
@@ -517,6 +551,19 @@ credential:
   # backfilled. The gateway never caches a resolution past a credential's
   # expiry. People re-run `yaadgaar login` when theirs expires.
   lifetimeSeconds: 7776000
+
+# WHERE `is_admin` COMES FROM (team access, ADR-0962, ADR-0963;
+# docs plans/team-access.md §6). Rendered as IAM_ADMIN_FROM_TEAM, "true" or
+# "false"; iam refuses to boot without it.
+#
+# `false` (shipped): the iam_user.is_admin column decides, as before, and
+# SetUserAdmin works. `true`: admin is membership of the declared, live
+# `administrators` team; SetUserAdmin and CreateUser with is_admin true are
+# refused, and the bootstrap CreateUser with a pre-minted user_id (F2) is
+# admitted. Turn it on only after the declared administrators are proved
+# members (stage 10); a cold install sets it true from the start (F2 needs it).
+# A bare `true` or `false`; anything else is refused at render.
+adminFromTeam: false
 
 # What iam puts into every enrolment token it mints (D73). An admin assembles
 # neither value and so cannot get either wrong — which puts the whole burden of

@@ -32,17 +32,17 @@ use crate::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 
 /// The name the serving leaf is issued for. The client dials an IP and
 /// verifies this name, so nothing depends on how `localhost` resolves.
-const SERVED_NAME: &str = "localhost";
+pub(super) const SERVED_NAME: &str = "localhost";
 
 /// One authority, the serving leaf it issued, and the means to issue more.
-struct Pki {
+pub(super) struct Pki {
     ca: CertifiedIssuer<'static, KeyPair>,
-    ca_pem: String,
+    pub(super) ca_pem: String,
     cert_pem: String,
     key_pem: String,
 }
 
-fn pki() -> Pki {
+pub(super) fn pki() -> Pki {
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -67,7 +67,7 @@ fn pki() -> Pki {
 }
 
 /// A client leaf the authority issued, with common name `name`.
-fn leaf(p: &Pki, name: &str) -> Identity {
+pub(super) fn leaf(p: &Pki, name: &str) -> Identity {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -99,10 +99,37 @@ impl Drop for TempPem {
     }
 }
 
+/// The chart's `server.limits` defaults (ADR-1006), through the same lookup a
+/// deployment's environment goes through.
+fn limits() -> crate::serve::ServerLimits {
+    crate::serve::limits_from_lookup(|key| {
+        match key {
+            "LISTEN_MAX_CONCURRENT_STREAMS" => Some("256"),
+            "LISTEN_KEEPALIVE_INTERVAL_SECS" => Some("30"),
+            "LISTEN_KEEPALIVE_TIMEOUT_SECS" => Some("10"),
+            "LISTEN_MAX_HEADER_LIST_BYTES" => Some("16384"),
+            _ => None,
+        }
+        .map(str::to_string)
+    })
+    .expect("the chart defaults are a complete, in-range configuration")
+}
+
 /// Serve an `Iam` over TLS in client-auth `mode`, verifying callers against
 /// `p`'s authority, and return the port. The files outlive the boot only;
 /// `serve::builder` reads them once.
 async fn serve_iam(p: &Pki, mode: &str) -> u16 {
+    let (iam, _rec, _inv) = iam_with(FakeDb {
+        resolves_to: Some("yadgar:user:1".into()),
+        ..Default::default()
+    })
+    .await;
+    serve_iam_with(p, mode, iam).await
+}
+
+/// [`serve_iam`] serving `iam` as given: the same TLS listener and gate, in
+/// front of whatever twin and floors the caller built it with.
+pub(super) async fn serve_iam_with(p: &Pki, mode: &str, iam: Iam) -> u16 {
     let cert = TempPem::with(&p.cert_pem);
     let key = TempPem::with(&p.key_pem);
     let ca = TempPem::with(&p.ca_pem);
@@ -119,14 +146,9 @@ async fn serve_iam(p: &Pki, mode: &str) -> u16 {
     .expect("a complete configuration")
     .expect("the TLS path");
 
-    let (iam, _rec, _inv) = iam_with(FakeDb {
-        resolves_to: Some("yadgar:user:1".into()),
-        ..Default::default()
-    })
-    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let router = crate::serve::builder(Some(&tls))
+    let router = crate::serve::builder(Some(&tls), &limits())
         .expect("a usable certificate and key")
         .add_service(IamServiceServer::new(iam));
     tokio::spawn(async move {
@@ -196,5 +218,76 @@ async fn an_off_listener_refuses_even_the_gateway_leaf() {
     assert_eq!(
         resolve(&p, port, Some(leaf(&p, GATEWAY_CALLER))).await,
         Err(tonic::Code::PermissionDenied)
+    );
+}
+
+/// Dial `port` presenting `identity`, and ask `SyncTeams` once with the
+/// seeder's principal.
+async fn sync(p: &Pki, port: u16, identity: Option<Identity>) -> Result<(), tonic::Code> {
+    let mut tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(&p.ca_pem))
+        .domain_name(SERVED_NAME);
+    if let Some(identity) = identity {
+        tls = tls.identity(identity);
+    }
+    let channel = Endpoint::from_shared(format!("https://127.0.0.1:{port}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .tls_config(tls)
+        .unwrap()
+        .connect_lazy();
+    let answered = tokio::time::timeout(
+        Duration::from_secs(10),
+        IamServiceClient::new(channel).sync_teams(SyncTeamsRequest {
+            scope: Some(crate::pb::yadgar::common::v1::Scope {
+                user_id: "yadgar:system:seeder".into(),
+                ..Default::default()
+            }),
+            teams: vec![],
+        }),
+    )
+    .await
+    .expect("the call answered in time");
+    answered.map(drop).map_err(|s| s.code())
+}
+
+/// TEAM ACCESS STAGE 3, GATE ITEM 2: the seeder's client chain reaches the
+/// `SyncTeams` handler through `serve_tls` with a client CA set. The gate
+/// admits only a parsed leaf naming exactly `seeder-caller`, so an `Ok` here
+/// is `peer_certs()` returning `Some` with that leaf, read in the handler.
+#[tokio::test]
+async fn the_seeder_caller_leaf_reaches_sync_teams_through_tonic() {
+    let p = pki();
+    let port = serve_iam(&p, "required").await;
+    assert_eq!(
+        sync(&p, port, Some(leaf(&p, "seeder-caller"))).await,
+        Ok(())
+    );
+}
+
+/// The gateway's leaf, verified at the same handshake, is refused on
+/// `SyncTeams`: the one verb it may not call.
+#[tokio::test]
+async fn the_gateway_leaf_is_refused_on_sync_teams_through_tonic() {
+    let p = pki();
+    let port = serve_iam(&p, "required").await;
+    assert_eq!(
+        sync(&p, port, Some(leaf(&p, GATEWAY_CALLER))).await,
+        Err(tonic::Code::PermissionDenied)
+    );
+}
+
+/// A client with no leaf is never admitted: the `required` listener fails
+/// the handshake, and an `optional` one hands the handler no name.
+#[tokio::test]
+async fn a_client_with_no_leaf_is_never_admitted_to_sync_teams() {
+    let p = pki();
+    let port = serve_iam(&p, "required").await;
+    assert!(sync(&p, port, None).await.is_err(), "required: refused");
+    let port = serve_iam(&p, "optional").await;
+    assert_eq!(
+        sync(&p, port, None).await,
+        Err(tonic::Code::PermissionDenied),
+        "optional: no name, refused by the gate"
     );
 }

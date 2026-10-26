@@ -95,7 +95,7 @@ use yadgar_iam::key_identity;
 use yadgar_iam::pb::yadgar::iam::v1::iam_service_server::IamServiceServer;
 use yadgar_iam::rotate;
 use yadgar_iam::serve;
-use yadgar_iam::service::Iam;
+use yadgar_iam::service::{Iam, IamDb};
 
 /// The process entry point: run the service, and print a refusal as its
 /// SENTENCE.
@@ -144,7 +144,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // happens in a task after the listener binds.
     let identity = key_identity::Identity::of(&keys);
 
-    let (db, db_tls) = boot::iam_db().await?;
+    let (db, ceiling, db_tls) = boot::iam_db().await?;
 
     let (config, schedule) = boot::rotation()?;
 
@@ -155,6 +155,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let floors = boot::response_floors()?;
     let lifetime = boot::credential_lifetime()?;
+    let admin_from_team = boot::admin_from_team()?;
 
     let addr: SocketAddr = boot::env_required("LISTEN")?
         .parse()
@@ -169,12 +170,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // nothing in this file is reachable from a test. `key_identity::Check` has
     // no such mutation, because the future is built inside the library where
     // `until_stopped_with`'s own test reddens.
-    let key_check = key_identity::Check::new(db.clone(), identity, key_identity::Retry::standard());
+    let key_check = key_identity::Check::new(
+        db.clone(),
+        ceiling,
+        identity,
+        key_identity::Retry::standard(),
+    );
 
     serve_and_drain(
         server,
         addr,
-        Iam::new(keys, db, invalidator, floors, enrolment, lifetime),
+        Iam::new(
+            keys,
+            IamDb::new(db, ceiling),
+            invalidator,
+            floors,
+            enrolment,
+            lifetime,
+            admin_from_team,
+        ),
         listen_tls.as_ref(),
         watch_inputs,
         schedule,
