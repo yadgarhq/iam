@@ -372,6 +372,12 @@ it, so this service would keep serving and stop being able to reach its own
 store. Both files are mounted as a DIRECTORY and both are watched, in the same
 change that mounted them.
 
+## Installing
+
+Install iam from the published OCI chart: `helm install iam oci://ghcr.io/yadgarhq/charts/iam --version <version>`. The release pins that chart to the image digest.
+
+A checkout of `chart/` renders `image.tag: latest`, a moving tag. Use a checkout for development only.
+
 ## Local development
 
 ```bash
