@@ -287,18 +287,18 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration
     if let Some(observed) = &unverified.observed {
         return adopt::tell(observed, unverified.reason, stood_for);
     }
-    match unverified.permanent {
-        // NO RETRY MENDS THIS, so the pod stays Ready, serving and unverified
-        // until somebody acts. ERROR is the level that says a human is needed.
+    match unverified.permanent || adopt::escalated(unverified, stood_for) {
+        // A RETRY ALONE MENDS NOTHING HERE, though the loop keeps asking (yaadgaar
+        // 499). ERROR is the level that says a human is needed.
         true => tracing::error!(
             reason = unverified.reason,
             standing_for_secs = stood_for.as_secs(),
             derivation_version = DERIVATION_VERSION,
-            "the key identity is UNVERIFIED and no retry will mend it. This pod is Ready and \
-             serving and has NOT proved it holds the key set its rows were encrypted under. \
-             Act on the reason: deploy an iam-db carrying the key-identity arm, resolve the \
-             marker this store holds (ADR-0764, ADR-0765), or reissue this pod's client \
-             certificate as `iam-caller` (ADR-0972)"
+            "the key identity is UNVERIFIED until somebody acts; this pod keeps retrying. It \
+             is Ready and serving and has NOT proved it holds the key set its rows were \
+             encrypted under. Act on the reason: deploy an iam-db carrying the arm it names, \
+             resolve the marker this store holds (ADR-0764, ADR-0765), or reissue this \
+             pod's client certificate as `iam-caller` (ADR-0972)"
         ),
         false => tracing::warn!(
             reason = unverified.reason,
@@ -309,7 +309,7 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration
     }
 }
 
-/// Why the check has not passed, and whether any retry can mend it.
+/// Why the check has not passed, and whether it can pass without anyone acting.
 #[derive(Clone, Debug)]
 pub struct Unverified {
     reason: &'static str,
@@ -340,7 +340,7 @@ impl Unverified {
     /// waiting, and every one of them is mended by a DEPLOY — which is exactly
     /// what [`Self::of_status`] classifies `UNIMPLEMENTED` permanent for. Left
     /// transient it warns for ever, and this module's own table says an operator
-    /// is told when no retry will mend it.
+    /// is told when a retry alone will not mend it.
     const UNREADABLE: Self = Self::of("an outcome this build cannot read as a pass", true);
 
     /// A non-OK status. EVERY one of them is not-passed; the question this

@@ -582,6 +582,12 @@ adminFromTeam: false
 # `adopt`: on a passed proof call AdoptKeyIdentity; on a failed one end the
 #   serve and exit non-zero, on every pod. Set it only after the log shows
 #   `reason=OBSERVE: the adoption proof PASSED`.
+#
+# ONCE THE MARKER IS ADOPTED IT PINS THE KEY SET. A re-minted or drifted
+# `iam-keys` Secret then reads MISMATCH on every iam pod, and every pod ends
+# its serve and exits non-zero. No migration rewrites the marker today: a
+# deliberate key rotation must rewrite it as part of the rotation (yaadgaar
+# 168, ADR-0989). See the README, "The key-identity marker pins the key set".
 # A quoted "observe" or "adopt"; anything else, including a deleted key
 # (`adopt: null`), is refused at render.
 keyIdentity:
@@ -685,6 +691,17 @@ preStopSleepSeconds: 5
 # lifecycle/src/drain.rs) breaks that crate's floor, not this chart's. `0`
 # renders nothing and returns the field to kubelet's 30s default.
 terminationGracePeriodSeconds: 35
+
+# HOW LONG A NEW POD MUST STAY READY BEFORE THE ROLL COUNTS IT (yaadgaar 500).
+# The key-identity check exits a pod on MISMATCH or a failed adoption proof.
+# Against a reachable iam-db it decides within milliseconds, before the
+# tcpSocket probe makes the pod Ready (2-4 s), so this adds nothing there. It
+# covers a decision delayed past readiness by retries (iam-db rolling or
+# unreachable, 10-12 s seen live): such a pod never counts available, and the
+# old pods keep serving. It does not tie readiness to iam-db. A decision later
+# than 30 s, and every in-place restart, is not covered. Costs 30 s per surge
+# pod per roll. `0` renders nothing. See `templates/deployment.yaml`.
+minReadySeconds: 30
 
 # THE ROLL. `maxUnavailable: 0` is the guarantee and `maxSurge: 1` is what pays
 # for it. Both are written out because the inherited default is 25% of the LIVE
