@@ -53,6 +53,32 @@ spec:
     type: RollingUpdate
     rollingUpdate: {{- toYaml . | nindent 6 }}
   {{- end }}
+  {{- with .Values.minReadySeconds }}
+  # THE ONLY CANARY THE KEY-IDENTITY CHECK HAS (yaadgaar 500), AND IT COVERS
+  # LESS THAN IT SOUNDS. The key-identity check runs AFTER boot (ADR-0764: it
+  # never gates boot) and ends the serve on `MISMATCH` or a failed adoption
+  # proof. Against a reachable `iam-db` it decides within milliseconds of boot,
+  # so a wrong-key pod exits BEFORE the `tcpSocket` probe below makes it Ready
+  # (2-4 s, `initialDelaySeconds: 2`), and this field adds nothing. It matters
+  # only when the decision is delayed past readiness by the retry backoff:
+  # `iam-db` rolling or unreachable (10-12 s seen live). At 0, the rollout then
+  # counted the pod available at once, and `maxUnavailable: 0` held nothing
+  # back. A pod counts available only after it has stayed Ready this long, so
+  # a pod that exits inside the window never does: the old pods keep serving,
+  # and after `progressDeadlineSeconds` the rollout is marked
+  # ProgressDeadlineExceeded (Argo: Degraded). Nothing rolls back.
+  #
+  # READINESS STILL DOES NOT DEPEND ON `iam-db` (ADR-0532, `main.rs`): this is
+  # a rollout delay, not a probe. An `iam-db` blip changes nothing here.
+  #
+  # WHAT IT DOES NOT COVER: a decision later than this window, and every
+  # IN-PLACE restart (ADR-0523's self-restart, an eviction, an OOM kill), which
+  # no rollout holds back. After each in-place restart the Deployment shows
+  # Available=False for this long; endpoints follow readiness, so traffic does
+  # not. It costs this many seconds per surge pod on every roll. `0` renders
+  # nothing and returns the Deployment API's default, 0.
+  minReadySeconds: {{ . }}
+  {{- end }}
   selector:
     matchLabels:
       app: {{ .Chart.Name }}

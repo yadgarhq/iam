@@ -170,6 +170,7 @@
     },
     "preStopSleepSeconds": {},
     "terminationGracePeriodSeconds": {},
+    "minReadySeconds": {},
     "rollingUpdate": {},
     "topologySpread": {
       "properties": {
