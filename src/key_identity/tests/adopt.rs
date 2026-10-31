@@ -345,8 +345,9 @@ async fn a_status_on_the_adoption_arm_neither_passes_nor_exits() {
     }
 }
 
-/// `UNIMPLEMENTED` on either adoption RPC names the ADOPTION arm, permanently,
-/// at ERROR — not the key-identity arm the twin evidently has.
+/// `UNIMPLEMENTED` on either adoption RPC names the ADOPTION arm — not the
+/// key-identity arm the twin evidently has — and is TRANSIENT, at WARN: it is
+/// what every pod sees while `iam-db` is still rolling onto the adoption arm.
 #[tokio::test]
 async fn unimplemented_names_the_adoption_arm() {
     crate::service::tests::warnings_from_here();
@@ -355,8 +356,153 @@ async fn unimplemented_names_the_adoption_arm() {
     let _ = run(script, identity_in(Adoption::Adopt)).await;
     let lines = told_about(ADOPTION_UNIMPLEMENTED.reason);
     assert!(!lines.is_empty(), "an operator is told");
-    assert!(lines.iter().all(|line| line.error));
-    assert!(ADOPTION_UNIMPLEMENTED.reason.contains("adoption arm"));
+    assert!(lines.iter().all(|line| !line.error), "{lines:?}");
+    assert!(!ADOPTION_UNIMPLEMENTED.is_permanent());
+    assert!(ADOPTION_UNIMPLEMENTED.reason.contains("adoption RPCs"));
+}
+
+/// The adoption-arm lines on this thread, as rendered — level, message and
+/// fields.
+fn adoption_unimplemented_lines() -> Vec<String> {
+    crate::service::tests::warnings()
+        .into_iter()
+        .filter(|l| l.contains(&format!("reason={}", ADOPTION_UNIMPLEMENTED.reason)))
+        .collect()
+}
+
+/// **AN `iam-db` STILL ROLLING IS NOT AN INCIDENT (yaadgaar 499).** Seen live:
+/// each iam pod's first `ListKeyIdentityEvidence` reached an `iam-db` pod that
+/// predated the adoption arm and logged ERROR "no retry will mend it"; the
+/// retry 10-12 s later reached a new pod and the dry run PASSED. The loop
+/// always retried; only the log claimed it would not help.
+///
+/// THE ASSERTIONS THAT REDDEN: classifying `ADOPTION_UNIMPLEMENTED` permanent
+/// again (the lines become ERROR and carry the permanent sentence); a check
+/// that stops at the first answer (`list.len() > 1`).
+#[tokio::test]
+async fn unimplemented_then_a_passed_dry_run_claims_no_permanence() {
+    crate::service::tests::warnings_from_here();
+    let mut script = pre_marker(rows(&right(), 2), Vec::new());
+    script.list_fails = Some(tonic::Code::Unimplemented);
+    script.list_fails_first = 1;
+    let (ended, asked) = run(script, identity_in(Adoption::Observe)).await;
+    assert!(ended.is_none());
+    assert!(asked.list.len() > 1, "the retry reached the evidence");
+    let lines = adoption_unimplemented_lines();
+    assert!(!lines.is_empty(), "the transient condition is still told");
+    for line in &lines {
+        assert!(line.starts_with("WARN"), "{line}");
+        assert!(!line.contains("no retry will mend"), "{line}");
+    }
+}
+
+/// The same rollout in `adopt` mode: `AdoptKeyIdentity` answers
+/// `UNIMPLEMENTED`, then `RECORDED`, and the check PASSES — it stops asking.
+#[tokio::test]
+async fn unimplemented_then_an_adoption_passes_and_claims_no_permanence() {
+    crate::service::tests::warnings_from_here();
+    let (ended, asked) = run(
+        pre_marker(
+            rows(&right(), 2),
+            vec![
+                Answer::Failed(tonic::Code::Unimplemented),
+                Answer::Outcome(raw(db::KeyIdentityOutcome::Recorded)),
+            ],
+        ),
+        identity_in(Adoption::Adopt),
+    )
+    .await;
+    assert!(ended.is_none());
+    assert_eq!(
+        asked.adopt.len(),
+        2,
+        "passed on the retry and stopped asking"
+    );
+    assert_eq!(asked.get.len(), 2);
+    let lines = adoption_unimplemented_lines();
+    assert!(!lines.is_empty(), "the transient condition is still told");
+    for line in lines {
+        assert!(line.starts_with("WARN"), "{line}");
+        assert!(!line.contains("no retry will mend"), "{line}");
+    }
+}
+
+/// **A STANDING `ADOPTION_UNIMPLEMENTED` ESCALATES TO ERROR ON ITS FIRST
+/// RESTATEMENT.** An `iam-db` with the key-identity arm and without the adoption
+/// arm is a permanent state, and a WARN for ever would hide it. A rollout clears
+/// in seconds and never reaches [`RESTATE_AFTER`]; a reason that has stood that
+/// long is not a rollout.
+///
+/// Forty `UNIMPLEMENTED` answers, then evidence under ANOTHER key in `adopt`
+/// mode: the failed proof ends the loop, so the script bounds it exactly.
+///
+/// THE ASSERTIONS THAT REDDEN: no escalation (no ERROR line); escalation
+/// without the elapsed guard (the first line is ERROR).
+#[tokio::test]
+async fn a_standing_adoption_unimplemented_escalates_to_error_on_restatement() {
+    const ATTEMPTS: usize = 40;
+    let mut script = pre_marker(rows(&keys_of([3u8; 32], [4u8; 32]), 2), Vec::new());
+    script.list_fails = Some(tonic::Code::Unimplemented);
+    script.list_fails_first = ATTEMPTS;
+    let (channel, asked) = twin_channel(script).await;
+    crate::service::tests::warnings_from_here();
+    tokio::time::pause();
+    let refusal = watch_with_seed(
+        IamDbServiceClient::new(channel),
+        TEST_CEILING,
+        identity_in(Adoption::Adopt),
+        Retry::of(Duration::from_secs(100), Duration::from_secs(100)),
+        0x5eed_5eed_5eed_5eed,
+    )
+    .await;
+    tokio::time::resume();
+    assert_eq!(refusal.arm, PROOF);
+    assert_eq!(asked.lock().expect("asked").list.len(), ATTEMPTS + 1);
+
+    let lines = told_about(ADOPTION_UNIMPLEMENTED.reason);
+    assert!(lines.len() > 1, "restated: {lines:?}");
+    assert!(
+        !lines[0].error,
+        "the first line is a rollout until shown otherwise"
+    );
+    assert!(lines[1..].iter().all(|l| l.error), "{lines:?}");
+    assert!(
+        lines[1..]
+            .iter()
+            .all(|l| l.standing_for_secs >= RESTATE_AFTER.as_secs()),
+        "{lines:?}"
+    );
+}
+
+/// **THE ESCALATION IS `ADOPTION_UNIMPLEMENTED`'s ALONE.** An unreachable twin
+/// that stands just as long stays WARN on every restatement: it is an outage
+/// the dial already reports, not a version gap.
+///
+/// THE ASSERTION THAT REDDENS: escalating every transient reason that stands.
+#[tokio::test]
+async fn a_standing_unavailable_twin_is_never_escalated() {
+    const ATTEMPTS: usize = 40;
+    let mut get = vec![Answer::Failed(tonic::Code::Unavailable); ATTEMPTS];
+    get.push(Answer::Outcome(raw(db::KeyIdentityOutcome::Mismatch)));
+    let (channel, _) = twin_channel(Script {
+        get,
+        ..Default::default()
+    })
+    .await;
+    crate::service::tests::warnings_from_here();
+    tokio::time::pause();
+    let _ = watch_with_seed(
+        IamDbServiceClient::new(channel),
+        TEST_CEILING,
+        identity_in(Adoption::Adopt),
+        Retry::of(Duration::from_secs(100), Duration::from_secs(100)),
+        0x5eed_5eed_5eed_5eed,
+    )
+    .await;
+    tokio::time::resume();
+    let lines = told_about(Unverified::of_status(tonic::Code::Unavailable).reason);
+    assert!(lines.len() > 1, "restated: {lines:?}");
+    assert!(lines.iter().all(|l| !l.error), "{lines:?}");
 }
 
 /// Only `SetKeyIdentity`'s `FAILED_PRECONDITION` leads to the proof: the same

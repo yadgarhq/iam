@@ -49,6 +49,10 @@ struct Script {
     page_fixed: usize,
     /// When set, `ListKeyIdentityEvidence` answers this status every time.
     list_fails: Option<tonic::Code>,
+    /// When non-zero, `list_fails` answers only the first this many calls and
+    /// every later one serves the evidence: an `iam-db` rolling onto the
+    /// adoption arm while this pod is already asking.
+    list_fails_first: usize,
     adopt: Vec<Answer>,
 }
 
@@ -129,8 +133,11 @@ impl IamDbService for FakeTwin {
             asked.list.push(r.into_inner());
             asked.list.last().cloned().expect("just pushed")
         };
+        let n = self.asked.lock().expect("asked").list.len();
         if let Some(code) = self.script.list_fails {
-            return Err(Status::new(code, "scripted"));
+            if self.script.list_fails_first == 0 || n <= self.script.list_fails_first {
+                return Err(Status::new(code, "scripted"));
+            }
         }
         let from: usize = r.page_token.parse().unwrap_or(0);
         let mut size = usize::try_from(r.page_size.max(1)).expect("positive");
@@ -681,6 +688,35 @@ async fn every_non_ok_status_is_not_passed_and_the_permanent_ones_are_named() {
             Unverified::of_status(code).is_permanent(),
             "{code:?} cannot be mended by a retry, so an operator must be told"
         );
+    }
+}
+
+/// **A PERMANENT REASON IS AN ERROR THAT DOES NOT CLAIM THE LOOP GIVES UP.**
+/// The loop retries every not-passed answer for ever, so "no retry will mend
+/// it" was false about the loop (yaadgaar 499): what is true is that the check
+/// will not pass until somebody changes the deployment, and that it keeps
+/// asking meanwhile.
+///
+/// THE ASSERTIONS THAT REDDEN: the old sentence restored; a permanent reason
+/// demoted to WARN.
+#[tokio::test]
+async fn a_permanent_reason_is_an_error_that_says_it_keeps_retrying() {
+    crate::service::tests::warnings_from_here();
+    let reason = Unverified::of_status(tonic::Code::PermissionDenied).reason;
+    let _ = never_passes_and_never_exits(Script {
+        get: vec![Answer::Failed(tonic::Code::PermissionDenied)],
+        ..Default::default()
+    })
+    .await;
+    let lines: Vec<String> = crate::service::tests::warnings()
+        .into_iter()
+        .filter(|l| l.contains(&format!("reason={reason}")))
+        .collect();
+    assert!(!lines.is_empty(), "an operator is told");
+    for line in &lines {
+        assert!(line.starts_with("ERROR"), "{line}");
+        assert!(!line.contains("no retry will mend"), "{line}");
+        assert!(line.contains("keeps retrying"), "{line}");
     }
 }
 

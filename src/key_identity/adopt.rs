@@ -31,7 +31,7 @@
 //!
 //! **A STATUS ON EITHER RPC IS NEVER A PROOF FAILURE.** It is not-passed, and it
 //! is classified as every other status in this module is; `UNIMPLEMENTED` names
-//! an `iam-db` that predates the adoption arm.
+//! an `iam-db` that does not serve the adoption arm yet, and is transient.
 
 use std::time::Duration;
 
@@ -261,11 +261,31 @@ fn of_status(code: tonic::Code) -> Unverified {
     }
 }
 
+/// `UNIMPLEMENTED` on either adoption RPC: an `iam-db` that does not serve the
+/// adoption arm yet.
+///
+/// **TRANSIENT, unlike the key-identity arm's `UNIMPLEMENTED` (yaadgaar 499).**
+/// The adoption arm is the newer of the two, so every rollout that brings it is
+/// a window in which this pod reaches an `iam-db` pod that does not serve it
+/// yet; the retry reaches a new one. Seen live: ERROR at boot, then the proof
+/// PASSED 10-12 s later. Its FIRST line is WARN; a restatement is ERROR
+/// ([`escalated`]).
 pub(super) const ADOPTION_UNIMPLEMENTED: Unverified = Unverified::of(
-    "UNIMPLEMENTED: this iam-db predates the adoption arm (ListKeyIdentityEvidence, \
-     AdoptKeyIdentity)",
-    true,
+    "UNIMPLEMENTED: iam-db does not serve the adoption RPCs (ListKeyIdentityEvidence, \
+     AdoptKeyIdentity) yet",
+    false,
 );
+
+/// Whether a transient reason has stood long enough to be told at ERROR.
+///
+/// **ONLY [`ADOPTION_UNIMPLEMENTED`], AND ONLY ON A RESTATEMENT.** A line is
+/// restated only after the same reason has stood for [`super::RESTATE_AFTER`]
+/// with no other reason between. A rollout clears in seconds and never gets
+/// there; an `iam-db` that has the key-identity arm and predates the adoption
+/// arm stays there for ever, and a WARN for ever would hide it.
+pub(super) fn escalated(unverified: &Unverified, stood_for: Duration) -> bool {
+    unverified.reason == ADOPTION_UNIMPLEMENTED.reason && stood_for >= super::RESTATE_AFTER
+}
 
 /// Zero rows read: no proof, and no retry makes one (ADR-1085).
 pub(super) const NO_EVIDENCE: Unverified = Unverified::of(
