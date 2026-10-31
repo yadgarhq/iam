@@ -235,6 +235,37 @@ fail every request touching a credential or a personal-data field — a pod that
 looks healthy and is wrong. `main.rs` calls `crypto::Keys::from_env()` before
 binding the listener for exactly that reason.
 
+## The key-identity marker pins the key set
+
+`iam-db` stores a key-identity marker: a fingerprint of the key set in
+`iam-keys` (ADR-0764, ADR-0765). On an installation older than `iam-db`
+migration 14 the marker is acquired by adoption (`keyIdentity.adopt`,
+ADR-1085). After boot, each iam pod compares its keys with the marker.
+
+**Once the marker is set, a re-minted or drifted `iam-keys` Secret causes
+`MISMATCH` on every iam pod.** Every pod ends its serve and exits non-zero. This
+is the intended refusal of a wrong key, and it also catches a deliberate
+change of keys.
+
+`iam-keys` is a directory mount, so a re-minted Secret reaches a running pod at
+its next in-place restart (a certificate renewal under ADR-0523, an eviction,
+an OOM kill). Every replica then reads `MISMATCH` and crash-loops, and no
+rollout holds it back.
+
+No migration rewrites the marker today. A key rotation must rewrite the marker
+as part of the rotation, before the new keys reach a pod (yaadgaar 168, the
+rotate-keys Job of ADR-0989). Do not replace `iam-keys` until that rotation
+exists.
+
+Against a reachable `iam-db` the check decides within milliseconds of boot,
+before the `tcpSocket` readiness probe makes the pod Ready (2-4 s). When the
+decision is delayed past readiness by retries (`iam-db` rolling or
+unreachable), the chart's `minReadySeconds` (default 30) is the canary: a new
+pod must stay Ready that long before the rollout counts it available, so a pod
+that exits on `MISMATCH` inside the window never counts and the old pods keep
+serving. A decision later than the window, and an in-place restart, are not
+covered.
+
 ## A renewed certificate arrives by restart, not by reload
 
 The certificate this service presents is read ONCE, when the listener is built,
