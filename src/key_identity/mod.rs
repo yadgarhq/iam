@@ -26,6 +26,10 @@
 //! | `DERIVATION_SKEW` | no | no | YES |
 //! | anything else, including every non-OK status | no | no | when permanent |
 //!
+//! ONE status is routed further: `SetKeyIdentity`'s `FAILED_PRECONDITION`, a
+//! populated store with no marker, goes to [`adopt`]'s proof (ADR-1085), whose
+//! FAILURE in `adopt` mode takes `MISMATCH`'s row.
+//!
 //! **THE PASS IS A WHITELIST AND NEVER A BLACKLIST OF `MISMATCH`.** A caller
 //! reading "not MISMATCH" as a pass would pass on the zero value, on
 //! `DERIVATION_SKEW`, on a member added after this tag, and on every transport
@@ -47,6 +51,7 @@
 //! or every pod reads `DERIVATION_SKEW` and never passes. ADR-0765 exists
 //! because that hazard has no mechanism behind it otherwise.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tonic::transport::Channel;
@@ -58,11 +63,13 @@ use crate::pb::yadgar::common::v1::Idempotency;
 use crate::pb::yadgar::iamdb::v1 as db;
 use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
 
+mod adopt;
 mod retry;
 mod stop;
 
+pub use adopt::{Adoption, ADOPT_CHART_KEY, ADOPT_ENV, EVIDENCE_CAP};
 pub use retry::Retry;
-pub use stop::{until_stopped, until_stopped_with, Check, Ended};
+pub use stop::{until_stopped, until_stopped_with, Check, Ended, Mismatch};
 
 /// Which function produced the fingerprint. Versions start at 1 (ADR-0765);
 /// zero is refused by both arms, because `uint32` has no presence in proto3.
@@ -126,21 +133,39 @@ fn restate(since: Option<Duration>) -> bool {
 }
 
 /// What this process claims about its key set, computed once at boot.
-#[derive(Clone, Debug)]
+///
+/// It carries the KEYS THEMSELVES, behind the same `Arc` `Iam` holds, because
+/// the adoption proof ([`adopt`], ADR-1085) decrypts stored rows with them. The
+/// material still never leaves [`crate::crypto`]: this holds the handle, and
+/// `Debug` below prints neither key.
+#[derive(Clone)]
 pub struct Identity {
+    keys: Arc<Keys>,
+    adoption: Adoption,
     fingerprint: Vec<u8>,
     idempotency_key: String,
+    adopt_idempotency_key: String,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("adoption", &self.adoption)
+            .field("idempotency_key", &self.idempotency_key)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Identity {
-    /// Derive it from the keys this process loaded.
-    ///
-    /// Takes `&Keys` and NOT the key bytes: the material never leaves
-    /// [`crate::crypto`], which is the one module that holds it.
-    pub fn of(keys: &Keys) -> Self {
+    /// Derive it from the keys this process loaded, under `adoption`
+    /// (`KEY_IDENTITY_ADOPT`), which says what a passed proof may do.
+    pub fn of(keys: Arc<Keys>, adoption: Adoption) -> Self {
         Self {
             fingerprint: keys.key_identity_fingerprint(DOMAIN),
             idempotency_key: mint_idempotency_key(),
+            adopt_idempotency_key: adopt::mint_idempotency_key(),
+            keys,
+            adoption,
         }
     }
 
@@ -179,28 +204,6 @@ fn mint_idempotency_key() -> String {
         "iam:key-identity:v{DERIVATION_VERSION}:{}",
         uuid::Uuid::now_v7()
     )
-}
-
-/// The key set this process holds is NOT the one these rows were encrypted
-/// under. Permanent: no restart, no retry and no wait changes it.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "the key-identity marker in iam-db does NOT match the key set this process loaded: {arm} \
-     answered MISMATCH under derivation version {DERIVATION_VERSION}. A MISMATCH on \
-     GetKeyIdentity means a marker was ALREADY stored and disagrees; one on SetKeyIdentity \
-     means another replica recorded a different marker between this pod's read and its write, \
-     so this pod lost a split rollout. Every name and every credential already stored was \
-     encrypted under a different key set, so this process cannot read its own rows and will \
-     not go on serving as though it could (ADR-0764). Nothing has been written. Mount the key \
-     Secret this installation was provisioned with; if it is lost, the rows are not \
-     recoverable and no key in the world makes them so."
-)]
-pub struct Mismatch {
-    /// Which arm answered it, and it is INTERPOLATED INTO THE MESSAGE ABOVE
-    /// rather than held for a reader of this struct. This message is the only
-    /// thing the process prints on its way out, so a field the operator never
-    /// sees states its distinction where nobody reads it.
-    arm: &'static str,
 }
 
 /// Run the check until it passes, or until it must end the serve.
@@ -279,6 +282,11 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration
     }
     let stood_for = since.unwrap_or_default();
     *standing = Some((unverified.reason, Duration::ZERO));
+    // A DRY RUN'S OUTCOME IS NOT AN INCIDENT: INFO on a passed proof, WARN on a
+    // failed one, on the same cadence (ADR-1085, `KEY_IDENTITY_ADOPT=observe`).
+    if let Some(observed) = &unverified.observed {
+        return adopt::tell(observed, unverified.reason, stood_for);
+    }
     match unverified.permanent {
         // NO RETRY MENDS THIS, so the pod stays Ready, serving and unverified
         // until somebody acts. ERROR is the level that says a human is needed.
@@ -302,18 +310,25 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration
 }
 
 /// Why the check has not passed, and whether any retry can mend it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Unverified {
     reason: &'static str,
     permanent: bool,
+    /// What a dry run of the adoption proof found; `None` for everything else.
+    observed: Option<adopt::Observed>,
 }
 
 impl Unverified {
+    const fn of(reason: &'static str, permanent: bool) -> Self {
+        Self {
+            reason,
+            permanent,
+            observed: None,
+        }
+    }
+
     /// A marker produced by a function this build does not speak.
-    pub const SKEW: Self = Self {
-        reason: "DERIVATION_SKEW",
-        permanent: true,
-    };
+    pub const SKEW: Self = Self::of("DERIVATION_SKEW", true);
 
     /// An answer this build cannot read as a pass: the zero value, a member
     /// added after this tag, or `RECORDED` from the arm that writes nothing.
@@ -326,10 +341,7 @@ impl Unverified {
     /// what [`Self::of_status`] classifies `UNIMPLEMENTED` permanent for. Left
     /// transient it warns for ever, and this module's own table says an operator
     /// is told when no retry will mend it.
-    const UNREADABLE: Self = Self {
-        reason: "an outcome this build cannot read as a pass",
-        permanent: true,
-    };
+    const UNREADABLE: Self = Self::of("an outcome this build cannot read as a pass", true);
 
     /// A non-OK status. EVERY one of them is not-passed; the question this
     /// answers is only whether a retry could ever mend it.
@@ -344,34 +356,31 @@ impl Unverified {
     /// does not. Still `NotYet` and never `Refused`: unverified, not mismatched.
     pub fn of_status(code: tonic::Code) -> Self {
         match code {
-            tonic::Code::Unimplemented => Self {
-                reason: "UNIMPLEMENTED: this iam-db predates the key-identity arm",
-                permanent: true,
-            },
-            tonic::Code::FailedPrecondition => Self {
-                reason: "FAILED_PRECONDITION: the store holds rows and no marker",
-                permanent: true,
-            },
-            tonic::Code::InvalidArgument => Self {
-                reason: "INVALID_ARGUMENT: iam-db refused the request this build sent",
-                permanent: true,
-            },
+            tonic::Code::Unimplemented => Self::of(
+                "UNIMPLEMENTED: this iam-db predates the key-identity arm",
+                true,
+            ),
+            tonic::Code::FailedPrecondition => Self::of(
+                "FAILED_PRECONDITION: the store holds rows and no marker",
+                true,
+            ),
+            tonic::Code::InvalidArgument => Self::of(
+                "INVALID_ARGUMENT: iam-db refused the request this build sent",
+                true,
+            ),
             // Before this arm the catch-all below read it as "the twin did not
             // answer", transient, at WARN — an outage that does not exist.
-            tonic::Code::PermissionDenied => Self {
-                reason: "PERMISSION_DENIED: iam-db's caller gate refused this pod's client \
+            tonic::Code::PermissionDenied => Self::of(
+                "PERMISSION_DENIED: iam-db's caller gate refused this pod's client \
                          certificate (it admits only `iam-caller`)",
-                permanent: true,
-            },
-            _ => Self {
-                reason: "the twin did not answer",
-                permanent: false,
-            },
+                true,
+            ),
+            _ => Self::of("the twin did not answer", false),
         }
     }
 
     /// Whether an operator must be told rather than a retry counter.
-    pub fn is_permanent(self) -> bool {
+    pub fn is_permanent(&self) -> bool {
         self.permanent
     }
 }
@@ -471,6 +480,11 @@ async fn record(
         .call(ceiling, write, |r| client.set_key_identity(r))
         .await;
     match asked {
+        // A POPULATED STORE WITH NO MARKER, and the ONLY way into the adoption
+        // proof (ADR-1085): the read arm's FAILED_PRECONDITION never reaches it.
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            adopt::attempt(client, ceiling, identity).await
+        }
         Err(status) => Step::NotYet(Unverified::of_status(status.code())),
         Ok(response) => outcome_of_write(response.into_inner().outcome),
     }

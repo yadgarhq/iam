@@ -330,3 +330,11 @@ the `tls.clientAuth` ones above.
       "(ADR-1006). Lower the timeout or raise the interval."))
       .Values.server.limits.keepaliveTimeoutSeconds .Values.server.limits.keepaliveIntervalSeconds) }}
 {{- end }}
+{{/* ADR-1085: `keyIdentity.adopt` renders KEY_IDENTITY_ADOPT, which iam reads as
+exactly "observe" or "adopt". `values.yaml` defaults it to "observe"; this refuses
+every other shape and spelling by name, a deleted key (`adopt: null`) included
+(ADR-0797). */}}
+{{- $adopt := dig "adopt" nil (ternary .Values.keyIdentity dict (kindIs "map" .Values.keyIdentity)) }}
+{{- if not (and (kindIs "string" $adopt) (has $adopt (list "observe" "adopt"))) }}
+{{- fail "iam: keyIdentity.adopt must be set to \"observe\" or \"adopt\"; it renders KEY_IDENTITY_ADOPT, what a passed key-identity adoption proof may do (ADR-1085)" }}
+{{- end }}

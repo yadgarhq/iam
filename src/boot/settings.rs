@@ -1,10 +1,12 @@
-//! The settings `main` hands to `Iam::new`: the response floors, the
-//! credential lifetime and `IAM_ADMIN_FROM_TEAM`. Each is REQUIRED, with no
+//! The settings `main` hands to `Iam::new` — the response floors, the
+//! credential lifetime and `IAM_ADMIN_FROM_TEAM` — and `KEY_IDENTITY_ADOPT`,
+//! which it hands to the key-identity check. Each is REQUIRED, with no
 //! compiled-in default (ADR-0569), and each refusal names its chart key.
 
 use std::time::Duration;
 
 use super::env_required;
+use crate::key_identity::{Adoption, ADOPT_CHART_KEY, ADOPT_ENV};
 use crate::service::{
     parse_admin_from_team, CredentialLifetime, ResponseFloors, ADMIN_FROM_TEAM_CHART_KEY,
     ADMIN_FROM_TEAM_ENV, LIFETIME_CHART_KEY, LIFETIME_ENV,
@@ -88,4 +90,21 @@ pub fn admin_from_team() -> Result<bool, Box<dyn std::error::Error>> {
          from the is_admin column when false"
     );
     Ok(on)
+}
+
+/// `KEY_IDENTITY_ADOPT` (ADR-1085): what a passed adoption proof may do.
+///
+/// REQUIRED: the binary has no default (ADR-0569). The chart defaults to
+/// `observe` (ADR-1091). A wrong value writes trust into the store or exits
+/// every pod, so the binary never guesses one.
+pub fn key_identity_adopt() -> Result<Adoption, Box<dyn std::error::Error>> {
+    let raw =
+        env_required(ADOPT_ENV).map_err(|e| format!("{e} Set the chart's {ADOPT_CHART_KEY}."))?;
+    let adoption = Adoption::parse(&raw)?;
+    tracing::info!(
+        key_identity_adopt = raw,
+        "KEY_IDENTITY_ADOPT: observe runs the adoption proof and only logs it; adopt records \
+         the marker on a passed proof and ends the serve on a failed one (ADR-1085)"
+    );
+    Ok(adoption)
 }

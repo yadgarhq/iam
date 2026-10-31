@@ -568,6 +568,25 @@ credential:
 # A bare `true` or `false`; anything else is refused at render.
 adminFromTeam: false
 
+# WHAT A PASSED KEY-IDENTITY ADOPTION PROOF MAY DO (ADR-1085, ADR-1089).
+# Rendered as KEY_IDENTITY_ADOPT. The BINARY refuses to boot without it; only
+# this chart supplies the default, `observe`, so a parent chart or argocd values
+# that omit the key still render and run read-only (adminFromTeam's shape).
+#
+# The proof runs only on a POPULATED store with NO marker (an installation
+# older than iam-db migration 14): iam decrypts the oldest rows of iam_user
+# (up to 64) and recomputes each blind index.
+# `observe`: run the proof and log it (INFO passed, WARN failed, naming the
+#   failing user ids). Never adopt, never exit. The read-only dry run ADR-1085
+#   requires before automatic adoption is deployed.
+# `adopt`: on a passed proof call AdoptKeyIdentity; on a failed one end the
+#   serve and exit non-zero, on every pod. Set it only after the log shows
+#   `reason=OBSERVE: the adoption proof PASSED`.
+# A quoted "observe" or "adopt"; anything else, including a deleted key
+# (`adopt: null`), is refused at render.
+keyIdentity:
+  adopt: "observe"
+
 # What iam puts into every enrolment token it mints (D73). An admin assembles
 # neither value and so cannot get either wrong — which puts the whole burden of
 # holding correct ones here.

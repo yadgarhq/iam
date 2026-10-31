@@ -525,6 +525,22 @@ impl IamDbService for FakeDb {
         Ok(Response::new(self.sync_answer.clone()))
     }
 
+    // The adoption arms (ADR-1085). No RPC of this service reaches them; only
+    // `key_identity`'s check does, against its own fake.
+    async fn list_key_identity_evidence(
+        &self,
+        _req: Request<db::ListKeyIdentityEvidenceRequest>,
+    ) -> Result<Response<db::ListKeyIdentityEvidenceResponse>, Status> {
+        unimplemented!("no RPC of this service lists key-identity evidence")
+    }
+
+    async fn adopt_key_identity(
+        &self,
+        _req: Request<db::AdoptKeyIdentityRequest>,
+    ) -> Result<Response<db::AdoptKeyIdentityResponse>, Status> {
+        unimplemented!("no RPC of this service adopts a key-identity marker")
+    }
+
     // THE TWO KEY-IDENTITY ARMS, WHICH NO `IamService` HANDLER REACHES. They
     // belong to `crate::key_identity`'s startup task, which builds its own twin
     // and scripts its own answers in `key_identity::tests`. `unimplemented!`

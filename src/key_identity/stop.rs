@@ -10,8 +10,51 @@ use std::time::Duration;
 
 use tonic::transport::Channel;
 
-use super::{watch, Identity, Mismatch, Retry};
+use super::{watch, Identity, Retry};
 use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
+
+/// The key set this process holds is NOT the one these rows were encrypted
+/// under. Permanent: no restart, no retry and no wait changes it.
+///
+/// Reached two ways: an arm of `iam-db` ANSWERED `MISMATCH`, or this process's
+/// own adoption proof FAILED over the store's oldest rows ([`super::adopt`]).
+/// The two get different sentences, because only the first is an answer.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", sentence(self.arm))]
+pub struct Mismatch {
+    /// Which arm answered it, and it is INTERPOLATED INTO THE MESSAGE ABOVE
+    /// rather than held for a reader of this struct. This message is the only
+    /// thing the process prints on its way out, so a field the operator never
+    /// sees states its distinction where nobody reads it.
+    pub(super) arm: &'static str,
+}
+
+/// What the process prints on its way out, by the way the refusal was reached.
+fn sentence(arm: &'static str) -> String {
+    if arm == super::adopt::PROOF {
+        return String::from(
+            "the key set this process loaded did NOT pass the adoption proof (ADR-1085): at \
+             least one of the oldest rows of iam_user failed to decrypt under it, or its blind \
+             index did not match. KEY_IDENTITY_ADOPT is adopt, so this is MISMATCH's \
+             disposition and the serve ends. Nothing has been written; the log line before \
+             this one names the failing user ids. Mount the key Secret this installation \
+             was provisioned with, or set keyIdentity.adopt to observe to keep serving \
+             UNVERIFIED while the rows are examined.",
+        );
+    }
+    format!(
+        "the key-identity marker in iam-db does NOT match the key set this process loaded: {arm} \
+         answered MISMATCH under derivation version {DERIVATION_VERSION}. A MISMATCH on \
+         GetKeyIdentity means a marker was ALREADY stored and disagrees; one on SetKeyIdentity \
+         means another replica recorded a different marker between this pod's read and its write, \
+         so this pod lost a split rollout. Every name and every credential already stored was \
+         encrypted under a different key set, so this process cannot read its own rows and will \
+         not go on serving as though it could (ADR-0764). Nothing has been written. Mount the key \
+         Secret this installation was provisioned with; if it is lost, the rows are not \
+         recoverable and no key in the world makes them so.",
+        DERIVATION_VERSION = super::DERIVATION_VERSION
+    )
+}
 
 /// What ended the serve, and what the process owes the exit code afterwards.
 #[derive(Debug)]

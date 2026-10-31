@@ -289,7 +289,7 @@ impl EnrolmentConfig {
 }
 
 pub struct Iam {
-    keys: Keys,
+    keys: std::sync::Arc<Keys>,
     channel: tonic::transport::Channel,
     /// The ceiling on every `iam-db` call (ADR-1019). See [`IamDb`].
     ceiling: Duration,
@@ -322,7 +322,7 @@ impl Iam {
     /// that deployment onto the new name — it silently reverts it to the
     /// default, which for a security control is the change nobody sees.
     pub fn new(
-        keys: Keys,
+        keys: impl Into<std::sync::Arc<Keys>>,
         db: IamDb,
         invalidator: Invalidator,
         floors: ResponseFloors,
@@ -331,7 +331,7 @@ impl Iam {
         admin_from_team: bool,
     ) -> Self {
         Self {
-            keys,
+            keys: keys.into(),
             channel: db.channel,
             ceiling: db.ceiling,
             invalidator,

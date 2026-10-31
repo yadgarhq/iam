@@ -345,3 +345,26 @@ fn an_absent_or_misspelt_admin_from_team_refuses_to_boot() {
         );
     }
 }
+
+/// ADR-1085: `KEY_IDENTITY_ADOPT` has no compiled-in default (ADR-0569), the
+/// chart defaults to `observe` (ADR-1091), and the value is exactly `observe`
+/// or `adopt`. Absent, empty
+/// and any other spelling each refuse the boot, naming the variable and the
+/// chart key.
+#[test]
+fn an_absent_or_misspelt_key_identity_adopt_refuses_to_boot() {
+    for bad in [None, Some(""), Some("Observe"), Some("true")] {
+        let keys_dir = fresh_keys_dir();
+        let mut vars = cleartext_env(&keys_dir);
+        vars.retain(|(k, _)| *k != "KEY_IDENTITY_ADOPT");
+        if let Some(value) = bad {
+            vars.push(("KEY_IDENTITY_ADOPT", value.to_string()));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains("KEY_IDENTITY_ADOPT") && line.contains("keyIdentity.adopt"),
+            "{bad:?}: the refusal must name the variable and the chart key: {line}"
+        );
+    }
+}

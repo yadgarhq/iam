@@ -440,6 +440,13 @@ spec:
             # non-boolean `adminFromTeam` by name before this line renders it.
             - name: IAM_ADMIN_FROM_TEAM
               value: {{ .Values.adminFromTeam | quote }}
+            # ADR-1085: what a passed adoption proof may do. iam refuses to boot
+            # without it; the chart's `values.yaml` default is `observe`. The value
+            # refusals are in `templates/render-checks.yaml`; this line only
+            # reads the value, guarded so a non-map `keyIdentity` cannot panic
+            # the render first.
+            - name: KEY_IDENTITY_ADOPT
+              value: {{ dig "adopt" "" (ternary .Values.keyIdentity dict (kindIs "map" .Values.keyIdentity)) | quote }}
             # The gateway address every enrolment token carries (D73).
             #
             # NOT `required`, and NOT a boot failure either. No default can know
