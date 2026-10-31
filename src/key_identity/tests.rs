@@ -39,6 +39,17 @@ enum Answer {
 struct Script {
     get: Vec<Answer>,
     set: Vec<Answer>,
+    /// The store's key-bearing rows, OLDEST FIRST, as `ListKeyIdentityEvidence`
+    /// serves them (ADR-1089).
+    evidence: Vec<db::KeyIdentityEvidence>,
+    /// The most rows one page serves; zero is no cap beyond the request's.
+    page_cap: usize,
+    /// When non-zero, every page serves this many rows WHATEVER `page_size`
+    /// asked for: a peer that over-serves.
+    page_fixed: usize,
+    /// When set, `ListKeyIdentityEvidence` answers this status every time.
+    list_fails: Option<tonic::Code>,
+    adopt: Vec<Answer>,
 }
 
 /// What the fake twin was asked. The ONLY witness that separates "the check
@@ -47,6 +58,8 @@ struct Script {
 struct Asked {
     get: Vec<db::GetKeyIdentityRequest>,
     set: Vec<db::SetKeyIdentityRequest>,
+    list: Vec<db::ListKeyIdentityEvidenceRequest>,
+    adopt: Vec<db::AdoptKeyIdentityRequest>,
     /// The raw `grpc-timeout` each round trip arrived with (ADR-1019).
     told: Vec<Option<String>>,
 }
@@ -101,6 +114,58 @@ impl IamDbService for FakeTwin {
         match answer(&self.script.set, n) {
             Answer::Failed(code) => Err(Status::new(code, "scripted")),
             Answer::Outcome(outcome) => Ok(Response::new(db::SetKeyIdentityResponse { outcome })),
+        }
+    }
+
+    /// Pages `script.evidence` by an OFFSET token. The real arm's token is a
+    /// keyset position; the caller treats it as opaque either way.
+    async fn list_key_identity_evidence(
+        &self,
+        r: Request<db::ListKeyIdentityEvidenceRequest>,
+    ) -> Result<Response<db::ListKeyIdentityEvidenceResponse>, Status> {
+        let r = {
+            let mut asked = self.asked.lock().expect("asked");
+            asked.told.push(told_by(&r));
+            asked.list.push(r.into_inner());
+            asked.list.last().cloned().expect("just pushed")
+        };
+        if let Some(code) = self.script.list_fails {
+            return Err(Status::new(code, "scripted"));
+        }
+        let from: usize = r.page_token.parse().unwrap_or(0);
+        let mut size = usize::try_from(r.page_size.max(1)).expect("positive");
+        if self.script.page_cap > 0 {
+            size = size.min(self.script.page_cap);
+        }
+        if self.script.page_fixed > 0 {
+            size = self.script.page_fixed;
+        }
+        let rows = &self.script.evidence;
+        let to = (from + size).min(rows.len());
+        let evidence = rows.get(from..to).unwrap_or_default().to_vec();
+        let next_page_token = match to < rows.len() {
+            true => to.to_string(),
+            false => String::new(),
+        };
+        Ok(Response::new(db::ListKeyIdentityEvidenceResponse {
+            evidence,
+            next_page_token,
+        }))
+    }
+
+    async fn adopt_key_identity(
+        &self,
+        r: Request<db::AdoptKeyIdentityRequest>,
+    ) -> Result<Response<db::AdoptKeyIdentityResponse>, Status> {
+        let n = {
+            let mut asked = self.asked.lock().expect("asked");
+            asked.told.push(told_by(&r));
+            asked.adopt.push(r.into_inner());
+            asked.adopt.len() - 1
+        };
+        match answer(&self.script.adopt, n) {
+            Answer::Failed(code) => Err(Status::new(code, "scripted")),
+            Answer::Outcome(outcome) => Ok(Response::new(db::AdoptKeyIdentityResponse { outcome })),
         }
     }
 
@@ -288,7 +353,12 @@ fn brisk() -> Retry {
 const WINDOW: Duration = Duration::from_millis(400);
 
 fn identity() -> Identity {
-    Identity::of(&crate::crypto::tests::keys())
+    of(crate::crypto::tests::keys())
+}
+
+/// An identity over `keys`, in `adopt` mode: the mode that can act on a proof.
+fn of(keys: crate::crypto::Keys) -> Identity {
+    Identity::of(Arc::new(keys), Adoption::Adopt)
 }
 
 /// Every member this build knows, as the raw value that travels.
@@ -359,6 +429,7 @@ async fn an_empty_store_is_recorded_and_then_passes() {
     let (client, asked) = twin(Script {
         get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Absent))],
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Recorded))],
+        ..Default::default()
     })
     .await;
     let id = identity();
@@ -539,6 +610,7 @@ async fn a_skew_on_the_recording_arm_neither_passes_nor_exits() {
     let asked = never_passes_and_never_exits(Script {
         get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Absent))],
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::DerivationSkew))],
+        ..Default::default()
     })
     .await;
     assert!(asked.set.len() > 1, "a skew on the write arm is not a pass");
@@ -551,6 +623,7 @@ async fn a_mismatch_on_the_recording_arm_ends_the_serve() {
     let (client, _asked) = twin(Script {
         get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Absent))],
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Mismatch))],
+        ..Default::default()
     })
     .await;
     let refusal =
@@ -568,6 +641,7 @@ async fn a_match_on_the_recording_arm_passes() {
     let (client, asked) = twin(Script {
         get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Absent))],
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Match))],
+        ..Default::default()
     })
     .await;
     let outcome =
@@ -687,9 +761,9 @@ async fn a_key_identity_read_refused_by_the_gate_stays_not_yet_and_never_refused
 /// version from the key reddens the two `contains` assertions.
 #[test]
 fn the_idempotency_key_is_fresh_and_carries_the_derivation_version() {
-    let keys = crate::crypto::tests::keys();
-    let a = Identity::of(&keys);
-    let b = Identity::of(&keys);
+    let keys = Arc::new(crate::crypto::tests::keys());
+    let a = Identity::of(keys.clone(), Adoption::Adopt);
+    let b = Identity::of(keys.clone(), Adoption::Adopt);
     assert_ne!(
         a.idempotency_key(),
         b.idempotency_key(),
@@ -855,21 +929,21 @@ async fn a_signal_and_a_rotation_both_exit_zero() {
 /// a server that ignored the version.
 #[test]
 fn the_fingerprint_covers_both_keys_and_the_domain_names_the_version() {
-    let base = crate::crypto::tests::keys_of([7u8; 32], [9u8; 32]);
-    let other_encryption = crate::crypto::tests::keys_of([8u8; 32], [9u8; 32]);
-    let other_blind_index = crate::crypto::tests::keys_of([7u8; 32], [1u8; 32]);
+    let base = Arc::new(crate::crypto::tests::keys_of([7u8; 32], [9u8; 32]));
+    let other_encryption = Arc::new(crate::crypto::tests::keys_of([8u8; 32], [9u8; 32]));
+    let other_blind_index = Arc::new(crate::crypto::tests::keys_of([7u8; 32], [1u8; 32]));
 
     assert_ne!(
-        Identity::of(&base).fingerprint(),
-        Identity::of(&other_encryption).fingerprint()
+        Identity::of(base.clone(), Adoption::Adopt).fingerprint(),
+        Identity::of(other_encryption.clone(), Adoption::Adopt).fingerprint()
     );
     assert_ne!(
-        Identity::of(&base).fingerprint(),
-        Identity::of(&other_blind_index).fingerprint()
+        Identity::of(base.clone(), Adoption::Adopt).fingerprint(),
+        Identity::of(other_blind_index.clone(), Adoption::Adopt).fingerprint()
     );
     assert_eq!(
-        Identity::of(&base).fingerprint(),
-        Identity::of(&crate::crypto::tests::keys_of([7u8; 32], [9u8; 32])).fingerprint(),
+        Identity::of(base.clone(), Adoption::Adopt).fingerprint(),
+        of(crate::crypto::tests::keys_of([7u8; 32], [9u8; 32])).fingerprint(),
         "the same key set derives the same fingerprint, or no pod ever passes twice"
     );
     assert!(DOMAIN.ends_with(&format!("v{DERIVATION_VERSION}")));
@@ -882,8 +956,8 @@ fn the_fingerprint_covers_both_keys_and_the_domain_names_the_version() {
 /// stolen store confirm a guess about a username against the marker column.
 #[test]
 fn the_fingerprint_is_neither_the_key_nor_a_blind_index() {
-    let keys = crate::crypto::tests::keys_of([7u8; 32], [9u8; 32]);
-    let fingerprint = Identity::of(&keys).fingerprint();
+    let keys = Arc::new(crate::crypto::tests::keys_of([7u8; 32], [9u8; 32]));
+    let fingerprint = Identity::of(keys.clone(), Adoption::Adopt).fingerprint();
     assert_eq!(fingerprint.len(), 32);
     assert_ne!(fingerprint, vec![7u8; 32]);
     assert_ne!(fingerprint, vec![9u8; 32]);
@@ -1121,6 +1195,7 @@ async fn both_round_trips_tell_the_store_the_ceiling() {
     let (client, asked) = twin(Script {
         get: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Absent))],
         set: vec![Answer::Outcome(raw(db::KeyIdentityOutcome::Recorded))],
+        ..Default::default()
     })
     .await;
 
@@ -1144,3 +1219,5 @@ async fn both_round_trips_tell_the_store_the_ceiling() {
         "the read, then the write"
     );
 }
+
+mod adopt;

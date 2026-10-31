@@ -3,6 +3,36 @@
 Commands for a human to run, and orderings a human must decide. Nothing here is
 applied automatically.
 
+## Key-identity adoption: `KEY_IDENTITY_ADOPT` is required in the binary; the chart defaults it to `observe` (ADR-1085, ADR-1089)
+
+**Breaking for the binary: iam refuses to boot without `KEY_IDENTITY_ADOPT`.**
+The chart supplies the default (`keyIdentity.adopt: "observe"`, the precedent
+`adminFromTeam` sets), so a parent chart or argocd values that omit the key
+still render and run read-only. The render check refuses every value but
+`"observe"` and `"adopt"`, a deleted key (`adopt: null`) included, naming the
+key.
+
+- The proof runs only where `SetKeyIdentity` answers `FAILED_PRECONDITION`: a
+  populated store with no marker (older than iam-db migration 14). A fresh or
+  already-marked store never reaches it, whatever the mode.
+- It needs an iam-db that serves `ListKeyIdentityEvidence` and
+  `AdoptKeyIdentity`. An older iam-db answers `UNIMPLEMENTED`; iam then stays
+  UNVERIFIED and logs "this iam-db predates the adoption arm" at ERROR.
+- ADR-1085: the pin deploys `observe` by default. Read the iam log for the
+  dry-run line (`reason=OBSERVE: the adoption proof PASSED ...` at INFO, or
+  `... FAILED ...` at WARN with the failing user ids). Set
+  `iam.keyIdentity.adopt: "adopt"` in the argocd values only after the kind log
+  shows `reason=OBSERVE ... PASSED`. No parent chart change is needed to pin
+  this iam chart.
+
+```bash
+helm template iam chart -f chart/ci/values.yaml | grep -A1 KEY_IDENTITY_ADOPT
+kubectl --context kind-yadgar -n yadgar logs deploy/iam | grep -E 'OBSERVE: the adoption proof|adoption proof'
+```
+
+Rollback: revert this image and chart. In `observe` nothing is written. In
+`adopt` a recorded marker stays; it is the marker a fresh install records.
+
 ## Team access stage 3: `IAM_ADMIN_FROM_TEAM` is required; `SyncTeams`; the runtime team verbs retire
 
 **Breaking: iam refuses to boot without `IAM_ADMIN_FROM_TEAM`.** The chart

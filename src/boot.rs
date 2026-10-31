@@ -19,7 +19,7 @@ use crate::service::EnrolmentConfig;
 use crate::upstream::{self, UpstreamTls};
 
 mod settings;
-pub use settings::{admin_from_team, credential_lifetime, response_floors};
+pub use settings::{admin_from_team, credential_lifetime, key_identity_adopt, response_floors};
 
 /// The file holding the broker password. A PATH, never the value (D80).
 const PASSWORD_FILE_KEY: &str = "NATS_PASSWORD_FILE";

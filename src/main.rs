@@ -134,15 +134,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Fails boot loudly if the keys are absent or unreadable — deliberately
     // before the listener binds. See the module doc above for why this one
     // dependency is NOT allowed to degrade gracefully the way iam-db is.
-    let keys = Keys::from_env()?;
+    let keys = std::sync::Arc::new(Keys::from_env()?);
     tracing::info!("crypto keys loaded; names are encrypted at rest (D72)");
 
     // WHICH key set those are, as the opaque bytes `iamdb.v1`'s key-identity arm
-    // stores and compares (ADR-0764, ADR-0765). Derived HERE because `keys` is
-    // moved into `Iam` below, and BOOT IS GATED ON NONE OF IT: this is a local
-    // computation over material already loaded, and the round trip that uses it
-    // happens in a task after the listener binds.
-    let identity = key_identity::Identity::of(&keys);
+    // stores and compares (ADR-0764, ADR-0765). The check SHARES `keys` with
+    // `Iam` below, because the adoption proof decrypts stored rows with them
+    // (ADR-1085). BOOT IS GATED ON NONE OF IT beyond the required mode: this is
+    // a local computation over material already loaded, and the round trip that
+    // uses it happens in a task after the listener binds.
+    let identity = key_identity::Identity::of(keys.clone(), boot::key_identity_adopt()?);
 
     let (db, ceiling, db_tls) = boot::iam_db().await?;
 
