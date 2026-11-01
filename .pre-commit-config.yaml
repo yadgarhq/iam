@@ -33,7 +33,7 @@ repos:
     # the file. A second `repo:` entry pinning the same repository at a
     # second rev was the alternative, and it is the drift the shared
     # manifest exists to prevent.
-    rev: v1.48.3
+    rev: v1.50.0
     hooks:
       - id: gitleaks
       - id: prettier
