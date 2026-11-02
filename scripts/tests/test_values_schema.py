@@ -47,7 +47,9 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[2]
@@ -1093,3 +1095,288 @@ def test_the_suite_reads_the_chart_this_repository_ships():
     assert CHART == REPO / "chart", CHART
     assert SCHEMA_PATH.exists(), SCHEMA_PATH
     assert json.loads(SCHEMA_PATH.read_text())["title"] == "yadgar/iam"
+
+
+# ── THE CENSUS: NO type / enum / default / required ANYWHERE UNLESS LISTED ───
+#
+# ADR-0847 keeps `type`, `enum` and `default` out of this schema; ADR-0845 and
+# ADR-1006 put a few back on purpose. The spot checks above pin SPECIFIC
+# leaves. They do not stop a new `type`, `enum`, `default` or `required` landing
+# on any OTHER node, nor an `enum` riding in on a leaf that is already typed. The
+# census walks EVERY node and compares it with two data tables, so a deliberate
+# schema change must edit the table in the same PR (yaadgaar 327).
+#
+# `TYPED_ON_PURPOSE` maps each leaf path that carries keywords to the exact node
+# it must equal; every other leaf must be `{}`. `BLOCKS_ON_PURPOSE` maps each
+# block path that carries keywords besides `properties` and
+# `additionalProperties` to those keywords; every other block carries none. The
+# ROOT is the block path `""`. Prose keys (`description`, `$comment`, `$schema`,
+# `title`) are ignored: they decide nothing. `default` and `enum` are refused
+# everywhere, also inside a nested sub-schema (`anyOf`, `items`), with no table
+# to excuse them (ADR-0705: a consequential knob carries no default, and a
+# schema `default` is a second source for the chart default).
+# The tables are data so ADR-0705's REQUIRED list (yaadgaar 336) can extend them.
+#
+# UNDELIBERATE? (yaadgaar 327): the bare `type: object` on the block `nats.tls`
+# is covered by no ADR this chart cites (ADR-0845 / ADR-0852 / ADR-0885 cover the
+# `required: [enabled]` and the boolean leaf, not a block type). It is pinned as
+# shipped, not deleted, so a ruling to keep or strip it edits this table.
+# ADR-0847 keeps types out; ADR-0845 puts the TLS switches back; ADR-1006 covers
+# `server.limits`; `iamDb.requestTimeoutSeconds` follows ADR-0925 / ADR-0569.
+
+TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
+    "tls.enabled": {"type": "boolean"},
+    "server.limits.maxConcurrentStreams": {"type": "integer", "minimum": 1, "maximum": 10000},
+    "server.limits.keepaliveIntervalSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "server.limits.keepaliveTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
+    "server.limits.maxHeaderListBytes": {"type": "integer", "minimum": 1024, "maximum": 1048576},
+    "iamDb.requestTimeoutSeconds": {"type": "integer", "minimum": 14, "maximum": 59},
+    "iamDb.tls.enabled": {"type": "boolean"},
+    "nats.tls.enabled": {"type": "boolean"},
+}
+
+BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
+    "tls": {"required": ["enabled", "clientAuth"]},
+    "server": {"required": ["limits"]},
+    "server.limits": {"required": ["maxConcurrentStreams", "keepaliveIntervalSeconds", "keepaliveTimeoutSeconds", "maxHeaderListBytes"]},
+    "iamDb": {"required": ["requestTimeoutSeconds"]},
+    "iamDb.tls": {"required": ["enabled"]},
+    "nats.tls": {"type": "object", "required": ["enabled"]},
+}
+
+BOUNDED_LEAF = "server.limits.maxConcurrentStreams"
+CENSUS_PROSE = frozenset({"description", "$comment", "$schema", "title"})
+CENSUS_STRUCTURE = frozenset({"properties", "additionalProperties"})
+
+
+def _census_keywords(node: dict[str, Any], skip: frozenset[str]) -> dict[str, Any]:
+    kept = {key: value for key, value in node.items() if key not in skip}
+    if "required" in kept:
+        kept["required"] = sorted(kept["required"])
+    return kept
+
+
+def _nested_refusals(node: Any, where: str) -> list[str]:
+    """`default` or `enum` anywhere inside a keyword's value (`anyOf`, `items`,
+    ...). A `properties` map is walked by the caller, so its keys are not
+    keywords here. PURE."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("default", "enum"):
+                found.append(f"{where}: carries a nested `{key}`")
+            elif key != "properties":
+                found.extend(_nested_refusals(value, where))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_nested_refusals(item, where))
+    return found
+
+
+def census_failures(
+    schema: dict[str, Any],
+    typed: dict[str, dict[str, Any]] | None = None,
+    blocks: dict[str, dict[str, Any]] | None = None,
+) -> list[str]:
+    """Every node whose keywords differ from the tables above. PURE."""
+    typed = TYPED_ON_PURPOSE if typed is None else typed
+    blocks = BLOCKS_ON_PURPOSE if blocks is None else blocks
+    failures: list[str] = []
+    seen_leaves: set[str] = set()
+    seen_blocks: set[str] = set()
+
+    def walk(node: dict[str, Any], path: str) -> None:
+        where = path or "<root>"
+        if "default" in node:
+            failures.append(f"{where}: carries a `default`")
+        if "enum" in node:
+            failures.append(f"{where}: carries an `enum`")
+        failures.extend(
+            _nested_refusals({k: v for k, v in node.items() if k not in ("default", "enum")}, where)
+        )
+        if "properties" in node:
+            seen_blocks.add(path)
+            expected = _census_keywords(blocks.get(path, {}), frozenset())
+            actual = _census_keywords(node, CENSUS_PROSE | CENSUS_STRUCTURE)
+            if actual != expected:
+                failures.append(f"{where}: block keywords {actual} != {expected}")
+            for key, child in node["properties"].items():
+                walk(child, f"{path}.{key}" if path else key)
+        else:
+            seen_leaves.add(path)
+            expected = _census_keywords(typed.get(path, {}), frozenset())
+            actual = _census_keywords(node, CENSUS_PROSE)
+            if actual != expected:
+                failures.append(f"{where}: leaf {actual} != {expected}")
+
+    walk(schema, "")
+    for path in sorted(set(typed) - seen_leaves):
+        failures.append(f"{path}: TYPED_ON_PURPOSE names a leaf the schema does not have")
+    for path in sorted(set(blocks) - seen_blocks):
+        failures.append(f"{path or '<root>'}: BLOCKS_ON_PURPOSE names a block the schema does not have")
+    return failures
+
+
+def a_census_untyped_leaf(schema: dict[str, Any]) -> str:
+    """The first leaf path (sorted) that no table excuses. PURE."""
+    leaves: list[str] = []
+
+    def walk(node: dict[str, Any], path: str) -> None:
+        if "properties" in node:
+            for key, child in node["properties"].items():
+                walk(child, f"{path}.{key}" if path else key)
+        elif path not in TYPED_ON_PURPOSE and node == {}:
+            leaves.append(path)
+
+    walk(schema, "")
+    return sorted(leaves)[0]
+
+
+def census_node(schema: dict[str, Any], path: str) -> dict[str, Any]:
+    node = schema
+    for step in path.split(".") if path else []:
+        node = node["properties"][step]
+    return node
+
+
+def test_the_census_is_clean_on_the_shipped_schema() -> None:
+    assert census_failures(schema()) == []
+
+
+def test_the_census_tables_name_only_nodes_that_carry_keywords() -> None:
+    assert all(TYPED_ON_PURPOSE.values()), "an empty TYPED_ON_PURPOSE entry excuses nothing"
+    assert all(BLOCKS_ON_PURPOSE.values()), "an empty BLOCKS_ON_PURPOSE entry excuses nothing"
+
+
+def test_the_census_ignores_prose() -> None:
+    mutated = copy.deepcopy(schema())
+    mutated["$comment"] = "reworded"
+    census_node(mutated, "tls.enabled")["description"] = "reworded"
+    census_node(mutated, a_census_untyped_leaf(mutated))["description"] = "reworded"
+    assert census_failures(mutated) == []
+
+
+def census_mutations() -> dict[str, Any]:
+    """Name -> mutator(schema) for every row of the red table. Each must redden."""
+
+    def on_untyped(change: dict[str, Any]):
+        def mutate(schema: dict[str, Any]) -> None:
+            census_node(schema, a_census_untyped_leaf(schema)).update(change)
+
+        return mutate
+
+    def on_node(path: str, change: dict[str, Any]):
+        def mutate(schema: dict[str, Any]) -> None:
+            census_node(schema, path).update(change)
+
+        return mutate
+
+    def delete_key(path: str, key: str):
+        def mutate(schema: dict[str, Any]) -> None:
+            del census_node(schema, path)[key]
+
+        return mutate
+
+    def replace_node(path: str, node: dict[str, Any]):
+        def mutate(schema: dict[str, Any]) -> None:
+            parent, _, leaf = path.rpartition(".")
+            census_node(schema, parent)["properties"][leaf] = node
+
+        return mutate
+
+    def drop_required(path: str, name: str):
+        def mutate(schema: dict[str, Any]) -> None:
+            census_node(schema, path)["required"].remove(name)
+
+        return mutate
+
+    def nested_in_any_of(path: str, index: int, change: dict[str, Any]):
+        def mutate(schema: dict[str, Any]) -> None:
+            census_node(schema, path)["anyOf"][index].update(change)
+
+        return mutate
+
+    def drop_any_of_branch(path: str, index: int):
+        def mutate(schema: dict[str, Any]) -> None:
+            del census_node(schema, path)["anyOf"][index]
+
+        return mutate
+
+    def nested_in_items(path: str, change: dict[str, Any]):
+        def mutate(schema: dict[str, Any]) -> None:
+            census_node(schema, path)["items"].update(change)
+
+        return mutate
+
+    return {
+        # keyword added where the table lists none
+        "type on an untyped leaf": on_untyped({"type": "string"}),
+        "enum on an untyped leaf": on_untyped({"enum": ["a", "b"]}),
+        "default on an untyped leaf": on_untyped({"default": "x"}),
+        "required on an untyped leaf": on_untyped({"required": ["x"]}),
+        "minimum on an untyped leaf": on_untyped({"minimum": 1}),
+        # keyword riding on a leaf that is already typed on purpose
+        "default on tls.enabled": on_node("tls.enabled", {"default": True}),
+        "enum on tls.enabled": on_node("tls.enabled", {"enum": [True]}),
+        "default on a bounded integer": on_node(BOUNDED_LEAF, {"default": 5}),
+        "enum on a bounded integer": on_node(BOUNDED_LEAF, {"enum": [5]}),
+        # a typed leaf drifts
+        "bound raised": on_node(BOUNDED_LEAF, {"maximum": TYPED_ON_PURPOSE[BOUNDED_LEAF]["maximum"] + 1}),
+        "bound lowered": on_node(BOUNDED_LEAF, {"minimum": TYPED_ON_PURPOSE[BOUNDED_LEAF]["minimum"] + 1}),
+        "bound dropped": delete_key(BOUNDED_LEAF, "maximum"),
+        "type changed": on_node(BOUNDED_LEAF, {"type": "number"}),
+        # a typed leaf loses its keywords (the reverse direction)
+        "tls.enabled loses its type": replace_node("tls.enabled", {}),
+        "bounded integer loses its type": replace_node(BOUNDED_LEAF, {}),
+        # blocks
+        "default on a block": on_node("tls", {"default": {}}),
+        "type on a block that has none": on_node("tls", {"type": "object"}),
+        "enum on a block": on_node("tls", {"enum": [{}]}),
+        "extra required on a block": on_node("tls", {"required": ["enabled", "clientAuth", "clientCaSecret"]}),
+        "enum on tls.clientAuth": on_node("tls.clientAuth", {"enum": ["off", "optional", "required"]}),
+        "type on tls.clientAuth": on_node("tls.clientAuth", {"type": "string"}),
+        "default on tls.clientAuth": on_node("tls.clientAuth", {"default": "off"}),
+        "iamDb.requestTimeoutSeconds bound raised": on_node("iamDb.requestTimeoutSeconds", {"maximum": 60}),
+        "iamDb.requestTimeoutSeconds bound lowered": on_node("iamDb.requestTimeoutSeconds", {"minimum": 15}),
+        "iamDb.requestTimeoutSeconds loses its type": replace_node("iamDb.requestTimeoutSeconds", {}),
+        "iamDb.tls.enabled loses its type": replace_node("iamDb.tls.enabled", {}),
+        "nats.tls.enabled loses its type": replace_node("nats.tls.enabled", {}),
+        "nats.tls loses its type": delete_key("nats.tls", "type"),
+        "required dropped from nats.tls": delete_key("nats.tls", "required"),
+        "required key dropped from iamDb": drop_required("iamDb", "requestTimeoutSeconds"),
+        "required dropped from server": delete_key("server", "required"),
+        "required key dropped from server.limits": drop_required("server.limits", "maxHeaderListBytes"),
+        "required dropped from a block": delete_key("tls", "required"),
+        "required key dropped from tls": drop_required("tls", "clientAuth"),
+        # root
+        "type on the root": on_node("", {"type": "object"}),
+        "default on the root": on_node("", {"default": {}}),
+        "required on the root": on_node("", {"required": ["tls"]}),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(census_mutations()))
+def test_the_census_reddens_on(name: str) -> None:
+    mutated = copy.deepcopy(schema())
+    census_mutations()[name](mutated)
+    assert census_failures(mutated) != [], name
+
+
+def test_a_stale_typed_entry_reddens_the_census() -> None:
+    typed = {**TYPED_ON_PURPOSE, "no.such.leaf": {"type": "string"}}
+    assert census_failures(schema(), typed=typed) != []
+
+
+def test_a_stale_block_entry_reddens_the_census() -> None:
+    blocks = {**BLOCKS_ON_PURPOSE, "no.such.block": {"required": ["x"]}}
+    assert census_failures(schema(), blocks=blocks) != []
+
+
+def test_a_typed_table_missing_an_entry_reddens_the_census() -> None:
+    typed = {path: node for path, node in TYPED_ON_PURPOSE.items() if path != "tls.enabled"}
+    assert census_failures(schema(), typed=typed) != []
+
+
+def test_a_block_table_missing_an_entry_reddens_the_census() -> None:
+    blocks = {path: node for path, node in BLOCKS_ON_PURPOSE.items() if path != "tls"}
+    assert census_failures(schema(), blocks=blocks) != []
