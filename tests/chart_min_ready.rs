@@ -73,7 +73,7 @@ fn the_deployment_renders_it_from_the_chart_key() {
         .collect();
     assert_eq!(
         block.trim(),
-        "minReadySeconds: {{ . }}",
+        "minReadySeconds: {{ . | int64 }}",
         "the guarded block must render the field itself"
     );
     let spec = deployment
