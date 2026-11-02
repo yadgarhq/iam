@@ -18,7 +18,7 @@ spec:
   # Rendering nothing hands the field to the HPA, which is what `minReplicas`
   # exists to floor. `replicaCount` still applies to every deployment that has
   # not enabled autoscaling, which is the chart's own default (D80).
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.replicaCount | int64 }}
   {{- end }}
   {{- with .Values.rollingUpdate }}
   # THE ROLL'S SHAPE, WRITTEN OUT BECAUSE THE DEFAULT IS COUNT-DEPENDENT
@@ -77,7 +77,7 @@ spec:
   # Available=False for this long; endpoints follow readiness, so traffic does
   # not. It costs this many seconds per surge pod on every roll. `0` renders
   # nothing and returns the Deployment API's default, 0.
-  minReadySeconds: {{ . }}
+  minReadySeconds: {{ . | int64 }}
   {{- end }}
   selector:
     matchLabels:
@@ -293,7 +293,7 @@ spec:
             - name: IAM_DB_HOST
               value: {{ .Values.iamDb.host | quote }}
             - name: IAM_DB_PORT
-              value: {{ .Values.iamDb.port | quote }}
+              value: {{ .Values.iamDb.port | int64 | quote }}
             # NO COMPILED-IN DEFAULT (ADR-0569, ADR-0925 Q-C1): the binary refuses
             # an unset value, so this renders from `iamDb.requestTimeoutSeconds`
             # unconditionally. Bounded 14..=59 in `values.schema.json`.
@@ -444,7 +444,7 @@ spec:
             # nobody chose, and a security control configured by accident is the
             # failure this whole change is about.
             - name: LOGIN_RESPONSE_FLOOR_MS
-              value: {{ required "login.responseFloorMs is the Login response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.login.responseFloorMs | quote }}
+              value: {{ required "login.responseFloorMs is the Login response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.login.responseFloorMs | int64 | quote }}
             # The same control for RedeemEnrolment, and its own number. That RPC
             # is unauthenticated and its three refusals are decided inside
             # iam-db, so the difference a floor hides here arises in another
@@ -452,7 +452,7 @@ spec:
             # the reason above: a floor nobody chose is a security control
             # configured by accident.
             - name: REDEEM_RESPONSE_FLOOR_MS
-              value: {{ required "redeemEnrolment.responseFloorMs is the RedeemEnrolment response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.redeemEnrolment.responseFloorMs | quote }}
+              value: {{ required "redeemEnrolment.responseFloorMs is the RedeemEnrolment response-time floor in milliseconds and must be set; see the chart's values.yaml" .Values.redeemEnrolment.responseFloorMs | int64 | quote }}
             # ADR-0972 (3): how long every Login and RedeemEnrolment credential
             # lives. iam refuses to boot without it. `int64` because a values
             # file delivers a float64, which `quote` alone renders as
