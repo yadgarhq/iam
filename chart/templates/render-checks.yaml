@@ -362,7 +362,7 @@ ONLY A KNOB THE RENDER READS IS CHECKED. `replicaCount` feeds `replicas:` only w
 and `maxReplicas` feed the ScaledObject only while it is true,
 so a bad value in the arm that is off changes nothing and is not refused.
 `minReadySeconds`, `terminationGracePeriodSeconds` and `preStopSleepSeconds` sit behind `with`, which skips
-nil and 0 and so are checked only when present. `terminationGracePeriodSeconds` and `preStopSleepSeconds` are NOT cast: `hooks/chart_baseline.py` prices the grace period against the sleep and cannot read `{{ . | int64 }}`, so the check bounds both at 999999 instead, the largest value a float64 prints without an exponent. The other knobs are rendered
+nil and 0 and so are checked only when present. `terminationGracePeriodSeconds`, `preStopSleepSeconds` and `topologySpread.maxSkew` are NOT cast: `hooks/chart_baseline.py` prices the grace period against the sleep and the skew and cannot read `{{ . | int64 }}`, so the check bounds all three at 999999 instead, the largest value a float64 prints without an exponent. `topologySpread.maxSkew` is also refused below 1 (the API requires it greater than zero) and is read only while `topologySpread.enabled` is true. The other knobs are rendered
 unconditionally, so a missing key reads as nil here and is refused too.
 `autoscaling.enabled` is a confirmed bool by the blocks above.
 */}}
@@ -384,6 +384,9 @@ unconditionally, so a missing key reads as nil here and is refused too.
 {{- end }}
 {{- if and (hasKey .Values "preStopSleepSeconds") (not (kindIs "invalid" .Values.preStopSleepSeconds)) }}
 {{- $checks = append $checks (dict "key" "preStopSleepSeconds" "value" .Values.preStopSleepSeconds "max" 999999) }}
+{{- end }}
+{{- if and (kindIs "map" .Values.topologySpread) .Values.topologySpread.enabled }}
+{{- $checks = append $checks (dict "key" "topologySpread.maxSkew" "value" .Values.topologySpread.maxSkew "min" 1 "max" 999999) }}
 {{- end }}
 {{- range $check := $checks }}
 {{- $value := $check.value }}

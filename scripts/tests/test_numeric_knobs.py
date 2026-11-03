@@ -198,3 +198,25 @@ def test_the_grace_period_and_pre_stop_sleep_are_bounded_where_a_float_prints_pl
     for key in ("terminationGracePeriodSeconds", "preStopSleepSeconds"):
         for value in (1000000, 1.5, "abc", -1, "0123", 1e20, ""):
             refused_naming(overlay(key, value), key, tmp_path)
+
+
+def test_the_topology_skew_is_bounded_where_a_float_prints_plainly_and_both_ends_are_exact(tmp_path):
+    """Not cast through `int64`: the chart-baseline gate cannot read the skew through it.
+    The API needs maxSkew > 0, so 0 is refused; 999999 is the largest value helm prints
+    without an exponent (yaadgaar 543)."""
+    def skew(value):
+        body = overlay("topologySpread.maxSkew", value)
+        body["topologySpread"]["enabled"] = True
+        return body
+
+    for value in (1, 999999):
+        spec = deployment(rendered(skew(value), tmp_path))["spec"]["template"]["spec"]
+        assert spec["topologySpreadConstraints"][0]["maxSkew"] == value
+    for value in (0, "0", 1000000, 1.5, "abc", -1, "", "0123", 1e20):
+        refused_naming(skew(value), "topologySpread.maxSkew", tmp_path)
+
+
+def test_the_topology_skew_is_not_read_while_the_spread_is_off(tmp_path):
+    body = overlay("topologySpread.maxSkew", 1.5)
+    body["topologySpread"]["enabled"] = False
+    assert rendered(body, tmp_path)
