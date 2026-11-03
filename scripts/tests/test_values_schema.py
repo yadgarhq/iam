@@ -1117,10 +1117,11 @@ def test_the_suite_reads_the_chart_this_repository_ships():
 # schema `default` is a second source for the chart default).
 # The tables are data so ADR-0705's REQUIRED list (yaadgaar 336) can extend them.
 #
-# UNDELIBERATE? (yaadgaar 327): the bare `type: object` on the block `nats.tls`
-# is covered by no ADR this chart cites (ADR-0845 / ADR-0852 / ADR-0885 cover the
-# `required: [enabled]` and the boolean leaf, not a block type). It is pinned as
-# shipped, not deleted, so a ruling to keep or strip it edits this table.
+# ADR-1138 (accepted 2026-11-03, yaadgaar #327 ruling 4): the bare `type: object`
+# on the block `nats.tls` is a deliberate exception to ADR-0847, kept as shipped
+# and marked `# ADR-1138` in the table below. ADR-0845 / ADR-0852 / ADR-0885
+# cover the `required: [enabled]` and the boolean leaf. Any other new type still
+# needs its own ruling and edits this table in the PR.
 # ADR-0847 keeps types out; ADR-0845 puts the TLS switches back; ADR-1006 covers
 # `server.limits`; `iamDb.requestTimeoutSeconds` follows ADR-0925 / ADR-0569.
 
@@ -1141,7 +1142,7 @@ BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "server.limits": {"required": ["maxConcurrentStreams", "keepaliveIntervalSeconds", "keepaliveTimeoutSeconds", "maxHeaderListBytes"]},
     "iamDb": {"required": ["requestTimeoutSeconds"]},
     "iamDb.tls": {"required": ["enabled"]},
-    "nats.tls": {"type": "object", "required": ["enabled"]},
+    "nats.tls": {"type": "object", "required": ["enabled"]},  # ADR-1138
 }
 
 BOUNDED_LEAF = "server.limits.maxConcurrentStreams"
@@ -1246,6 +1247,21 @@ def test_the_census_is_clean_on_the_shipped_schema() -> None:
 def test_the_census_tables_name_only_nodes_that_carry_keywords() -> None:
     assert all(TYPED_ON_PURPOSE.values()), "an empty TYPED_ON_PURPOSE entry excuses nothing"
     assert all(BLOCKS_ON_PURPOSE.values()), "an empty BLOCKS_ON_PURPOSE entry excuses nothing"
+
+
+ADR_1138_PATHS = (
+    "nats.tls",
+)
+
+
+def test_each_adr_1138_exception_cites_the_adr_in_its_census_entry() -> None:
+    """ADR-1138 (accepted 2026-11-03, yaadgaar #327 ruling 4) records these named types
+    as deliberate exceptions to ADR-0847. Each census entry carries the citation."""
+    lines = Path(__file__).read_text().splitlines()
+    for path in ADR_1138_PATHS:
+        entries = [line for line in lines if line.startswith(f'    "{path}": ')]
+        assert len(entries) == 1, f"{path}: expected one census entry, found {len(entries)}"
+        assert "ADR-1138" in entries[0], f"{path}: the census entry does not cite ADR-1138"
 
 
 def test_the_census_ignores_prose() -> None:
