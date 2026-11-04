@@ -27,7 +27,7 @@
 //! | anything else, including every non-OK status | no | no | when permanent |
 //!
 //! ONE status is routed further: `SetKeyIdentity`'s `FAILED_PRECONDITION`, a
-//! populated store with no marker, goes to [`adopt`]'s proof (ADR-1085), whose
+//! populated store with no marker, goes to `adopt`'s proof (ADR-1085), whose
 //! FAILURE in `adopt` mode takes `MISMATCH`'s row.
 //!
 //! **THE PASS IS A WHITELIST AND NEVER A BLACKLIST OF `MISMATCH`.** A caller
@@ -135,7 +135,7 @@ fn restate(since: Option<Duration>) -> bool {
 /// What this process claims about its key set, computed once at boot.
 ///
 /// It carries the KEYS THEMSELVES, behind the same `Arc` `Iam` holds, because
-/// the adoption proof ([`adopt`], ADR-1085) decrypts stored rows with them. The
+/// the adoption proof (`adopt`, ADR-1085) decrypts stored rows with them. The
 /// material still never leaves [`crate::crypto`]: this holds the handle, and
 /// `Debug` below prints neither key.
 #[derive(Clone)]
@@ -294,11 +294,10 @@ fn report(unverified: &Unverified, standing: &mut Option<(&'static str, Duration
             reason = unverified.reason,
             standing_for_secs = stood_for.as_secs(),
             derivation_version = DERIVATION_VERSION,
+            act_on = adopt::ACT_ON,
             "the key identity is UNVERIFIED until somebody acts; this pod keeps retrying. It \
              is Ready and serving and has NOT proved it holds the key set its rows were \
-             encrypted under. Act on the reason: deploy an iam-db carrying the arm it names, \
-             resolve the marker this store holds (ADR-0764, ADR-0765), or reissue this \
-             pod's client certificate as `iam-caller` (ADR-0972)"
+             encrypted under. Act on the reason as `act_on` says"
         ),
         false => tracing::warn!(
             reason = unverified.reason,

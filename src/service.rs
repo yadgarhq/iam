@@ -12,21 +12,21 @@
 //!
 //! | file | what is in it |
 //! | --- | --- |
-//! | [`login`] | `Login`, and the response-time floor it is held to |
-//! | [`enrolment`] | `IssueEnrolment` and `RedeemEnrolment` (D73) |
-//! | [`credential`] | resolving, listing, minting and revoking a credential |
-//! | [`admin`] | the administrative writes on a user and on a team |
-//! | [`settings`] | an inherited setting and a rate-limit override |
-//! | [`validate`] | the bounds on fields that appear in more than one request |
-//! | [`rpc`] | the `IamService` impl: contract docs, and the caller handed on |
+//! | `login` | `Login`, and the response-time floor it is held to |
+//! | `enrolment` | `IssueEnrolment` and `RedeemEnrolment` (D73) |
+//! | `credential` | resolving, listing, minting and revoking a credential |
+//! | `admin` | the administrative writes on a user and on a team |
+//! | `settings` | an inherited setting and a rate-limit override |
+//! | `validate` | the bounds on fields that appear in more than one request |
+//! | `rpc` | the `IamService` impl: contract docs, and the caller handed on |
 //! | [`caller`] | the caller gate (ADR-0972): the `_as` seam, telemetry scope, floors |
-//! | [`teams`] | `SyncTeams`, its seeder gate, and `IAM_ADMIN_FROM_TEAM` (team access) |
-//! | [`store`] | the `iam-db` hop under the caller's deadline (ADR-1019) |
+//! | `teams` | `SyncTeams`, its seeder gate, and `IAM_ADMIN_FROM_TEAM` (team access) |
+//! | `store` | the `iam-db` hop under the caller's deadline (ADR-1019) |
 //!
 //! A BOUND STAYS WITH THE REQUEST IT WAS ARGUED FOR, which is ADR-0565's rule
 //! about re-arguing a bound per field, applied to where the bound lives. Only
 //! the genuinely shared ones — a label, an idempotency key, an entity id — sit
-//! in [`validate`].
+//! in `validate`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
