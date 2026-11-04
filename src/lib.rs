@@ -26,6 +26,9 @@ pub mod upstream;
 /// Generated from the vendored contract (D16, D70). The module tree mirrors the
 /// protobuf package path — generated cross-package references are emitted as
 /// `super::super::common::v1::Meta`, so a flattened tree fails to compile.
+/// The contract's comments write `<uuidv7>` as prose, which rustdoc reads as an
+/// unclosed HTML tag; that text is not this crate's to change.
+#[allow(rustdoc::invalid_html_tags)]
 pub mod pb {
     pub mod yadgar {
         pub mod common {

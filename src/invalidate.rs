@@ -205,7 +205,7 @@ impl std::fmt::Debug for Credentials {
 /// legitimate state for a local run and NOT for a deployment — `main` warns
 /// loudly at boot rather than treating a missing broker as normal, because a
 /// gateway cache with no invalidation path is the failure D72 names. A
-/// configured broker whose first dial failed is the third: [`redial`] fills
+/// configured broker whose first dial failed is the third: `redial` fills
 /// `client` once a dial succeeds, and every clone sees it, because the slot is
 /// shared rather than copied — `Iam::new` holds a clone taken at boot.
 #[derive(Clone)]
@@ -277,7 +277,7 @@ impl Invalidator {
     /// A broker that cannot be reached at boot does not stop the service: `iam`
     /// still authenticates, and refusing to start would turn a broker outage into
     /// an authentication outage (D69/ADR-0555). The cost is recorded in the log,
-    /// not hidden — and it ENDS: the outage arm hands the dial to [`redial`],
+    /// not hidden — and it ENDS: the outage arm hands the dial to `redial`,
     /// which retries every [`RETRY`] in the background and starts publishing
     /// once one succeeds. Before ledger 1420 that arm returned a publisher that
     /// published nothing for the life of the process, which is what PB-3 hit
@@ -309,7 +309,7 @@ impl Invalidator {
     /// `nats-auth`) and rolls on a CONFIG change only. A rotation restarts `iam`
     /// on the new password while the broker holds the old one until it restarts.
     /// The log line still says DEPLOYMENT ERROR. Why this is not
-    /// `retry_on_initial_connect` is in [`redial`].
+    /// `retry_on_initial_connect` is in `redial`.
     ///
     /// `tls` is the broker hop's transport (B-N3, ADR-0852): `None` dials in
     /// cleartext exactly as this did before; `Some` is
@@ -373,7 +373,7 @@ impl Invalidator {
 
     /// Whether this instance has connected to the broker: at boot, or on a
     /// redial since. It stays `true` across the reconnects `async-nats` makes
-    /// underneath an established client — those are reported by [`on_event`].
+    /// underneath an established client — those are reported by `on_event`.
     ///
     /// **A test asserting that a credential was CONFIGURED would pass against a
     /// broker that ignored it.** This is what lets a test assert the outcome

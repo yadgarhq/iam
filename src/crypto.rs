@@ -370,7 +370,7 @@ impl Keys {
 
     /// Hash a password for storage.
     ///
-    /// Through [`hash_secret`], and the dummy hash is too — see the note there
+    /// Through `hash_secret`, and the dummy hash is too — see the note there
     /// for why the two must not be configured separately.
     pub fn hash_password(&self, password: &str) -> Result<String, CryptoError> {
         hash_secret(password.as_bytes()).map_err(|e| CryptoError::BadHash(e.to_string()))
@@ -384,7 +384,7 @@ impl Keys {
     ///
     /// PARSING IS NOT ENOUGH TO KNOW THE WORK HAPPENED, which is what the `None`
     /// arm below is for: a PHC string can parse cleanly and still be refused by
-    /// the verifier before it hashes anything. See [`verify_counted`].
+    /// the verifier before it hashes anything. See `verify_counted`.
     ///
     /// # The residual this does NOT close, and what does
     ///

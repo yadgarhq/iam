@@ -32,6 +32,8 @@
 //! **A STATUS ON EITHER RPC IS NEVER A PROOF FAILURE.** It is not-passed, and it
 //! is classified as every other status in this module is; `UNIMPLEMENTED` names
 //! an `iam-db` that does not serve the adoption arm yet, and is transient.
+//! `FAILED_PRECONDITION` from `AdoptKeyIdentity` is stale evidence, a row
+//! changed after the read ([`STALE_EVIDENCE`]), and is transient too.
 
 use std::time::Duration;
 
@@ -233,6 +235,9 @@ async fn adopt(
         .call(ceiling, write, |r| client.adopt_key_identity(r))
         .await;
     match asked {
+        Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+            Step::NotYet(STALE_EVIDENCE)
+        }
         Err(status) => Step::NotYet(of_status(status.code())),
         Ok(response) => outcome_of_adopt(response.into_inner().outcome),
     }
@@ -276,16 +281,42 @@ pub(super) const ADOPTION_UNIMPLEMENTED: Unverified = Unverified::of(
     false,
 );
 
+/// `FAILED_PRECONDITION` on `AdoptKeyIdentity`: the evidence sent is not the N
+/// oldest rows NOW, because a row was written or deleted after the read.
+///
+/// **TRANSIENT, AND NOT `Unverified::of_status`'s missing-marker reason
+/// (yaadgaar #509).** Every attempt re-lists the evidence, so the retry mends a
+/// race with nobody acting. Its FIRST line is WARN; a restatement is ERROR
+/// ([`escalated`]), because evidence refused for that long is not a race.
+pub(super) const STALE_EVIDENCE: Unverified = Unverified::of(
+    "FAILED_PRECONDITION: AdoptKeyIdentity refused the evidence as not the oldest rows \
+     now (a row changed after the read); the next attempt reads it again",
+    false,
+);
+
 /// Whether a transient reason has stood long enough to be told at ERROR.
 ///
-/// **ONLY [`ADOPTION_UNIMPLEMENTED`], AND ONLY ON A RESTATEMENT.** A line is
-/// restated only after the same reason has stood for [`super::RESTATE_AFTER`]
-/// with no other reason between. A rollout clears in seconds and never gets
-/// there; an `iam-db` that has the key-identity arm and predates the adoption
-/// arm stays there for ever, and a WARN for ever would hide it.
+/// **ONLY [`ADOPTION_UNIMPLEMENTED`] AND [`STALE_EVIDENCE`], AND ONLY ON A
+/// RESTATEMENT.** A line is restated only after the same reason has stood for
+/// [`super::RESTATE_AFTER`] with no other reason between. A rollout or a race
+/// clears in seconds and never gets there; an `iam-db` that has the
+/// key-identity arm and predates the adoption arm stays there for ever, and a
+/// WARN for ever would hide it.
 pub(super) fn escalated(unverified: &Unverified, stood_for: Duration) -> bool {
-    unverified.reason == ADOPTION_UNIMPLEMENTED.reason && stood_for >= super::RESTATE_AFTER
+    [ADOPTION_UNIMPLEMENTED.reason, STALE_EVIDENCE.reason].contains(&unverified.reason)
+        && stood_for >= super::RESTATE_AFTER
 }
+
+/// What an operator does about each reason the ERROR line can carry, logged
+/// as that line's `act_on` field. Every reason has an entry (yaadgaar #509).
+pub(super) const ACT_ON: &str = "UNIMPLEMENTED, INVALID_ARGUMENT or an outcome this build \
+     cannot read as a pass: deploy iam and iam-db from matching tags. DERIVATION_SKEW: deploy \
+     an iam that speaks the stored marker's derivation, or migrate the marker (ADR-0765). \
+     FAILED_PRECONDITION from GetKeyIdentity or ListKeyIdentityEvidence: resolve the marker \
+     this store holds (ADR-0764, ADR-0765). FAILED_PRECONDITION from AdoptKeyIdentity that \
+     stands: find what writes iam_user during the check. NO_EVIDENCE: iam-db says the store \
+     holds rows and lists none; inspect iam_user and the iam-db build before adopting. \
+     PERMISSION_DENIED: reissue this pod's client certificate as `iam-caller` (ADR-0972)";
 
 /// Zero rows read: no proof, and no retry makes one (ADR-1085).
 pub(super) const NO_EVIDENCE: Unverified = Unverified::of(

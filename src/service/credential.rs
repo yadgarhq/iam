@@ -212,12 +212,10 @@ impl Iam {
         let deadline = Deadline::of(&req);
         let r = req.get_ref();
         // BEFORE THE UPSTREAM CALL, so a refused request reaches no store. An
-        // empty id names nobody. A negative page size is refused rather than
-        // read as the default, because the contract gives it no meaning.
+        // empty id names nobody. `page_size` is relayed unchanged: at or below
+        // zero it is `iam-db`'s default page, as everywhere in the estate.
         let checked = if r.user_id.is_empty() {
             Err(Status::invalid_argument("`user_id` is required"))
-        } else if r.page_size < 0 {
-            Err(Status::invalid_argument("`page_size` must not be negative"))
         } else {
             check_entity_id("user_id", &r.user_id)
                 .and_then(|()| check_entity_id("page_token", &r.page_token))

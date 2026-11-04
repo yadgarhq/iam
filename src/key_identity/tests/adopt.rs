@@ -9,7 +9,7 @@ use crate::crypto::tests::keys_of;
 use crate::crypto::Keys;
 use crate::key_identity::adopt::{
     proven, Failure, Proof, ADOPTION_UNIMPLEMENTED, NO_EVIDENCE, OBSERVED_FAILED, OBSERVED_PASSED,
-    PROOF,
+    PROOF, STALE_EVIDENCE,
 };
 
 const RIGHT: ([u8; 32], [u8; 32]) = ([7u8; 32], [9u8; 32]);
@@ -593,5 +593,132 @@ fn the_mode_parses_only_observe_and_adopt() {
     for bad in ["", "Observe", "ADOPT", "true", "dry-run", " adopt"] {
         let refusal = Adoption::parse(bad).expect_err(bad);
         assert!(refusal.contains("KEY_IDENTITY_ADOPT") && refusal.contains("keyIdentity.adopt"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADOPT'S FAILED_PRECONDITION IS STALE EVIDENCE, NOT A MISSING MARKER (#509)
+// ---------------------------------------------------------------------------
+
+/// The permanent reason `Unverified::of_status` gives `FAILED_PRECONDITION`.
+const NO_MARKER: &str = "FAILED_PRECONDITION: the store holds rows and no marker";
+
+/// **`AdoptKeyIdentity`'s `FAILED_PRECONDITION` IS TRANSIENT, AT WARN.** The
+/// contract answers it when `evidence_user_ids` are not exactly the N oldest
+/// rows NOW: a row written or deleted between `ListKeyIdentityEvidence` and the
+/// adopt. Every attempt re-lists, so the retry mends it with nobody acting.
+///
+/// THE ASSERTIONS THAT REDDEN: the status sent through `Unverified::of_status`
+/// again (an ERROR line under the permanent no-marker reason, and no line under
+/// `STALE_EVIDENCE`); the check stopping at the first answer (`adopt.len()`).
+#[tokio::test]
+async fn failed_precondition_on_the_adopt_is_transient_stale_evidence() {
+    crate::service::tests::warnings_from_here();
+    let (ended, asked) = run(
+        pre_marker(
+            rows(&right(), 2),
+            vec![
+                Answer::Failed(tonic::Code::FailedPrecondition),
+                Answer::Outcome(raw(db::KeyIdentityOutcome::Recorded)),
+            ],
+        ),
+        identity_in(Adoption::Adopt),
+    )
+    .await;
+    assert!(ended.is_none());
+    assert_eq!(
+        asked.adopt.len(),
+        2,
+        "passed on the retry and stopped asking"
+    );
+    assert!(
+        asked.list.len() >= 2,
+        "each attempt reads the evidence again"
+    );
+    assert!(!STALE_EVIDENCE.is_permanent());
+    assert!(
+        told_about(NO_MARKER).is_empty(),
+        "not the missing-marker reason"
+    );
+    let lines = told_about(STALE_EVIDENCE.reason);
+    assert!(!lines.is_empty(), "the transient condition is still told");
+    assert!(lines.iter().all(|l| !l.error), "{lines:?}");
+}
+
+/// **A STANDING `STALE_EVIDENCE` ESCALATES TO ERROR ON ITS FIRST RESTATEMENT**,
+/// as `ADOPTION_UNIMPLEMENTED` does. A race mends in one retry; evidence that
+/// is refused for `RESTATE_AFTER` is not a race, and a WARN for ever hides it.
+///
+/// THE ASSERTIONS THAT REDDEN: no escalation (no ERROR line); escalation
+/// without the elapsed guard (the first line is ERROR).
+#[tokio::test]
+async fn a_standing_stale_evidence_escalates_to_error_on_restatement() {
+    const ATTEMPTS: usize = 40;
+    let mut adopt = vec![Answer::Failed(tonic::Code::FailedPrecondition); ATTEMPTS];
+    adopt.push(Answer::Outcome(raw(db::KeyIdentityOutcome::Mismatch)));
+    let (channel, _) = twin_channel(pre_marker(rows(&right(), 2), adopt)).await;
+    crate::service::tests::warnings_from_here();
+    tokio::time::pause();
+    let refusal = watch_with_seed(
+        IamDbServiceClient::new(channel),
+        TEST_CEILING,
+        identity_in(Adoption::Adopt),
+        Retry::of(Duration::from_secs(100), Duration::from_secs(100)),
+        0x5eed_5eed_5eed_5eed,
+    )
+    .await;
+    tokio::time::resume();
+    assert_eq!(refusal.arm, "AdoptKeyIdentity");
+
+    let lines = told_about(STALE_EVIDENCE.reason);
+    assert!(lines.len() > 1, "restated: {lines:?}");
+    assert!(
+        !lines[0].error,
+        "the first line is a race until shown otherwise"
+    );
+    assert!(lines[1..].iter().all(|l| l.error), "{lines:?}");
+}
+
+/// **THE ERROR LINE NAMES AN ACTION FOR EVERY REASON IT CAN CARRY.** It used to
+/// list three actions and leave `NO_EVIDENCE`, `DERIVATION_SKEW` and an
+/// unreadable outcome without one.
+///
+/// Read from the `act_on` field alone: the `reason` field on the same line
+/// already names its own reason, so a whole-line search proves nothing.
+///
+/// THE ASSERTIONS THAT REDDEN: any reason's action dropped; the field dropped
+/// from the line.
+#[tokio::test]
+async fn the_error_line_names_an_action_for_every_permanent_reason() {
+    crate::service::tests::warnings_from_here();
+    let _ = run(
+        pre_marker(Vec::new(), Vec::new()),
+        identity_in(Adoption::Adopt),
+    )
+    .await;
+    let lines: Vec<String> = crate::service::tests::warnings()
+        .into_iter()
+        .filter(|l| l.contains(&format!("reason={}", NO_EVIDENCE.reason)))
+        .collect();
+    assert!(!lines.is_empty(), "an operator is told");
+    for line in &lines {
+        assert!(line.starts_with("ERROR"), "{line}");
+        let act_on = line.split("act_on=").nth(1).unwrap_or_default();
+        assert!(
+            act_on.contains("ADR-0972"),
+            "the whole field is logged: {line}"
+        );
+        for named in [
+            "UNIMPLEMENTED",
+            "DERIVATION_SKEW",
+            "cannot read as a pass",
+            "FAILED_PRECONDITION",
+            "NO_EVIDENCE",
+            "INVALID_ARGUMENT",
+            "PERMISSION_DENIED",
+            "iam-caller",
+        ] {
+            assert!(act_on.contains(named), "no action for {named}: {line}");
+        }
     }
 }
