@@ -16,6 +16,7 @@ Run: python3 -m pytest scripts/tests/ -q
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -190,22 +191,39 @@ def test_a_zero_timing_knob_still_means_not_rendered(tmp_path):
 
 
 DEPLOYMENT = CHART / "templates" / "deployment.yaml"
-CAST_SITES = [
-    "terminationGracePeriodSeconds: {{ . | int64 }}\n",
-    "seconds: {{ . | int64 }}\n",
-    "- maxSkew: {{ .Values.topologySpread.maxSkew | int64 }}\n",
-]
+# Each site is a pair of patterns: (any line that renders the key, the one form that line must take). Both are anchored
+# to a whole line with re.M, so a copy in a comment or a trailing comment does not count.
+# `[ \t]*`, not `\s*`: under re.M `\s*` crosses newlines from a blank line above.
+CAST_SITES = {
+    "grace": (
+        r"^[ \t]*terminationGracePeriodSeconds: \{\{.*$",
+        r"^[ \t]*terminationGracePeriodSeconds: \{\{ \. \| int64 \}\}$",
+    ),
+    "preStop": (
+        r"^[ \t]*seconds: \{\{.*$",
+        r"^[ \t]*seconds: \{\{ \. \| int64 \}\}$",
+    ),
+    "maxSkew": (
+        r"^[ \t]*- maxSkew: \{\{.*$",
+        r"^[ \t]*- maxSkew: \{\{ \.Values\.topologySpread\.maxSkew \| int64 \}\}$",
+    ),
+}
 
 
-@pytest.mark.parametrize("line", CAST_SITES, ids=["grace", "preStop", "maxSkew"])
-def test_the_grace_period_pre_stop_sleep_and_skew_render_through_int64(line):
+@pytest.mark.parametrize("site", CAST_SITES)
+def test_the_grace_period_pre_stop_sleep_and_skew_render_through_int64(site):
     """Cast, like every other numeric knob (yaadgaar 550). The chart-baseline gate reads
     `| int64` since actions v1.64.0, so the cast no longer costs the gate its view of the
     value. `| int` is not the same cast and does not count. Every value the check below
     admits renders the same bytes with or without the cast, so this pin is the test that
-    holds the cast in place."""
+    holds the cast in place. Exactly ONE line may render the key, and that line must be
+    the cast form (yaadgaar 641, the yadgarhq/project#92 shape): a second uncast render
+    line, or the cast line kept only in a comment or a dead branch, fails."""
+    any_render, cast = CAST_SITES[site]
     text = DEPLOYMENT.read_text()
-    assert text.count(line) == 1, f"{line.strip()!r} is not in deployment.yaml exactly once"
+    renders = re.findall(any_render, text, re.M)
+    assert len(renders) == 1, f"{site}: expected one render line in deployment.yaml, found {renders!r}"
+    assert re.fullmatch(cast, renders[0]), f"{site}: {renders[0].strip()!r} is not cast through int64"
 
 
 def test_the_grace_period_and_pre_stop_sleep_are_bounded_where_a_float_prints_plainly(tmp_path):
