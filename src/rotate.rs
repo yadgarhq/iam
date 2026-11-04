@@ -214,7 +214,7 @@ impl Material for Broker<'_> {
 /// argument needs a branch at the call site — which is what let the four
 /// per-role builder methods this module used to carry collapse into one trait.
 ///
-/// **`nats_tls` IS FOLDED AS A [`Broker`], NOT THROUGH [`UpstreamTls`]'s OWN
+/// **`nats_tls` IS FOLDED AS A `Broker`, NOT THROUGH [`UpstreamTls`]'s OWN
 /// `Material` IMPL (B-N3, ADR-0885, ledger 1439).** ADR-0885 gives the broker
 /// hop its OWN client certificate, independent of `iamDb.tls`'s, so a
 /// deployment presenting both holds TWO `Presented::Client` leaves. The

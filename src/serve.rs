@@ -35,7 +35,7 @@
 //!
 //! A path that names nothing, a file that cannot be read, a key that does not
 //! match its certificate and a CA file holding no certificate all stop
-//! [`builder`] with a message naming the file. None of them returns a server:
+//! `builder` with a message naming the file. None of them returns a server:
 //! the only server that could be returned is a PLAINTEXT one, and an operator
 //! who asked for encryption would then have an unencrypted listener nobody
 //! could see was unencrypted.

@@ -187,14 +187,6 @@ async fn a_refused_listing_request_never_reaches_the_store() {
         ("empty user id", listing("")),
         ("over-long user id", listing(&long)),
         (
-            "negative page size",
-            Request::new(ListCredentialsRequest {
-                user_id: LISTED_USER.into(),
-                page_size: -1,
-                ..Default::default()
-            }),
-        ),
-        (
             "over-long page token",
             Request::new(ListCredentialsRequest {
                 user_id: LISTED_USER.into(),
@@ -217,6 +209,29 @@ async fn a_refused_listing_request_never_reaches_the_store() {
             "{name}: the store was never asked"
         );
     }
+}
+
+/// ALIGNED WITH THE ESTATE (yaadgaar #198): `page_size` at or below zero is
+/// the server's default page, which `iam-db` applies. `iam` relays the value
+/// unchanged rather than refusing it, so a caller gets one answer whichever
+/// hop it reaches.
+#[tokio::test]
+async fn a_negative_page_size_is_relayed_for_the_store_to_default() {
+    let (iam, rec, _inv) = iam_with(FakeDb::default()).await;
+
+    iam.list_credentials_as(
+        Some(GATEWAY_CALLER),
+        Request::new(ListCredentialsRequest {
+            user_id: LISTED_USER.into(),
+            page_size: -1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("a negative page size is the default page, not a refusal");
+
+    let asked: Vec<_> = twin_listed(&rec).iter().map(|r| r.page_size).collect();
+    assert_eq!(asked, vec![-1], "relayed unchanged for iam-db to default");
 }
 
 #[tokio::test]

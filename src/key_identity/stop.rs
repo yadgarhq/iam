@@ -17,7 +17,7 @@ use crate::pb::yadgar::iamdb::v1::iam_db_service_client::IamDbServiceClient;
 /// under. Permanent: no restart, no retry and no wait changes it.
 ///
 /// Reached two ways: an arm of `iam-db` ANSWERED `MISMATCH`, or this process's
-/// own adoption proof FAILED over the store's oldest rows ([`super::adopt`]).
+/// own adoption proof FAILED over the store's oldest rows (`super::adopt`).
 /// The two get different sentences, because only the first is an answer.
 #[derive(Debug, thiserror::Error)]
 #[error("{}", sentence(self.arm))]
