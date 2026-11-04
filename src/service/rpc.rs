@@ -205,7 +205,7 @@ impl IamService for Iam {
     ///
     /// **THIS SERVICE REFUSES THE CONTRACT'S CLAUSES ITSELF RATHER THAN
     /// FORWARDING THEM** — `yadgar.iam.v1`'s comment on this RPC says so, and
-    /// [`check_inherited_setting`] is where it happens. Every refusal lands
+    /// `check_inherited_setting` is where it happens. Every refusal lands
     /// BEFORE the store is called, so a rejected request leaves no row, no
     /// ledger entry and no idempotency key behind.
     ///
