@@ -346,8 +346,8 @@ impl Unverified {
     /// answers is only whether a retry could ever mend it.
     ///
     /// `UNIMPLEMENTED` is an `iam-db` deployed from a tag that predates the arm.
-    /// `FAILED_PRECONDITION` is a populated store with no marker — an incident,
-    /// and the only refusal about the stored marker on that arm.
+    /// `FAILED_PRECONDITION` is an `iam-db` that breaks its contract: it never
+    /// sends it on `GetKeyIdentity` or `ListKeyIdentityEvidence`: deploy matching tags.
     /// `INVALID_ARGUMENT` is a request this build should never have sent, which
     /// includes D9's refusal of a key replayed under a different payload.
     /// `PERMISSION_DENIED` is iam-db's caller gate (ADR-0972): this pod's client
@@ -360,7 +360,9 @@ impl Unverified {
                 true,
             ),
             tonic::Code::FailedPrecondition => Self::of(
-                "FAILED_PRECONDITION: the store holds rows and no marker",
+                "FAILED_PRECONDITION: this iam-db sent a status its contract never \
+                 sends on GetKeyIdentity or ListKeyIdentityEvidence; deploy iam and \
+                 iam-db from matching tags",
                 true,
             ),
             tonic::Code::InvalidArgument => Self::of(

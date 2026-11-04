@@ -289,7 +289,8 @@ pub(super) const ADOPTION_UNIMPLEMENTED: Unverified = Unverified::of(
 /// stands means the `iam-db` pods run different builds (a stuck rollout), or
 /// `iam-db` has a defect.
 ///
-/// **TRANSIENT, AND NOT `Unverified::of_status`'s missing-marker reason
+/// **TRANSIENT, AND NOT `Unverified::of_status`'s `FAILED_PRECONDITION` reason
+/// (a contract breach)
 /// (yaadgaar #509).** Every attempt re-lists the evidence, so the retry mends a
 /// race with nobody acting. Its FIRST line is WARN; a restatement is ERROR
 /// ([`escalated`]), because evidence refused for that long is not a race.
