@@ -600,8 +600,32 @@ fn the_mode_parses_only_observe_and_adopt() {
 // ADOPT'S FAILED_PRECONDITION IS STALE EVIDENCE, NOT A MISSING MARKER (#509)
 // ---------------------------------------------------------------------------
 
-/// The permanent reason `Unverified::of_status` gives `FAILED_PRECONDITION`.
-const NO_MARKER: &str = "FAILED_PRECONDITION: the store holds rows and no marker";
+/// The permanent reason `Unverified::of_status` gives `FAILED_PRECONDITION`: an
+/// `iam-db` that breaks its contract, because it never sends the status on the
+/// read arms (yaadgaar #604). It must agree with `ACT_ON`.
+const NO_MARKER: &str = "FAILED_PRECONDITION: this iam-db sent a status its contract never \
+     sends on the read arms; deploy iam and iam-db from matching tags";
+
+/// **THE `FAILED_PRECONDITION` REASON NAMES AN `iam-db` THAT BREAKS ITS
+/// CONTRACT, NOT A STORE STATE.** `of_status` is reached only from
+/// `GetKeyIdentity` and `ListKeyIdentityEvidence`, and `iam-db` never sends the
+/// status there, so "the store holds rows and no marker" named a cause that
+/// cannot be true (yaadgaar #604). The fix is a deploy of matching tags.
+///
+/// THE ASSERTIONS THAT REDDEN: the old reason restored; a reason that does not
+/// name the deploy; a reason that is empty; the status classified transient.
+#[test]
+fn failed_precondition_reason_names_a_contract_breach_and_a_matching_deploy() {
+    let reason = Unverified::of_status(tonic::Code::FailedPrecondition);
+    assert_eq!(reason.reason, NO_MARKER);
+    assert!(reason.reason.contains("matching tags"), "{}", reason.reason);
+    assert!(!reason.reason.contains("no marker"), "{}", reason.reason);
+    assert!(reason.is_permanent());
+    assert!(
+        crate::key_identity::adopt::ACT_ON.contains("deploy matching tags"),
+        "the reason and ACT_ON agree"
+    );
+}
 
 /// **`AdoptKeyIdentity`'s `FAILED_PRECONDITION` IS TRANSIENT, AT WARN.** The
 /// contract answers it when `evidence_user_ids` are not exactly the N oldest

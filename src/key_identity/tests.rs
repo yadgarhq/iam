@@ -661,7 +661,7 @@ async fn a_match_on_the_recording_arm_passes() {
 /// the transient so they can reach an operator.
 ///
 /// UNIMPLEMENTED is an `iam-db` deployed from a tag that predates this arm.
-/// FAILED_PRECONDITION is a populated store with no marker. INVALID_ARGUMENT is
+/// FAILED_PRECONDITION is an iam-db that breaks its contract. INVALID_ARGUMENT is
 /// a request this build should never have sent. Retrying any of them for ever is
 /// safe and is NOT sufficient: the pod stays Ready, serving and unverified.
 ///
