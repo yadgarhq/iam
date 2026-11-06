@@ -205,12 +205,17 @@ fn the_limits_chart_key_is_the_values_block_the_limits_render_from() {
     assert_eq!(LIMITS_CHART_KEY, "server.limits");
 }
 
-const LIMITS: [(&str, &str); 4] = [
+const LIMITS: [(&str, &str); 5] = [
     ("LISTEN_MAX_CONCURRENT_STREAMS", "256"),
     ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30"),
     ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10"),
     ("LISTEN_MAX_HEADER_LIST_BYTES", "16384"),
+    ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800"),
 ];
+
+/// Read by the library from v0.4.0 on (yadgarhq/lifecycle#78). Older pins ignore
+/// it, so the absent-key case below skips it until the pin bump drops this.
+const NOT_YET_REQUIRED_BY_THE_PIN: &str = "LISTEN_MAX_CONNECTION_AGE_SECS";
 
 #[test]
 fn the_chart_defaults_are_a_complete_configuration() {
@@ -225,7 +230,11 @@ fn the_chart_defaults_are_a_complete_configuration() {
 /// and the `server.limits` leaf this service hands the library.
 #[test]
 fn an_absent_limit_is_refused_naming_the_variable_and_the_chart_value() {
-    for (absent, _) in LIMITS {
+    for (absent, _) in LIMITS
+        .iter()
+        .copied()
+        .filter(|(k, _)| *k != NOT_YET_REQUIRED_BY_THE_PIN)
+    {
         let present: Vec<_> = LIMITS
             .iter()
             .copied()

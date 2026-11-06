@@ -142,6 +142,7 @@ pub fn cleartext_env(keys_dir: &Path) -> Vec<(&'static str, String)> {
         ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30".to_string()),
         ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10".to_string()),
         ("LISTEN_MAX_HEADER_LIST_BYTES", "16384".to_string()),
+        ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800".to_string()),
         ("IAM_DB_TLS_ENABLED", "0".to_string()),
         ("IAM_DB_REQUEST_TIMEOUT_SECONDS", "14".to_string()),
         ("YADGAR_KEYS_DIR", keys_dir.display().to_string()),

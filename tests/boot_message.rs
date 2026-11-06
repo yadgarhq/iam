@@ -57,6 +57,7 @@ fn limits_env() -> Vec<(&'static str, String)> {
         ("LISTEN_KEEPALIVE_INTERVAL_SECS", "30".to_string()),
         ("LISTEN_KEEPALIVE_TIMEOUT_SECS", "10".to_string()),
         ("LISTEN_MAX_HEADER_LIST_BYTES", "16384".to_string()),
+        ("LISTEN_MAX_CONNECTION_AGE_SECS", "1800".to_string()),
     ]
 }
 

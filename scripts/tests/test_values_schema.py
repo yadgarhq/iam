@@ -1131,6 +1131,7 @@ TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "server.limits.keepaliveIntervalSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
     "server.limits.keepaliveTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 600},
     "server.limits.maxHeaderListBytes": {"type": "integer", "minimum": 1024, "maximum": 1048576},
+    "server.limits.maxConnectionAgeSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
     "iamDb.requestTimeoutSeconds": {"type": "integer", "minimum": 14, "maximum": 59},
     "iamDb.tls.enabled": {"type": "boolean"},
     "nats.tls.enabled": {"type": "boolean"},
@@ -1139,7 +1140,7 @@ TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
 BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "tls": {"required": ["enabled", "clientAuth"]},
     "server": {"required": ["limits"]},
-    "server.limits": {"required": ["maxConcurrentStreams", "keepaliveIntervalSeconds", "keepaliveTimeoutSeconds", "maxHeaderListBytes"]},
+    "server.limits": {"required": ["maxConcurrentStreams", "keepaliveIntervalSeconds", "keepaliveTimeoutSeconds", "maxHeaderListBytes", "maxConnectionAgeSeconds"]},
     "iamDb": {"required": ["requestTimeoutSeconds"]},
     "iamDb.tls": {"required": ["enabled"]},
     "nats.tls": {"type": "object", "required": ["enabled"]},  # ADR-1138
@@ -1362,6 +1363,9 @@ def census_mutations() -> dict[str, Any]:
         "required key dropped from iamDb": drop_required("iamDb", "requestTimeoutSeconds"),
         "required dropped from server": delete_key("server", "required"),
         "required key dropped from server.limits": drop_required("server.limits", "maxHeaderListBytes"),
+        "required connection age dropped from server.limits": drop_required("server.limits", "maxConnectionAgeSeconds"),
+        "connection age bound raised": on_node("server.limits.maxConnectionAgeSeconds", {"maximum": 86401}),
+        "connection age bound lowered": on_node("server.limits.maxConnectionAgeSeconds", {"minimum": 2}),
         "required dropped from a block": delete_key("tls", "required"),
         "required key dropped from tls": drop_required("tls", "clientAuth"),
         # root

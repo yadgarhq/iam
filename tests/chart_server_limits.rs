@@ -23,12 +23,15 @@ fn read(relative: &str) -> String {
 }
 
 /// leaf, env variable, ADR-1006 default, the literal range, the library's const.
+/// The const is `None` for `maxConnectionAgeSeconds` until the lifecycle pin
+/// carries `ServerLimits::MAX_CONNECTION_AGE_SECS` (yadgarhq/lifecycle#78, v0.4.0);
+/// the pin-bump PR replaces that `None` with the const.
 type Row = (
     &'static str,
     &'static str,
     u64,
     (u64, u64),
-    RangeInclusive<u64>,
+    Option<RangeInclusive<u64>>,
 );
 
 fn rows() -> Vec<Row> {
@@ -38,28 +41,35 @@ fn rows() -> Vec<Row> {
             "LISTEN_MAX_CONCURRENT_STREAMS",
             256,
             (1, 10_000),
-            ServerLimits::MAX_CONCURRENT_STREAMS,
+            Some(ServerLimits::MAX_CONCURRENT_STREAMS),
         ),
         (
             "keepaliveIntervalSeconds",
             "LISTEN_KEEPALIVE_INTERVAL_SECS",
             30,
             (1, 3_600),
-            ServerLimits::KEEPALIVE_INTERVAL_SECS,
+            Some(ServerLimits::KEEPALIVE_INTERVAL_SECS),
         ),
         (
             "keepaliveTimeoutSeconds",
             "LISTEN_KEEPALIVE_TIMEOUT_SECS",
             10,
             (1, 600),
-            ServerLimits::KEEPALIVE_TIMEOUT_SECS,
+            Some(ServerLimits::KEEPALIVE_TIMEOUT_SECS),
         ),
         (
             "maxHeaderListBytes",
             "LISTEN_MAX_HEADER_LIST_BYTES",
             16_384,
             (1_024, 1_048_576),
-            ServerLimits::MAX_HEADER_LIST_BYTES,
+            Some(ServerLimits::MAX_HEADER_LIST_BYTES),
+        ),
+        (
+            "maxConnectionAgeSeconds",
+            "LISTEN_MAX_CONNECTION_AGE_SECS",
+            1_800,
+            (1, 86_400),
+            None,
         ),
     ]
 }
@@ -73,7 +83,7 @@ fn schema_block() -> Value {
 }
 
 #[test]
-fn the_schema_requires_all_four_as_integers() {
+fn the_schema_requires_all_five_as_integers() {
     let block = schema_block();
     let required: Vec<&str> = block["required"]
         .as_array()
@@ -88,7 +98,7 @@ fn the_schema_requires_all_four_as_integers() {
         );
         assert_eq!(block["properties"][leaf]["type"], "integer", "{leaf}");
     }
-    assert_eq!(block["properties"].as_object().unwrap().len(), 4);
+    assert_eq!(block["properties"].as_object().unwrap().len(), 5);
     assert_eq!(block["additionalProperties"], false);
 }
 
@@ -99,11 +109,13 @@ fn the_schema_bounds_are_the_library_bounds() {
         let property = &block["properties"][leaf];
         let minimum = property["minimum"].as_u64().expect("`minimum` must be set");
         let maximum = property["maximum"].as_u64().expect("`maximum` must be set");
-        assert_eq!(
-            (minimum, maximum),
-            (*range.start(), *range.end()),
-            "{leaf}: the chart's bounds are not the range the pinned library refuses outside"
-        );
+        if let Some(range) = range {
+            assert_eq!(
+                (minimum, maximum),
+                (*range.start(), *range.end()),
+                "{leaf}: the chart's bounds are not the range the pinned library refuses outside"
+            );
+        }
         assert_eq!((minimum, maximum), (min, max), "{leaf}: the range moved");
     }
 }
@@ -144,10 +156,12 @@ fn the_defaults_are_the_ruled_ones_and_inside_the_library_ranges() {
     for (leaf, _, default, _, range) in rows() {
         let stated = values_default(leaf);
         assert_eq!(stated, default, "{leaf}: the ADR-1006 default moved");
-        assert!(
-            range.contains(&stated),
-            "{leaf}: the chart default {stated} is outside the range the binary accepts"
-        );
+        if let Some(range) = range {
+            assert!(
+                range.contains(&stated),
+                "{leaf}: the chart default {stated} is outside the range the binary accepts"
+            );
+        }
     }
     assert!(
         values_default("keepaliveTimeoutSeconds") < values_default("keepaliveIntervalSeconds"),
