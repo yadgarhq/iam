@@ -4713,10 +4713,25 @@ async fn an_over_long_request_id_is_capped_on_the_record_and_joins_the_twin() {
         "the twin reads back, through to_str(), the identical capped id"
     );
     assert_eq!(
-        super::capped(&cut),
+        yadgar_telemetry::request_id::capped(&cut),
         cut,
         "and re-capping it, as the twin does, leaves it unchanged"
     );
+}
+
+/// **THE SHARED CAP IS BYTE-IDENTICAL TO THE COPY `iam` HELD** (ledger 1255):
+/// 256 characters pass untouched, 257 are cut to 256 plus the ASCII `...`, and
+/// the cut falls on a character boundary. A drift here cuts one over-long id
+/// differently from `iam-db` and the two hops' records stop joining.
+#[test]
+fn the_shared_cap_keeps_the_bound_the_marker_and_the_char_boundary() {
+    use yadgar_telemetry::request_id::{capped, CAP, CUT_MARKER};
+    assert_eq!((CAP, CUT_MARKER), (256, "..."));
+    let at_cap = "a".repeat(256);
+    assert_eq!(capped(&at_cap), at_cap);
+    assert_eq!(capped(&"a".repeat(257)), format!("{at_cap}..."));
+    let wide = "é".repeat(257);
+    assert_eq!(capped(&wide), format!("{}...", "é".repeat(256)));
 }
 
 /// A legitimate id — the gateway's UUIDv7 — is neither cut nor marked, on the
