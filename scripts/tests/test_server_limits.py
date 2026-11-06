@@ -23,6 +23,7 @@ ENV = {
     "LISTEN_KEEPALIVE_INTERVAL_SECS": ("keepaliveIntervalSeconds", "30"),
     "LISTEN_KEEPALIVE_TIMEOUT_SECS": ("keepaliveTimeoutSeconds", "10"),
     "LISTEN_MAX_HEADER_LIST_BYTES": ("maxHeaderListBytes", "16384"),
+    "LISTEN_MAX_CONNECTION_AGE_SECS": ("maxConnectionAgeSeconds", "1800"),
 }
 
 
@@ -93,10 +94,20 @@ def test_each_value_outside_its_library_range_is_refused_by_the_schema():
         ("keepaliveTimeoutSeconds", 601),
         ("maxHeaderListBytes", 1023),
         ("maxHeaderListBytes", 1048577),
+        ("maxConnectionAgeSeconds", 0),
+        ("maxConnectionAgeSeconds", 86401),
     ]:
         done = render("--set", f"server.limits.{leaf}={bad}")
         assert done.returncode != 0, f"{leaf}={bad} rendered"
         assert leaf in done.stderr, done.stderr
+
+
+def test_the_connection_age_bounds_render_as_whole_numbers():
+    # ADR-1006 (30 min default): range 1..=86400. Both ends are accepted.
+    for bound in ("1", "86400"):
+        done = render("--set", f"server.limits.maxConnectionAgeSeconds={bound}")
+        assert done.returncode == 0, done.stderr
+        assert listener_env(done.stdout)["LISTEN_MAX_CONNECTION_AGE_SECS"] == bound
 
 
 def test_a_deleted_limit_is_refused_by_the_schema(tmp_path):
