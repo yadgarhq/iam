@@ -36,6 +36,7 @@ use tonic::{Request, Response, Status};
 use yadgar_dial::Deadline;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
+use yadgar_telemetry::request_id::capped;
 
 use crate::crypto::Keys;
 use crate::invalidate::Invalidator;
@@ -374,7 +375,7 @@ fn enrolment_refused() -> Status {
 ///
 /// **FORWARDED AS [`request_id_of`] CAPS IT**, so the wire to `iam-db` is
 /// bounded and carries the same string as this hop's `CallRecord` (ledger
-/// 1248). That needs the cap's [`CUT_MARKER`] to be ASCII: `iam-db` reads the
+/// 1248). That needs the cap's marker (`yadgar_telemetry::request_id::CUT_MARKER`) to be ASCII: `iam-db` reads the
 /// header with `to_str()`, which refuses any non-ASCII byte. `iam-db` re-caps
 /// what it reads, and capping a capped value changes nothing, so both records
 /// join. An absent or unreadable inbound id forwards nothing — which `iam-db`
@@ -388,32 +389,6 @@ fn forward_request_id<T, U>(from: &Request<T>, to: &mut Request<U>) {
     // ASCII. Dropped rather than unwrapped if it ever did not (D67).
     if let Ok(v) = id.parse() {
         to.metadata_mut().insert("x-yadgar-request-id", v);
-    }
-}
-
-/// How many of a caller's characters `x-yadgar-request-id` may put on a record.
-///
-/// A cut value is at most `REQUEST_ID_CAP + 3` characters, the marker included.
-///
-/// **THE SAME BOUND AND MARKER `iam-db` APPLIES** (its `ACTOR_RECORD_CAP`,
-/// `CUT_MARKER` and `capped`; iam-db#78, and the ASCII marker in
-/// yadgarhq/iam-db#80). A copy rather than a shared crate because none holds it
-/// yet; the copies must stay identical, or the two hops' records cut one
-/// over-long id differently and stop joining.
-const REQUEST_ID_CAP: usize = 256;
-
-/// What marks a cut. **ASCII, and that is load-bearing**: the capped id is
-/// forwarded in a header, and `iam-db` reads it with `to_str()`, which refuses
-/// any non-ASCII byte. A `…` here was accepted into metadata and read back as
-/// `""`.
-const CUT_MARKER: &str = "...";
-
-/// `s` cut to [`REQUEST_ID_CAP`] characters, with [`CUT_MARKER`] appended if it
-/// was cut.
-fn capped(s: &str) -> std::borrow::Cow<'_, str> {
-    match s.char_indices().nth(REQUEST_ID_CAP) {
-        Some((at, _)) => format!("{}{CUT_MARKER}", &s[..at]).into(),
-        None => s.into(),
     }
 }
 
