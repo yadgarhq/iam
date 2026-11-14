@@ -149,7 +149,7 @@ base64 = "0.23"
 # so the feature carried the advisory and nothing this crate calls. The list
 # below is the 0.50.0 default set, copied rather than trimmed, so no other
 # behaviour moves with the advisory fix.
-async-nats = { version = "0.51", default-features = false, features = [
+async-nats = { version = "0.52", default-features = false, features = [
   "server_2_10",
   "server_2_11",
   "server_2_12",
