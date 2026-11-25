@@ -492,8 +492,7 @@ async fn record(
 }
 
 async fn never() -> ! {
-    let never: std::convert::Infallible = std::future::pending().await;
-    match never {}
+    match std::future::pending::<std::convert::Infallible>().await {}
 }
 
 #[cfg(test)]
